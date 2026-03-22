@@ -1,0 +1,14 @@
+# Пример глобального конфига (~/.config/goagent/config.yaml)
+#
+# Применяется ко всем проектам. Проектный .goagent.yaml переопределяет эти значения.
+
+ollama:
+  base_url: "http://localhost:11434"
+  model: "qwen3-coder:30b"
+  timeout: 600s
+  context_size: 32768
+
+agent:
+  max_iterations: 100
+  auto_fix: true
+  auto_commit: false
