@@ -8,7 +8,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/raoptimus/go-agent/internal/ollama"
+	"github.com/pkg/errors"
+	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/rules"
+	"github.com/raoptimus/kodrun/internal/snippets"
 )
 
 // goTool is the base for all Go command tools.
@@ -22,8 +25,8 @@ type goTool struct {
 }
 
 func (t *goTool) Name() string              { return t.name }
-func (t *goTool) Description() string        { return t.description }
-func (t *goTool) Schema() ollama.JSONSchema  { return t.schema }
+func (t *goTool) Description() string       { return t.description }
+func (t *goTool) Schema() ollama.JSONSchema { return t.schema }
 
 func (t *goTool) Execute(ctx context.Context, params map[string]any) (ToolResult, error) {
 	args := make([]string, len(t.defaultArgs))
@@ -36,7 +39,12 @@ func (t *goTool) Execute(ctx context.Context, params map[string]any) (ToolResult
 	}
 
 	if flags, ok := params["flags"].(string); ok && flags != "" {
-		args = append(args, strings.Fields(flags)...)
+		for _, f := range strings.Fields(flags) {
+			if isForbiddenFlag(f) {
+				return ToolResult{Error: fmt.Sprintf("flag %q is not allowed", f), Success: false}, nil
+			}
+			args = append(args, f)
+		}
 	}
 
 	if run, ok := params["run"].(string); ok && run != "" {
@@ -56,7 +64,8 @@ func (t *goTool) Execute(ctx context.Context, params map[string]any) (ToolResult
 
 	exitCode := 0
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
 			exitCode = exitErr.ExitCode()
 		} else {
 			return ToolResult{Error: err.Error(), Success: false}, nil
@@ -81,6 +90,39 @@ func (t *goTool) Execute(ctx context.Context, params map[string]any) (ToolResult
 	}, nil
 }
 
+// dangerousPatterns lists shell command patterns that indicate destructive or risky operations.
+var dangerousPatterns = []string{
+	"rm -rf", "rm -r", "rm -f",
+	"chmod", "chown",
+	"curl", "wget",
+	"kill", "pkill",
+	"dd ", "mkfs", "fdisk",
+	"sudo",
+}
+
+// IsDangerousCommand checks if a shell command contains dangerous patterns.
+func IsDangerousCommand(cmd string) bool {
+	lower := strings.ToLower(cmd)
+	for _, p := range dangerousPatterns {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	return strings.Contains(cmd, "> /etc/") || strings.Contains(cmd, ">> /etc/")
+}
+
+// forbiddenGoFlags lists flags that could execute arbitrary code via go toolchain.
+var forbiddenGoFlags = []string{"-exec", "-toolexec", "-overlay"}
+
+func isForbiddenFlag(flag string) bool {
+	for _, f := range forbiddenGoFlags {
+		if flag == f || strings.HasPrefix(flag, f+"=") {
+			return true
+		}
+	}
+	return false
+}
+
 func goToolSchema(extraProps map[string]ollama.JSONSchema) ollama.JSONSchema {
 	props := map[string]ollama.JSONSchema{
 		"packages": {Type: "string", Description: "Go packages (default: ./...)"},
@@ -102,7 +144,7 @@ func NewGoBuildTool(workDir string) Tool {
 		name:        "go_build",
 		description: "Run go build",
 		command:     "go",
-		defaultArgs: []string{"build"},
+		defaultArgs: []string{"build", "-o", ".build"},
 		schema:      goToolSchema(nil),
 	}
 }
@@ -180,13 +222,13 @@ func NewGoModTidyTool(workDir string) Tool {
 }
 
 // RegisterAllTools registers all built-in tools into a registry.
-func RegisterAllTools(reg *Registry, workDir string, forbidden []string) {
-	reg.Register(NewReadFileTool(workDir, forbidden))
+func RegisterAllTools(_ context.Context, reg *Registry, workDir string, forbidden []string, maxReadLines int, loader *rules.Loader, snippetLoader *snippets.Loader, scope rules.Scope, useRuleTool, useSnippetTool, ragEnabled bool) {
+	reg.Register(NewReadFileTool(workDir, forbidden, maxReadLines))
 	reg.Register(NewWriteFileTool(workDir, forbidden))
 	reg.Register(NewEditFileTool(workDir, forbidden))
-	reg.Register(NewListDirTool(workDir))
-	reg.Register(NewFindFilesTool(workDir))
-	reg.Register(NewGrepTool(workDir))
+	reg.Register(NewListDirTool(workDir, forbidden))
+	reg.Register(NewFindFilesTool(workDir, forbidden))
+	reg.Register(NewGrepTool(workDir, forbidden))
 	reg.Register(NewDeleteFileTool(workDir, forbidden))
 	reg.Register(NewCreateDirTool(workDir))
 	reg.Register(NewMoveFileTool(workDir, forbidden))
@@ -197,6 +239,12 @@ func RegisterAllTools(reg *Registry, workDir string, forbidden []string) {
 	reg.Register(NewGoLintTool(workDir))
 	reg.Register(NewGoModTidyTool(workDir))
 	reg.Register(&BashTool{workDir: workDir})
+	if loader != nil && useRuleTool && !ragEnabled {
+		reg.Register(NewRuleTool(loader, scope))
+	}
+	if snippetLoader != nil && useSnippetTool && !ragEnabled {
+		reg.Register(NewSnippetTool(snippetLoader))
+	}
 }
 
 // BashTool executes arbitrary shell commands.
@@ -205,7 +253,7 @@ type BashTool struct {
 }
 
 func (t *BashTool) Name() string        { return "bash" }
-func (t *BashTool) Description() string  { return "Execute a shell command" }
+func (t *BashTool) Description() string { return "Execute a shell command" }
 
 func (t *BashTool) Schema() ollama.JSONSchema {
 	return ollama.JSONSchema{
@@ -236,7 +284,8 @@ func (t *BashTool) Execute(ctx context.Context, params map[string]any) (ToolResu
 
 	exitCode := 0
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
 			exitCode = exitErr.ExitCode()
 		} else {
 			return ToolResult{Error: err.Error(), Success: false}, nil
@@ -256,7 +305,7 @@ func (t *BashTool) Execute(ctx context.Context, params map[string]any) (ToolResu
 		Success: exitCode == 0,
 		Meta: map[string]any{
 			"exit_code": exitCode,
-			"duration":  fmt.Sprintf("%s", duration),
+			"duration":  duration.String(),
 		},
 	}, nil
 }

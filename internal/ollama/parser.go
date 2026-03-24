@@ -2,6 +2,7 @@ package ollama
 
 import (
 	"encoding/json"
+	"fmt"
 	"regexp"
 	"strings"
 )
@@ -18,6 +19,7 @@ func ParseToolCalls(content string) ([]ToolCall, bool) {
 	}
 	if err := json.Unmarshal([]byte(content), &single); err == nil && single.Name != "" {
 		return []ToolCall{{
+			ID: "fallback-0",
 			Function: ToolCallFunc{
 				Name:      single.Name,
 				Arguments: single.Arguments,
@@ -37,6 +39,7 @@ func ParseToolCalls(content string) ([]ToolCall, bool) {
 				continue
 			}
 			calls = append(calls, ToolCall{
+				ID: fmt.Sprintf("fallback-%d", len(calls)),
 				Function: ToolCallFunc{
 					Name:      item.Name,
 					Arguments: item.Arguments,
@@ -92,6 +95,7 @@ func parseXMLToolCalls(content string) []ToolCall {
 		}
 
 		calls = append(calls, ToolCall{
+			ID: fmt.Sprintf("fallback-%d", len(calls)),
 			Function: ToolCallFunc{
 				Name:      name,
 				Arguments: args,

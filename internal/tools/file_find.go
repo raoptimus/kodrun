@@ -2,25 +2,26 @@ package tools
 
 import (
 	"context"
-	"os"
+	"io/fs"
 	"path/filepath"
 	"strings"
 
-	"github.com/raoptimus/go-agent/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/ollama"
 )
 
 // FindFilesTool finds files matching a glob pattern.
 type FindFilesTool struct {
-	workDir string
+	workDir   string
+	forbidden []string
 }
 
 // NewFindFilesTool creates a new find_files tool.
-func NewFindFilesTool(workDir string) *FindFilesTool {
-	return &FindFilesTool{workDir: workDir}
+func NewFindFilesTool(workDir string, forbidden []string) *FindFilesTool {
+	return &FindFilesTool{workDir: workDir, forbidden: forbidden}
 }
 
 func (t *FindFilesTool) Name() string        { return "find_files" }
-func (t *FindFilesTool) Description() string  { return "Find files matching a glob pattern" }
+func (t *FindFilesTool) Description() string { return "Find files matching a glob pattern" }
 
 func (t *FindFilesTool) Schema() ollama.JSONSchema {
 	return ollama.JSONSchema{
@@ -33,7 +34,7 @@ func (t *FindFilesTool) Schema() ollama.JSONSchema {
 	}
 }
 
-func (t *FindFilesTool) Execute(_ context.Context, params map[string]any) (ToolResult, error) {
+func (t *FindFilesTool) Execute(ctx context.Context, params map[string]any) (ToolResult, error) {
 	pattern, _ := params["pattern"].(string)
 	root, _ := params["root"].(string)
 
@@ -43,7 +44,7 @@ func (t *FindFilesTool) Execute(_ context.Context, params map[string]any) (ToolR
 
 	searchRoot := t.workDir
 	if root != "" {
-		resolved, err := SafePath(t.workDir, root)
+		resolved, err := SafePath(ctx, t.workDir, root)
 		if err != nil {
 			return ToolResult{Error: err.Error(), Success: false}, nil
 		}
@@ -51,14 +52,20 @@ func (t *FindFilesTool) Execute(_ context.Context, params map[string]any) (ToolR
 	}
 
 	var matches []string
-	err := filepath.Walk(searchRoot, func(path string, info os.FileInfo, err error) error {
+	err := filepath.WalkDir(searchRoot, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
-		if info.IsDir() {
+		rel, _ := filepath.Rel(t.workDir, path)
+		if d.IsDir() {
+			if IsForbiddenDir(ctx, rel, t.forbidden) {
+				return filepath.SkipDir
+			}
 			return nil
 		}
-		rel, _ := filepath.Rel(t.workDir, path)
+		if IsForbidden(ctx, rel, t.forbidden) {
+			return nil
+		}
 		if matched, _ := filepath.Match(pattern, filepath.Base(path)); matched {
 			matches = append(matches, rel)
 		}

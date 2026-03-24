@@ -1,6 +1,6 @@
-# Пример глобального конфига (~/.config/goagent/config.yaml)
+# Global config example (~/.config/kodrun/config.yaml)
 #
-# Применяется ко всем проектам. Проектный .goagent.yaml переопределяет эти значения.
+# Applies to all projects. Project-level .kodrun.yaml overrides these values.
 
 ollama:
   base_url: "http://localhost:11434"
@@ -12,3 +12,9 @@ agent:
   max_iterations: 100
   auto_fix: true
   auto_commit: false
+  # Assistant response language (en, ru, de, fr, es, zh, ja)
+  language: "en"
+  # Auto-compact context when >=99% full
+  auto_compact: true
+  # Max parallel read-only tool calls (1 = sequential)
+  max_workers: 4

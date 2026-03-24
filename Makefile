@@ -1,6 +1,6 @@
 .PHONY: build run test lint clean install init
 
-BINARY    := goagent
+BINARY    := kodrun
 BUILD_DIR := .build
 VERSION   := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS   := -ldflags "-X main.version=$(VERSION)"
@@ -8,7 +8,7 @@ LDFLAGS   := -ldflags "-X main.version=$(VERSION)"
 ## build: Собрать бинарник в .build/
 build:
 	@mkdir -p $(BUILD_DIR)
-	go build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY) ./cmd/goagent
+	go build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY) ./cmd/kodrun
 
 ## run: Собрать и запустить в интерактивном режиме (TUI)
 run: build
@@ -44,9 +44,9 @@ lint:
 
 ## install: Установить бинарник в $GOPATH/bin
 install:
-	go install $(LDFLAGS) ./cmd/goagent
+	go install $(LDFLAGS) ./cmd/kodrun
 
-## init: Создать .goagent/ с примерами rules/docs/commands
+## init: Создать .kodrun/ с примерами rules/docs/commands
 init: build
 	$(BUILD_DIR)/$(BINARY) init
 

@@ -19,14 +19,14 @@ func NewPlainOutput(w io.Writer) *PlainOutput {
 func (p *PlainOutput) Handle(e Event) {
 	switch e.Type {
 	case EventAgent:
-		fmt.Fprintf(p.w, "[agent] %s\n", e.Message)
+		fmt.Fprintf(p.w, "%s\n", e.Message)
 	case EventTool:
 		status := "✓"
 		if !e.Success {
 			status = "✗"
 		}
 		if e.Tool != "" {
-			fmt.Fprintf(p.w, "[tool]  %s %s\n", e.Tool, status)
+			fmt.Fprintf(p.w, "%s(%s)\n", e.Tool, status)
 		}
 		if e.Message != "" && e.Message != "executing..." {
 			fmt.Fprintf(p.w, "        %s\n", e.Message)
@@ -35,6 +35,10 @@ func (p *PlainOutput) Handle(e Event) {
 		fmt.Fprintf(p.w, "[fix]   %s\n", e.Message)
 	case EventError:
 		fmt.Fprintf(p.w, "[error] %s: %s\n", e.Tool, e.Message)
+	case EventTokens:
+		fmt.Fprintf(p.w, "[tokens] prompt: %d, eval: %d\n", e.PromptTokens, e.EvalTokens)
+	case EventCompact:
+		fmt.Fprintf(p.w, "[compact] %s\n", e.Message)
 	case EventDone:
 		// Intentionally left blank for clean output
 	}

@@ -1,0 +1,106 @@
+# Project config example (.kodrun.yaml in the project root)
+#
+# Copy to the root of your Go project and adapt to your needs.
+
+ollama:
+  # Ollama API URL
+  base_url: "http://localhost:11434"
+  # Model for generation (see: ollama list)
+  model: "qwen3-coder:30b"
+  # Timeout per API request
+  timeout: 300s
+  # Model context window size (in tokens)
+  context_size: 32768
+
+# Providers (multiple Ollama instances)
+# When specified, used instead of the ollama section.
+# providers:
+#   gpu-server:
+#     base_url: "http://gpu-server:11434"
+#     model: "qwen3-coder:30b"
+#     timeout: 10m
+#     context_size: 65536
+#   local:
+#     base_url: "http://localhost:11434"
+#     model: "nomic-embed-text"
+#     timeout: 2m
+#     context_size: 8192
+
+agent:
+  # Provider name for chat (from providers section, default "default")
+  # provider: gpu-server
+  # Max iterations of the agent loop (infinite loop protection)
+  max_iterations: 50
+  # Automatically fix build/test/lint errors via LLM
+  auto_fix: true
+  # Automatically commit changes (use with caution)
+  auto_commit: false
+  # Assistant response language (en, ru, de, fr, es, zh, ja)
+  language: "en"
+  # Auto-compact context when >=99% full
+  auto_compact: true
+  # Max parallel read-only tool calls (1 = sequential)
+  max_workers: 4
+  # Automatically use Plan→Execute→Review pipeline (false by default)
+  orchestrator: false
+  # Enable Review phase after Execute (false by default)
+  review: false
+
+tools:
+  # Directories where file operations are allowed
+  allowed_dirs:
+    - "."
+  # File patterns that are blocked from access
+  forbidden_patterns:
+    - "*.env"
+    - ".git/**"
+    - "*.pem"
+    - "*.key"
+    - "credentials.*"
+    - "secrets.*"
+
+rules:
+  # Fixed directories: .kodrun/rules, .kodrun/commands, .kodrun/docs
+  # Register get_rule as a tool for LLM (true by default)
+  # When false, rules are only available via catalog in system prompt
+  use_tool: true
+
+snippets:
+  # Fixed directory: .kodrun/snippets
+  # Register snippets as a tool for LLM (true by default)
+  use_tool: true
+
+rag:
+  # Provider name for embedding (from providers section, default "default")
+  # provider: local
+  # Enable RAG (semantic search over the project)
+  enabled: false
+  # Embedding model (ollama pull nomic-embed-text)
+  embedding_model: "nomic-embed-text"
+  # Directories to index
+  index_dirs:
+    - "."
+  # Chunk size (in lines)
+  chunk_size: 512
+  # Overlap between chunks (in lines)
+  chunk_overlap: 64
+  # Number of search results
+  top_k: 5
+  # Index storage path
+  index_path: ".kodrun/rag_index"
+
+# MCP servers (Model Context Protocol)
+# Each server is a subprocess, communicating via stdio (JSON-RPC 2.0)
+# mcp:
+#   filesystem:
+#     command: "npx"
+#     args: ["-y", "@modelcontextprotocol/server-filesystem", "."]
+#     auto_approve: true
+#     read_only_tools: ["read_file", "list_directory"]
+#   github:
+#     command: "gh-mcp-server"
+#     auto_approve_tools: ["get_issue", "list_issues"]
+#   sqlite:
+#     command: "uvx"
+#     args: ["mcp-server-sqlite", "--db-path", "./data.db"]
+#     disabled: true

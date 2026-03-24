@@ -2,8 +2,10 @@ package tools
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -14,7 +16,7 @@ func TestReadFileTool(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tool := NewReadFileTool(dir, nil)
+	tool := NewReadFileTool(dir, nil, 500)
 
 	result, err := tool.Execute(context.Background(), map[string]any{"path": "test.txt"})
 	if err != nil {
@@ -23,8 +25,9 @@ func TestReadFileTool(t *testing.T) {
 	if !result.Success {
 		t.Fatalf("expected success, got error: %s", result.Error)
 	}
-	if result.Output != content {
-		t.Errorf("got %q, want %q", result.Output, content)
+	expected := "   1 | hello world\n"
+	if result.Output != expected {
+		t.Errorf("got %q, want %q", result.Output, expected)
 	}
 }
 
@@ -34,13 +37,134 @@ func TestReadFileTool_Forbidden(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tool := NewReadFileTool(dir, []string{"*.env"})
+	tool := NewReadFileTool(dir, []string{"*.env"}, 500)
 	result, err := tool.Execute(context.Background(), map[string]any{"path": ".env"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if result.Success {
 		t.Error("expected forbidden access to fail")
+	}
+}
+
+func TestReadFileTool_SmallFile(t *testing.T) {
+	dir := t.TempDir()
+	lines := []string{"line1", "line2", "line3"}
+	if err := os.WriteFile(filepath.Join(dir, "small.txt"), []byte(strings.Join(lines, "\n")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tool := NewReadFileTool(dir, nil, 500)
+	result, err := tool.Execute(context.Background(), map[string]any{"path": "small.txt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Success {
+		t.Fatalf("expected success, got error: %s", result.Error)
+	}
+	if strings.Contains(result.Output, "[truncated]") {
+		t.Error("small file should not be truncated")
+	}
+	if !strings.Contains(result.Output, "   1 | line1") {
+		t.Errorf("expected line numbers, got: %s", result.Output)
+	}
+}
+
+func TestReadFileTool_Truncation(t *testing.T) {
+	dir := t.TempDir()
+	var b strings.Builder
+	totalLines := 20
+	for i := range totalLines {
+		fmt.Fprintf(&b, "line %d\n", i+1)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "big.txt"), []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tool := NewReadFileTool(dir, nil, 5)
+	result, err := tool.Execute(context.Background(), map[string]any{"path": "big.txt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Success {
+		t.Fatalf("expected success, got error: %s", result.Error)
+	}
+	if !strings.Contains(result.Output, "[truncated]") {
+		t.Error("large file should be truncated")
+	}
+	if !strings.Contains(result.Output, "   1 | line 1") {
+		t.Errorf("expected first line, got: %s", result.Output)
+	}
+	if result.Meta["truncated"] != true {
+		t.Error("meta.truncated should be true")
+	}
+}
+
+func TestReadFileTool_OffsetLimit(t *testing.T) {
+	dir := t.TempDir()
+	var b strings.Builder
+	for i := range 20 {
+		fmt.Fprintf(&b, "line %d\n", i+1)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "lines.txt"), []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tool := NewReadFileTool(dir, nil, 500)
+	result, err := tool.Execute(context.Background(), map[string]any{
+		"path":   "lines.txt",
+		"offset": float64(10),
+		"limit":  float64(5),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Success {
+		t.Fatalf("expected success, got error: %s", result.Error)
+	}
+	if !strings.Contains(result.Output, "  11 | line 11") {
+		t.Errorf("expected line 11, got: %s", result.Output)
+	}
+	if !strings.Contains(result.Output, "  15 | line 15") {
+		t.Errorf("expected line 15, got: %s", result.Output)
+	}
+	if result.Meta["offset"] != 10 {
+		t.Errorf("expected offset=10, got %v", result.Meta["offset"])
+	}
+}
+
+func TestReadFileTool_OffsetBeyondEnd(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "short.txt"), []byte("one\ntwo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tool := NewReadFileTool(dir, nil, 500)
+	result, err := tool.Execute(context.Background(), map[string]any{
+		"path":   "short.txt",
+		"offset": float64(100),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Success {
+		t.Error("expected failure for offset beyond file end")
+	}
+}
+
+func TestReadFileTool_EmptyFile(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "empty.txt"), []byte(""), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tool := NewReadFileTool(dir, nil, 500)
+	result, err := tool.Execute(context.Background(), map[string]any{"path": "empty.txt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Success {
+		t.Fatalf("expected success, got error: %s", result.Error)
 	}
 }
 
@@ -124,7 +248,7 @@ func TestListDirTool(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "b.go"), []byte(""), 0o644)
 	os.MkdirAll(filepath.Join(dir, "sub"), 0o755)
 
-	tool := NewListDirTool(dir)
+	tool := NewListDirTool(dir, nil)
 	result, err := tool.Execute(context.Background(), map[string]any{"path": "."})
 	if err != nil {
 		t.Fatal(err)

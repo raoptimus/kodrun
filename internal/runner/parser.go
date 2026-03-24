@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"context"
 	"regexp"
 	"strconv"
 	"strings"
@@ -27,7 +28,7 @@ var (
 )
 
 // ParseErrors extracts structured errors from command output.
-func ParseErrors(output string) []ParsedError {
+func ParseErrors(_ context.Context, output string) []ParsedError {
 	var errors []ParsedError
 	seen := make(map[string]bool)
 
@@ -69,7 +70,7 @@ func ParseErrors(output string) []ParsedError {
 }
 
 // FormatErrors converts parsed errors to a human-readable string.
-func FormatErrors(errors []ParsedError) string {
+func FormatErrors(_ context.Context, errors []ParsedError) string {
 	if len(errors) == 0 {
 		return ""
 	}
@@ -85,7 +86,7 @@ func FormatErrors(errors []ParsedError) string {
 }
 
 // AffectedFiles returns unique file paths from parsed errors.
-func AffectedFiles(errors []ParsedError) []string {
+func AffectedFiles(_ context.Context, errors []ParsedError) []string {
 	seen := make(map[string]bool)
 	var files []string
 	for _, e := range errors {

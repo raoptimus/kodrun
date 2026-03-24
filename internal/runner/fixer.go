@@ -5,8 +5,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/raoptimus/go-agent/internal/ollama"
-	"github.com/raoptimus/go-agent/internal/tools"
+	"github.com/pkg/errors"
+	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/tools"
 )
 
 // Fixer uses an LLM to automatically fix Go errors.
@@ -18,7 +19,7 @@ type Fixer struct {
 }
 
 // NewFixer creates a new error fixer.
-func NewFixer(client *ollama.Client, model string, reg *tools.Registry, maxIter int) *Fixer {
+func NewFixer(_ context.Context, client *ollama.Client, model string, reg *tools.Registry, maxIter int) *Fixer {
 	return &Fixer{
 		client:  client,
 		model:   model,
@@ -29,13 +30,13 @@ func NewFixer(client *ollama.Client, model string, reg *tools.Registry, maxIter 
 
 // Fix attempts to fix errors from a tool run.
 func (f *Fixer) Fix(ctx context.Context, toolName string, output string, onEvent func(string)) (bool, error) {
-	errors := ParseErrors(output)
-	if len(errors) == 0 {
+	errs := ParseErrors(ctx, output)
+	if len(errs) == 0 {
 		return false, nil
 	}
 
 	// Read affected files for context
-	files := AffectedFiles(errors)
+	files := AffectedFiles(ctx, errs)
 	var fileContents strings.Builder
 	for _, file := range files {
 		result, err := f.reg.Execute(ctx, "read_file", map[string]any{"path": file})
@@ -54,7 +55,7 @@ File contents:
 %s
 
 Fix each error. Use edit_file with old_str/new_str for targeted changes.`,
-		FormatErrors(errors),
+		FormatErrors(ctx, errs),
 		fileContents.String(),
 	)
 
@@ -72,7 +73,7 @@ Fix each error. Use edit_file with old_str/new_str for targeted changes.`,
 			Tools: f.reg.ToolDefs(),
 		})
 		if err != nil {
-			return false, fmt.Errorf("fixer chat: %w", err)
+			return false, errors.WithMessage(err, "fixer chat")
 		}
 
 		if len(resp.ToolCalls) == 0 {
@@ -103,11 +104,11 @@ Fix each error. Use edit_file with old_str/new_str for targeted changes.`,
 		}
 
 		// Update prompt with remaining errors
-		errors = ParseErrors(result.Output)
-		if len(errors) == 0 {
+		errs = ParseErrors(ctx, result.Output)
+		if len(errs) == 0 {
 			return true, nil
 		}
-		prompt = fmt.Sprintf("Still have errors:\n%s\n\nFix them.", FormatErrors(errors))
+		prompt = fmt.Sprintf("Still have errors:\n%s\n\nFix them.", FormatErrors(ctx, errs))
 	}
 
 	return false, nil

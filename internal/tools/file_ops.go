@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/raoptimus/go-agent/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/ollama"
 )
 
 // DeleteFileTool deletes a file.
@@ -20,7 +20,7 @@ func NewDeleteFileTool(workDir string, forbiddenPatterns []string) *DeleteFileTo
 }
 
 func (t *DeleteFileTool) Name() string        { return "delete_file" }
-func (t *DeleteFileTool) Description() string  { return "Delete a file" }
+func (t *DeleteFileTool) Description() string { return "Delete a file" }
 
 func (t *DeleteFileTool) Schema() ollama.JSONSchema {
 	return ollama.JSONSchema{
@@ -32,18 +32,18 @@ func (t *DeleteFileTool) Schema() ollama.JSONSchema {
 	}
 }
 
-func (t *DeleteFileTool) Execute(_ context.Context, params map[string]any) (ToolResult, error) {
+func (t *DeleteFileTool) Execute(ctx context.Context, params map[string]any) (ToolResult, error) {
 	path, _ := params["path"].(string)
 	if path == "" {
 		return ToolResult{Error: "path is required", Success: false}, nil
 	}
 
-	resolved, err := SafePath(t.workDir, path)
+	resolved, err := SafePath(ctx, t.workDir, path)
 	if err != nil {
 		return ToolResult{Error: err.Error(), Success: false}, nil
 	}
 
-	if IsForbidden(path, t.forbiddenPatterns) {
+	if IsForbidden(ctx, path, t.forbiddenPatterns) || IsForbidden(ctx, resolved, t.forbiddenPatterns) {
 		return ToolResult{Error: fmt.Sprintf("access to %s is forbidden", path), Success: false}, nil
 	}
 
@@ -51,7 +51,11 @@ func (t *DeleteFileTool) Execute(_ context.Context, params map[string]any) (Tool
 		return ToolResult{Error: err.Error(), Success: false}, nil
 	}
 
-	return ToolResult{Output: fmt.Sprintf("deleted %s", path), Success: true}, nil
+	return ToolResult{
+		Output:  fmt.Sprintf("deleted %s", path),
+		Success: true,
+		Meta:    map[string]any{"action": "Delete"},
+	}, nil
 }
 
 // CreateDirTool creates a directory.
@@ -65,7 +69,7 @@ func NewCreateDirTool(workDir string) *CreateDirTool {
 }
 
 func (t *CreateDirTool) Name() string        { return "create_dir" }
-func (t *CreateDirTool) Description() string  { return "Create a directory (with parents)" }
+func (t *CreateDirTool) Description() string { return "Create a directory (with parents)" }
 
 func (t *CreateDirTool) Schema() ollama.JSONSchema {
 	return ollama.JSONSchema{
@@ -77,13 +81,13 @@ func (t *CreateDirTool) Schema() ollama.JSONSchema {
 	}
 }
 
-func (t *CreateDirTool) Execute(_ context.Context, params map[string]any) (ToolResult, error) {
+func (t *CreateDirTool) Execute(ctx context.Context, params map[string]any) (ToolResult, error) {
 	path, _ := params["path"].(string)
 	if path == "" {
 		return ToolResult{Error: "path is required", Success: false}, nil
 	}
 
-	resolved, err := SafePath(t.workDir, path)
+	resolved, err := SafePath(ctx, t.workDir, path)
 	if err != nil {
 		return ToolResult{Error: err.Error(), Success: false}, nil
 	}
@@ -92,7 +96,11 @@ func (t *CreateDirTool) Execute(_ context.Context, params map[string]any) (ToolR
 		return ToolResult{Error: err.Error(), Success: false}, nil
 	}
 
-	return ToolResult{Output: fmt.Sprintf("created %s", path), Success: true}, nil
+	return ToolResult{
+		Output:  fmt.Sprintf("created %s", path),
+		Success: true,
+		Meta:    map[string]any{"action": "Add"},
+	}, nil
 }
 
 // MoveFileTool moves/renames a file.
@@ -107,7 +115,7 @@ func NewMoveFileTool(workDir string, forbiddenPatterns []string) *MoveFileTool {
 }
 
 func (t *MoveFileTool) Name() string        { return "move_file" }
-func (t *MoveFileTool) Description() string  { return "Move or rename a file" }
+func (t *MoveFileTool) Description() string { return "Move or rename a file" }
 
 func (t *MoveFileTool) Schema() ollama.JSONSchema {
 	return ollama.JSONSchema{
@@ -120,7 +128,7 @@ func (t *MoveFileTool) Schema() ollama.JSONSchema {
 	}
 }
 
-func (t *MoveFileTool) Execute(_ context.Context, params map[string]any) (ToolResult, error) {
+func (t *MoveFileTool) Execute(ctx context.Context, params map[string]any) (ToolResult, error) {
 	from, _ := params["from"].(string)
 	to, _ := params["to"].(string)
 
@@ -128,17 +136,18 @@ func (t *MoveFileTool) Execute(_ context.Context, params map[string]any) (ToolRe
 		return ToolResult{Error: "from and to are required", Success: false}, nil
 	}
 
-	resolvedFrom, err := SafePath(t.workDir, from)
+	resolvedFrom, err := SafePath(ctx, t.workDir, from)
 	if err != nil {
 		return ToolResult{Error: err.Error(), Success: false}, nil
 	}
 
-	resolvedTo, err := SafePath(t.workDir, to)
+	resolvedTo, err := SafePath(ctx, t.workDir, to)
 	if err != nil {
 		return ToolResult{Error: err.Error(), Success: false}, nil
 	}
 
-	if IsForbidden(from, t.forbiddenPatterns) || IsForbidden(to, t.forbiddenPatterns) {
+	if IsForbidden(ctx, from, t.forbiddenPatterns) || IsForbidden(ctx, to, t.forbiddenPatterns) ||
+		IsForbidden(ctx, resolvedFrom, t.forbiddenPatterns) || IsForbidden(ctx, resolvedTo, t.forbiddenPatterns) {
 		return ToolResult{Error: "access to path is forbidden", Success: false}, nil
 	}
 
@@ -146,5 +155,9 @@ func (t *MoveFileTool) Execute(_ context.Context, params map[string]any) (ToolRe
 		return ToolResult{Error: err.Error(), Success: false}, nil
 	}
 
-	return ToolResult{Output: fmt.Sprintf("moved %s → %s", from, to), Success: true}, nil
+	return ToolResult{
+		Output:  fmt.Sprintf("moved %s → %s", from, to),
+		Success: true,
+		Meta:    map[string]any{"action": "Rename"},
+	}, nil
 }
