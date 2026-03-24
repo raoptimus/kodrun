@@ -4,26 +4,28 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 
-	"github.com/raoptimus/go-agent/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/ollama"
 )
 
 // GrepTool searches for a pattern in files.
 type GrepTool struct {
-	workDir string
+	workDir   string
+	forbidden []string
 }
 
 // NewGrepTool creates a new grep tool.
-func NewGrepTool(workDir string) *GrepTool {
-	return &GrepTool{workDir: workDir}
+func NewGrepTool(workDir string, forbidden []string) *GrepTool {
+	return &GrepTool{workDir: workDir, forbidden: forbidden}
 }
 
 func (t *GrepTool) Name() string        { return "grep" }
-func (t *GrepTool) Description() string  { return "Search for a regex pattern in files" }
+func (t *GrepTool) Description() string { return "Search for a regex pattern in files" }
 
 func (t *GrepTool) Schema() ollama.JSONSchema {
 	return ollama.JSONSchema{
@@ -37,7 +39,7 @@ func (t *GrepTool) Schema() ollama.JSONSchema {
 	}
 }
 
-func (t *GrepTool) Execute(_ context.Context, params map[string]any) (ToolResult, error) {
+func (t *GrepTool) Execute(ctx context.Context, params map[string]any) (ToolResult, error) {
 	pattern, _ := params["pattern"].(string)
 	path, _ := params["path"].(string)
 	recursive, _ := params["recursive"].(string)
@@ -53,7 +55,7 @@ func (t *GrepTool) Execute(_ context.Context, params map[string]any) (ToolResult
 
 	searchPath := t.workDir
 	if path != "" {
-		resolved, err := SafePath(t.workDir, path)
+		resolved, err := SafePath(ctx, t.workDir, path)
 		if err != nil {
 			return ToolResult{Error: err.Error(), Success: false}, nil
 		}
@@ -86,6 +88,7 @@ func (t *GrepTool) Execute(_ context.Context, params map[string]any) (ToolResult
 				}
 			}
 		}
+		// scanner.Err() intentionally ignored: partial results are acceptable for grep.
 	}
 
 	info, err := os.Stat(searchPath)
@@ -96,8 +99,18 @@ func (t *GrepTool) Execute(_ context.Context, params map[string]any) (ToolResult
 	if !info.IsDir() {
 		searchFile(searchPath)
 	} else if recursive == "true" {
-		_ = filepath.Walk(searchPath, func(p string, info os.FileInfo, err error) error {
-			if err != nil || info.IsDir() || len(results) >= maxResults {
+		_ = filepath.WalkDir(searchPath, func(p string, d fs.DirEntry, err error) error {
+			if err != nil || len(results) >= maxResults {
+				return nil
+			}
+			rel, _ := filepath.Rel(t.workDir, p)
+			if d.IsDir() {
+				if IsForbiddenDir(ctx, rel, t.forbidden) {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if IsForbidden(ctx, rel, t.forbidden) {
 				return nil
 			}
 			searchFile(p)
@@ -109,7 +122,11 @@ func (t *GrepTool) Execute(_ context.Context, params map[string]any) (ToolResult
 			if e.IsDir() || len(results) >= maxResults {
 				continue
 			}
-			searchFile(filepath.Join(searchPath, e.Name()))
+			name := e.Name()
+			if IsForbidden(ctx, name, t.forbidden) {
+				continue
+			}
+			searchFile(filepath.Join(searchPath, name))
 		}
 	}
 

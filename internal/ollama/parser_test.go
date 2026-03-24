@@ -52,7 +52,7 @@ func TestParseToolCalls_XMLFormat(t *testing.T) {
 hello.txt
 </parameter>
 <parameter=content>
-Hello from GoAgent!
+Hello from KodRun!
 </parameter>
 </function>`
 
@@ -71,8 +71,8 @@ Hello from GoAgent!
 		t.Errorf("path = %q, want %q", path, "hello.txt")
 	}
 	content, _ := calls[0].Function.Arguments["content"].(string)
-	if content != "Hello from GoAgent!" {
-		t.Errorf("content = %q, want %q", content, "Hello from GoAgent!")
+	if content != "Hello from KodRun!" {
+		t.Errorf("content = %q, want %q", content, "Hello from KodRun!")
 	}
 }
 

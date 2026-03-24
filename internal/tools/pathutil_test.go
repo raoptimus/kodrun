@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"testing"
 )
 
@@ -45,9 +46,37 @@ func TestSafePath(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := SafePath(tt.workDir, tt.path)
+			_, err := SafePath(context.Background(), tt.workDir, tt.path)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("SafePath() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestIsForbiddenDir(t *testing.T) {
+	patterns := []string{"node_modules/**", "vendor/**"}
+
+	tests := []struct {
+		name string
+		path string
+		want bool
+	}{
+		{"hidden dir .git", ".git", true},
+		{"hidden dir .idea", ".idea", true},
+		{"hidden dir .build", ".build", true},
+		{"hidden dir .claude", ".claude", true},
+		{"hidden dir itself", ".hidden", true},
+		{"normal dir", "internal", false},
+		{"normal nested dir", "internal/tools", false},
+		{"pattern match node_modules", "node_modules", true},
+		{"pattern match vendor", "vendor", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsForbiddenDir(context.Background(), tt.path, patterns); got != tt.want {
+				t.Errorf("IsForbiddenDir(%q) = %v, want %v", tt.path, got, tt.want)
 			}
 		})
 	}
@@ -68,7 +97,7 @@ func TestIsForbidden(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.path, func(t *testing.T) {
-			if got := IsForbidden(tt.path, patterns); got != tt.want {
+			if got := IsForbidden(context.Background(), tt.path, patterns); got != tt.want {
 				t.Errorf("IsForbidden(%q) = %v, want %v", tt.path, got, tt.want)
 			}
 		})

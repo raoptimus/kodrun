@@ -54,18 +54,43 @@ type JSONSchema struct {
 
 // ChatResponse is the response from the chat API.
 type ChatResponse struct {
-	Model     string  `json:"model"`
-	Message   Message `json:"message"`
-	Done      bool    `json:"done"`
-	DoneReason string `json:"done_reason,omitempty"`
+	Model              string  `json:"model"`
+	Message            Message `json:"message"`
+	Done               bool    `json:"done"`
+	DoneReason         string  `json:"done_reason,omitempty"`
+	PromptEvalCount    int     `json:"prompt_eval_count,omitempty"`
+	PromptEvalDuration int64   `json:"prompt_eval_duration,omitempty"`
+	EvalCount          int     `json:"eval_count,omitempty"`
+	EvalDuration       int64   `json:"eval_duration,omitempty"`
+	TotalDuration      int64   `json:"total_duration,omitempty"`
+	LoadDuration       int64   `json:"load_duration,omitempty"`
 }
 
 // ChatChunk represents a streaming chunk or final aggregated response.
 type ChatChunk struct {
-	Content   string
-	ToolCalls []ToolCall
-	Done      bool
-	Error     error
+	Content            string
+	ToolCalls          []ToolCall
+	Done               bool
+	Error              error
+	PromptEvalCount    int
+	PromptEvalDuration int64
+	EvalCount          int
+	EvalDuration       int64
+	TotalDuration      int64
+	LoadDuration       int64
+}
+
+// EmbedRequest is the request body for the embed API.
+type EmbedRequest struct {
+	Model    string   `json:"model"`
+	Input    []string `json:"input"`
+	Truncate bool     `json:"truncate,omitempty"`
+}
+
+// EmbedResponse is the response from the embed API.
+type EmbedResponse struct {
+	Model      string      `json:"model"`
+	Embeddings [][]float64 `json:"embeddings"`
 }
 
 // Model represents an Ollama model.

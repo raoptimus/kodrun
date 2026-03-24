@@ -1,15 +1,18 @@
 package tools
 
 import (
-	"fmt"
+	"context"
+	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/pkg/errors"
 )
 
 // SafePath resolves a path relative to workDir and ensures it doesn't escape.
-func SafePath(workDir, path string) (string, error) {
+func SafePath(_ context.Context, workDir, path string) (string, error) {
 	if filepath.IsAbs(path) {
-		return "", fmt.Errorf("absolute paths not allowed: %s", path)
+		return "", errors.Errorf("absolute paths not allowed: %s", path)
 	}
 
 	resolved := filepath.Join(workDir, path)
@@ -18,18 +21,50 @@ func SafePath(workDir, path string) (string, error) {
 	// Ensure the resolved path is under workDir
 	rel, err := filepath.Rel(workDir, resolved)
 	if err != nil {
-		return "", fmt.Errorf("resolve path: %w", err)
+		return "", errors.WithMessage(err, "resolve path")
 	}
 
 	if strings.HasPrefix(rel, "..") {
-		return "", fmt.Errorf("path traversal not allowed: %s", path)
+		return "", errors.Errorf("path traversal not allowed: %s", path)
+	}
+
+	// Resolve symlinks and re-check to prevent symlink-based traversal.
+	if real, err := filepath.EvalSymlinks(resolved); err == nil {
+		realWorkDir := workDir
+		if rwd, e := filepath.EvalSymlinks(workDir); e == nil {
+			realWorkDir = rwd
+		}
+		realRel, relErr := filepath.Rel(realWorkDir, real)
+		if relErr != nil || strings.HasPrefix(realRel, "..") {
+			return "", errors.Errorf("symlink escapes work directory: %s", path)
+		}
+	} else if !os.IsNotExist(err) {
+		return "", errors.WithMessage(err, "resolve symlink")
 	}
 
 	return resolved, nil
 }
 
+// IsForbiddenDir checks if a directory should be skipped during Walk.
+// Hidden directories (starting with ".") are always forbidden.
+// Additionally matches patterns like ".git/**" against directory name.
+func IsForbiddenDir(_ context.Context, relPath string, patterns []string) bool {
+	dirName := filepath.Base(relPath)
+	if strings.HasPrefix(dirName, ".") {
+		return true
+	}
+	for _, pattern := range patterns {
+		if dirPattern, ok := strings.CutSuffix(pattern, "/**"); ok {
+			if matched, _ := filepath.Match(dirPattern, dirName); matched {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // IsForbidden checks if a path matches any forbidden patterns.
-func IsForbidden(path string, patterns []string) bool {
+func IsForbidden(_ context.Context, path string, patterns []string) bool {
 	for _, pattern := range patterns {
 		if matched, _ := filepath.Match(pattern, filepath.Base(path)); matched {
 			return true

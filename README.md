@@ -1,205 +1,192 @@
-# GoAgent
+# KodRun
 
-CLI-агент для написания и сопровождения Go-кода. Работает полностью локально через [Ollama](https://ollama.com) API. Читает правила и документацию из рабочей директории проекта, выполняет инструменты (файловые операции, build/test/lint), автоматически исправляет ошибки через LLM.
+> **Beta** — this project is under active development. APIs and configuration may change.
 
-## Возможности
+CLI agent for writing and maintaining Go code. Runs fully locally via [Ollama](https://ollama.com) API. Reads rules, snippets, and documentation from the project working directory, executes tools (file operations, build/test/lint), and automatically fixes errors through LLM.
 
-- Чат с LLM, который имеет доступ к файлам проекта и Go-инструментам
-- Автоматическое исправление ошибок компиляции, тестов и линтера
-- Система правил: стиль кода, архитектура, пользовательские команды
-- Полноэкранный TUI (bubbletea) и plain stdout режим для pipe/скриптов
-- Path traversal защита и forbidden patterns для безопасности
-- Управление контекстом с суммаризацией при переполнении окна
+Tested with **qwen3-coder:30b** model. For RAG (semantic code search), the **nomic-embed-text** embedding model is recommended.
 
-## Быстрый старт
+## Features
 
-### Требования
+- Chat with LLM that has access to project files and Go tools
+- Automatic fix of compilation errors, tests, and linter issues
+- Rule system: code style, architecture, custom commands
+- Snippet system: reusable code templates with placeholders
+- RAG: semantic search over the project codebase
+- MCP (Model Context Protocol) support for external tool servers
+- Fullscreen TUI (bubbletea) and plain stdout mode for pipes/scripts
+- Path traversal protection and forbidden patterns for security
+- Context management with auto-compaction on overflow
+- Multi-provider support (multiple Ollama instances)
 
-- Go 1.23+
-- [Ollama](https://ollama.com) с загруженной моделью
+## Quick Start
 
-### Установка
+### Requirements
+
+- Go 1.25+
+- [Ollama](https://ollama.com) with a loaded model
+
+### Installation
 
 ```bash
-# Из исходников
-git clone https://github.com/raoptimus/go-agent.git
-cd go-agent
-make install
-
-# Или собрать локально
-make build
+go install github.com/raoptimus/kodrun/cmd/kodrun@latest
 ```
 
-### Запуск
+Or from source:
 
 ```bash
-# Убедитесь, что Ollama запущена
+git clone https://github.com/raoptimus/kodrun.git
+cd kodrun
+make install
+```
+
+### Launch
+
+```bash
+# Make sure Ollama is running
 ollama serve
 
-# Загрузите модель (если ещё не загружена)
+# Pull the model (if not already pulled)
 ollama pull qwen3-coder:30b
 
-# Интерактивный режим (TUI)
-goagent
+# (Optional) Pull embedding model for RAG
+ollama pull nomic-embed-text
 
-# Или через make
-make run
+# Interactive mode (TUI)
+kodrun
+
+# Initialize a new project
+kodrun init
 ```
 
-## Использование
+## Usage
 
-### Интерактивный режим
+### Initialize a New Project
+
+The `kodrun init` command creates the `.kodrun/` directory structure with starter rules, snippets, commands, and an `AGENTS.md` file:
 
 ```bash
-# TUI с полноэкранным интерфейсом
-goagent
-
-# Plain stdout (без TUI)
-goagent --no-tui
+cd your-go-project
+kodrun init
 ```
 
-### Одноразовая задача
+This creates:
+
+```
+.kodrun/
+  rules/       — code style and architecture rules
+  docs/        — project documentation
+  commands/    — custom chat commands
+  snippets/    — reusable code templates
+```
+
+### Interactive Mode
 
 ```bash
-# Из командной строки
-goagent -- "написать unit тест для функции ParseConfig"
+# TUI with fullscreen interface
+kodrun
 
-# Через make
-make task TASK="добавить godoc к публичным функциям в auth.go"
-
-# Через pipe
-echo "написать тесты для auth.go" | goagent --no-tui
+# Plain stdout (no TUI)
+kodrun --no-tui
 ```
 
-### Subcommands с авто-исправлением
+### One-shot Task
 
 ```bash
-# Собрать проект, при ошибках — LLM исправит и повторит
-goagent build
+# From command line
+kodrun -- "write a unit test for ParseConfig function"
 
-# Запустить тесты с авто-исправлением
-goagent test ./internal/config/...
+# Via make
+make task TASK="add godoc to public functions in auth.go"
 
-# Линтер с авто-исправлением
-goagent lint
-
-# Исправить конкретный файл
-goagent fix internal/agent/agent.go
+# Via pipe
+echo "write tests for auth.go" | kodrun --no-tui
 ```
 
-### Инициализация правил
+### Subcommands with Auto-fix
 
 ```bash
-# Создать .goagent/ со стартовой структурой
-goagent init
+# Build the project; on errors — LLM fixes and retries
+kodrun build
+
+# Run tests with auto-fix
+kodrun test ./internal/config/...
+
+# Linter with auto-fix
+kodrun lint
+
+# Fix a specific file
+kodrun fix internal/agent/agent.go
 ```
 
-### Флаги
+### Flags
 
-| Флаг | Описание | По умолчанию |
-|------|----------|--------------|
-| `--model` | Модель Ollama | из конфига |
-| `--work-dir` | Рабочая директория | `.` |
-| `--no-tui` | Режим plain stdout | `false` |
-| `--no-fix` | Отключить авто-исправление | `false` |
-| `--config` | Путь к конфигу | автоопределение |
-| `--verbose` | Подробный вывод | `false` |
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--model` | Ollama model | from config |
+| `--work-dir` | Working directory | `.` |
+| `--no-tui` | Plain stdout mode | `false` |
+| `--no-fix` | Disable auto-fix | `false` |
+| `--config` | Config file path | auto-detect |
+| `--verbose` | Verbose output | `false` |
 
-### Переменные окружения
+### Environment Variables
 
-| Переменная | Описание |
-|------------|----------|
-| `GOAGENT_MODEL` | Модель Ollama (приоритет над конфигом) |
-| `GOAGENT_OLLAMA_URL` | URL Ollama API |
-| `GOAGENT_WORK_DIR` | Рабочая директория |
-| `GOAGENT_NO_TUI` | `1` или `true` — отключить TUI |
+| Variable | Description |
+|----------|-------------|
+| `KODRUN_MODEL` | Ollama model (overrides config) |
+| `KODRUN_OLLAMA_URL` | Ollama API URL |
+| `KODRUN_WORK_DIR` | Working directory |
+| `KODRUN_NO_TUI` | `1` or `true` — disable TUI |
 
-## Конфигурация
+## Configuration
 
-Конфиг ищется в следующем порядке (каждый следующий переопределяет предыдущий):
+Config is resolved in the following order (each subsequent level overrides the previous):
 
-1. Встроенные дефолты
-2. `~/.config/goagent/config.yaml` — глобальный конфиг
-3. `.goagent.yaml` в корне проекта — проектный конфиг
-4. Переменные окружения
-5. Флаги командной строки
+1. Built-in defaults
+2. `~/.config/kodrun/config.yaml` — global config
+3. `.kodrun.yaml` in the project root — project config
+4. Environment variables
+5. Command-line flags
 
-### Пример `.goagent.yaml`
+See [`examples/kodrun.yaml`](examples/kodrun.yaml) for a full project config example and [`examples/global-config.yaml`](examples/global-config.yaml) for a global config example.
+
+### Minimal `.kodrun.yaml`
 
 ```yaml
 ollama:
-  base_url: "http://localhost:11434"
   model: "qwen3-coder:30b"
-  timeout: 300s
   context_size: 32768
 
 agent:
-  max_iterations: 50
   auto_fix: true
-  auto_commit: false
 
-tools:
-  allowed_dirs:
-    - "."
-  forbidden_patterns:
-    - "*.env"
-    - ".git/**"
-    - "*.pem"
-    - "*.key"
-
-rules:
-  dirs:
-    - ".goagent/rules"
-    - ".goagent/docs"
-    - ".goagent/commands"
+rag:
+  enabled: true
+  embedding_model: "nomic-embed-text"
 ```
 
-### Пример глобального конфига `~/.config/goagent/config.yaml`
+## Rules
 
-```yaml
-ollama:
-  base_url: "http://localhost:11434"
-  model: "qwen3-coder:30b"
-  timeout: 600s
+KodRun loads `.md` files from directories listed in `rules.dirs` and includes them in the agent's system prompt. This lets you customize agent behavior for your specific project.
 
-agent:
-  max_iterations: 100
-```
+### Rule File Format
 
-## Система правил
-
-GoAgent загружает `.md` файлы из директорий, указанных в `rules.dirs`, и включает их в системный промпт агента. Это позволяет настроить поведение агента под конкретный проект.
-
-### Структура `.goagent/`
-
-```
-.goagent/
-  rules/          — правила стиля и архитектуры
-  docs/           — документация проекта
-  commands/       — пользовательские команды
-```
-
-Создаётся командой `goagent init`.
-
-### Формат файлов правил
-
-Обычный Markdown с опциональным front matter:
+Standard Markdown with optional front matter:
 
 ```markdown
 ---
-priority: high       # high | normal | low — порядок включения в промпт
+priority: high       # high | normal | low — inclusion order in prompt
 scope: coding        # coding | review | fix | all
 ---
 
-# Правила стиля
+# Style Rules
 
-- Использовать `errors.Is` вместо прямого сравнения
-- Все публичные функции должны иметь godoc
+- Use `errors.Is` instead of direct comparison
+- All public functions must have godoc
 ```
 
-### Примеры правил
-
-#### `.goagent/rules/style.md` — стиль кода
+### Example: `.kodrun/rules/style.md`
 
 ```markdown
 ---
@@ -209,212 +196,127 @@ scope: coding
 
 # Go Style Rules
 
-- Использовать `errors.Is`/`errors.As` вместо прямого сравнения ошибок
-- Все публичные функции должны иметь godoc комментарии
-- Обёртка ошибок через `fmt.Errorf("operation: %w", err)`
-- Sentinel-ошибки определяются как `var` на уровне пакета
-- Никогда не вызывать `errors.New()` в рантайме (определять статические переменные)
+- Use `errors.Is`/`errors.As` instead of direct error comparison
+- All public functions must have godoc comments
+- Wrap errors with `fmt.Errorf("operation: %w", err)`
+- Define sentinel errors as package-level `var`
 ```
 
-#### `.goagent/rules/architecture.md` — архитектурные правила
+See more examples in [`examples/rules/`](examples/rules/).
+
+## Snippets
+
+Snippets are reusable code templates that the LLM can use when generating code. They help maintain consistency across the project.
+
+### Snippet File Format
+
+YAML front matter followed by the template code:
 
 ```markdown
 ---
-priority: high
-scope: all
+description: "Standard HTTP handler"
+tags: [http, handler]
+lang: go
+placeholders:
+  EntityName: "Name of the entity"
 ---
 
-# Архитектура проекта
-
-Clean Architecture с направлением зависимостей: transport → domain ← dal ← client.
-Domain ничего не знает о транспорте и инфраструктуре.
-
-Слои:
-- domain/model/ — доменные модели
-- domain/service/ — бизнес-логика одной сущности
-- domain/usecase/ — оркестрация 2+ сервисов
-- dal/entity/ — структуры БД
-- dal/repository/ — SQL-запросы
-- server/grpc/ — gRPC handlers
-- client/ — обёртки над внешними SDK
+func (h *Handler) Get{{EntityName}}(w http.ResponseWriter, r *http.Request) {
+    // handler implementation
+}
 ```
 
-#### `.goagent/rules/testing.md` — правила тестирования
+Place snippet files in `.kodrun/snippets/` (or directories listed in `snippets.dirs`).
 
-```markdown
----
-priority: normal
-scope: coding
----
+The agent can retrieve snippets via the `get_snippet` tool based on name, tags, or file path context.
 
-# Тестирование
+## Custom Commands
 
-- Используй table-driven tests (TDT)
-- Внешние зависимости всегда мокаются
-- Ожидаемые значения хардкодятся, не вычисляются
-- Тестируем только локальную логику, не поведение зависимостей
-- Проверяй граничные условия на стыках классов эквивалентности
-- Минимальная зависимость от деталей реализации
-```
+Files in `.kodrun/commands/` define commands callable via `/command` in chat:
 
-#### `.goagent/rules/service.md` — правила для доменных сервисов
-
-```markdown
----
-priority: normal
-scope: coding
----
-
-# Доменные сервисы
-
-- Каждый сервис работает только с одной сущностью
-- Зависимости — интерфейсы, определённые рядом с потребителем
-- Интерфейсы содержат только используемые методы
-- Конвертация model ↔ entity всегда через пакет convert/
-- Методы создания и обновления не возвращают значение — только error
-- Операции с несколькими сущностями → usecase, не service
-```
-
-### Пользовательские команды
-
-Файлы в `.goagent/commands/` определяют команды, вызываемые через `/command` в чате:
-
-#### `.goagent/commands/review.md`
+### Example: `.kodrun/commands/review.md`
 
 ```markdown
 ---
 command: /review
-description: "Провести code review файла"
+description: "Run code review on a file"
 ---
 
-Проведи детальный code review файла {{file}}.
-Проверь:
-- Баги и логические ошибки
-- Обработку ошибок
-- Нарушения стиля кода
-- Отсутствие тестов
-- Проблемы производительности
-
-Дай конкретные, actionable замечания.
+Perform a detailed code review of {{file}}.
+Check for:
+- Bugs and logic errors
+- Error handling
+- Style violations
+- Missing tests
+- Performance issues
 ```
 
-#### `.goagent/commands/refactor.md`
+See more examples in [`examples/commands/`](examples/commands/).
 
-```markdown
----
-command: /refactor
-description: "Рефакторинг по описанию"
----
+## RAG (Semantic Search)
 
-Выполни рефакторинг: {{description}}
+KodRun can index your project files and perform semantic search to find relevant code context. This is especially useful for large codebases.
 
-Требования:
-- Сохранить существующее поведение
-- Запустить go_build и go_test после изменений
-- Минимальные изменения
+```yaml
+rag:
+  enabled: true
+  embedding_model: "nomic-embed-text"
+  index_dirs: ["."]
+  chunk_size: 512
+  top_k: 5
 ```
 
-#### `.goagent/commands/test.md`
+Make sure to pull the embedding model first:
 
-```markdown
----
-command: /test
-description: "Написать тесты для файла"
----
-
-Напиши unit-тесты для файла {{file}}.
-
-Правила:
-- Table-driven tests
-- Покрой классы эквивалентности и граничные условия
-- Мокай внешние зависимости
-- Хардкодь ожидаемые значения
-- Запусти go_test после написания
+```bash
+ollama pull nomic-embed-text
 ```
 
-## Доступные инструменты
+## Available Tools
 
-Агент имеет доступ к следующим инструментам:
+### File Operations
 
-### Файловые операции
+| Tool | Description |
+|------|-------------|
+| `read_file` | Read file contents |
+| `write_file` | Write a file (creates directories) |
+| `edit_file` | Find & replace text in a file |
+| `list_dir` | List files in a directory |
+| `find_files` | Find files by glob pattern |
+| `grep` | Search files by regex |
+| `delete_file` | Delete a file |
+| `create_dir` | Create a directory |
+| `move_file` | Move/rename a file |
+| `bash` | Execute a shell command |
 
-| Инструмент | Описание |
-|------------|----------|
-| `read_file` | Прочитать содержимое файла |
-| `write_file` | Записать файл (создаёт директории) |
-| `edit_file` | Заменить текст в файле (find & replace) |
-| `list_dir` | Список файлов в директории |
-| `find_files` | Поиск файлов по glob-паттерну |
-| `grep` | Поиск по regex в файлах |
-| `delete_file` | Удалить файл |
-| `create_dir` | Создать директорию |
-| `move_file` | Переместить/переименовать файл |
-| `bash` | Выполнить shell-команду |
+### Go Tools
 
-### Go-инструменты
-
-| Инструмент | Описание |
-|------------|----------|
-| `go_build` | `go build` с парсингом ошибок |
-| `go_test` | `go test` с парсингом ошибок |
+| Tool | Description |
+|------|-------------|
+| `go_build` | `go build` with error parsing |
+| `go_test` | `go test` with error parsing |
 | `go_lint` | `golangci-lint run` |
 | `go_fmt` | `gofmt -w` |
 | `go_vet` | `go vet` |
 | `go_mod_tidy` | `go mod tidy` |
 
-### Безопасность
+### Security
 
-- Все пути резолвятся относительно рабочей директории
-- Выход за пределы work_dir запрещён (path traversal защита)
-- `forbidden_patterns` из конфига блокируют доступ к чувствительным файлам
+- All paths are resolved relative to the working directory
+- Directory escape is blocked (path traversal protection)
+- `forbidden_patterns` from config block access to sensitive files
 
-## Архитектура проекта
-
-```
-cmd/goagent/main.go           — CLI (cobra), точка входа
-internal/
-  agent/
-    agent.go                  — агентный цикл (LLM → tools → result)
-    context.go                — управление контекстом (суммаризация)
-    output.go                 — plain stdout вывод
-  config/
-    config.go                 — конфигурация (viper, YAML, env)
-  ollama/
-    client.go                 — HTTP-клиент Ollama API (streaming, retry)
-    types.go                  — типы запросов/ответов
-    parser.go                 — парсинг tool calls из текста (JSON + XML)
-  tools/
-    registry.go               — реестр инструментов
-    pathutil.go                — path traversal защита
-    file_read.go               — read_file
-    file_write.go              — write_file
-    file_edit.go               — edit_file
-    file_list.go               — list_dir
-    file_find.go               — find_files
-    file_grep.go               — grep
-    file_ops.go                — delete_file, create_dir, move_file
-    go_tools.go                — go_build, go_test, go_lint, go_fmt, go_vet, bash
-  rules/
-    loader.go                  — загрузка правил из .md файлов
-  runner/
-    parser.go                  — парсинг ошибок Go (build/test/lint)
-    fixer.go                   — авто-исправление через LLM
-  tui/
-    model.go                   — bubbletea TUI (viewport, textinput)
-  goagentinit/
-    init.go                    — goagent init (создание .goagent/)
-```
-
-## Разработка
+## Development
 
 ```bash
-make build          # Собрать бинарник
-make test           # Юнит-тесты
-make lint           # Линтер
-make clean          # Очистить артефакты
-make help           # Список целей
+make build          # Build binary
+make install        # Install to $GOPATH/bin
+make test           # Unit tests
+make lint           # Linter
+make clean          # Clean artifacts
+make help           # List targets
 ```
 
-## Лицензия
+## License
 
 MIT

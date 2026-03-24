@@ -1,0 +1,46 @@
+package rag
+
+import (
+	"fmt"
+	"path/filepath"
+)
+
+// RuleInfo holds the rule metadata needed for chunking.
+type RuleInfo struct {
+	Name    string
+	Content string
+	Path    string
+}
+
+// ChunkRules converts rules into RAG chunks.
+func ChunkRules(rules []RuleInfo) []Chunk {
+	chunks := make([]Chunk, 0, len(rules))
+	for _, r := range rules {
+		body := fmt.Sprintf("Rule: %s\n\n%s", r.Name, r.Content)
+		relPath := r.Path
+		if relPath == "" {
+			relPath = "rules://" + r.Name
+		}
+		subChunks := splitIntoChunks(relPath, body, 512, 32)
+		chunks = append(chunks, subChunks...)
+	}
+	return chunks
+}
+
+// RefDocInfo holds reference documentation metadata for chunking.
+type RefDocInfo struct {
+	Path    string
+	Content string
+}
+
+// ChunkRefDocs converts reference documents into RAG chunks.
+func ChunkRefDocs(docs []RefDocInfo) []Chunk {
+	chunks := make([]Chunk, 0, len(docs))
+	for _, d := range docs {
+		name := filepath.Base(d.Path)
+		body := fmt.Sprintf("Documentation: %s\n\n%s", name, d.Content)
+		subChunks := splitIntoChunks(d.Path, body, 512, 32)
+		chunks = append(chunks, subChunks...)
+	}
+	return chunks
+}

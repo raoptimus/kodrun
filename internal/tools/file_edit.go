@@ -6,7 +6,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/raoptimus/go-agent/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/ollama"
 )
 
 // EditFileTool performs find-and-replace editing in a file.
@@ -21,7 +21,7 @@ func NewEditFileTool(workDir string, forbiddenPatterns []string) *EditFileTool {
 }
 
 func (t *EditFileTool) Name() string        { return "edit_file" }
-func (t *EditFileTool) Description() string  { return "Edit a file by replacing old_str with new_str" }
+func (t *EditFileTool) Description() string { return "Edit a file by replacing old_str with new_str" }
 
 func (t *EditFileTool) Schema() ollama.JSONSchema {
 	return ollama.JSONSchema{
@@ -35,7 +35,7 @@ func (t *EditFileTool) Schema() ollama.JSONSchema {
 	}
 }
 
-func (t *EditFileTool) Execute(_ context.Context, params map[string]any) (ToolResult, error) {
+func (t *EditFileTool) Execute(ctx context.Context, params map[string]any) (ToolResult, error) {
 	path, _ := params["path"].(string)
 	oldStr, _ := params["old_str"].(string)
 	newStr, _ := params["new_str"].(string)
@@ -44,12 +44,12 @@ func (t *EditFileTool) Execute(_ context.Context, params map[string]any) (ToolRe
 		return ToolResult{Error: "path and old_str are required", Success: false}, nil
 	}
 
-	resolved, err := SafePath(t.workDir, path)
+	resolved, err := SafePath(ctx, t.workDir, path)
 	if err != nil {
 		return ToolResult{Error: err.Error(), Success: false}, nil
 	}
 
-	if IsForbidden(path, t.forbiddenPatterns) {
+	if IsForbidden(ctx, path, t.forbiddenPatterns) || IsForbidden(ctx, resolved, t.forbiddenPatterns) {
 		return ToolResult{Error: fmt.Sprintf("access to %s is forbidden", path), Success: false}, nil
 	}
 
@@ -69,8 +69,22 @@ func (t *EditFileTool) Execute(_ context.Context, params map[string]any) (ToolRe
 		return ToolResult{Error: err.Error(), Success: false}, nil
 	}
 
+	added, removed := LineStats(content, newContent)
+	diff := SimpleDiff(content, newContent, path, 30)
+
+	msg := fmt.Sprintf("replaced 1 occurrence in %s", path)
+	if count > 1 {
+		msg = fmt.Sprintf("replaced 1 of %d occurrences in %s (warning: %d more remain)", count, path, count-1)
+	}
+
 	return ToolResult{
-		Output:  fmt.Sprintf("replaced 1 occurrence in %s", path),
+		Output:  msg,
 		Success: true,
+		Meta: map[string]any{
+			"action":  "Update",
+			"added":   added,
+			"removed": removed,
+			"diff":    diff,
+		},
 	}, nil
 }

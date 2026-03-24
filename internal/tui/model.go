@@ -2,67 +2,305 @@ package tui
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
-	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
-	"github.com/raoptimus/go-agent/internal/agent"
+	"github.com/raoptimus/kodrun/internal/agent"
+)
+
+const (
+	maxVisibleItems = 5
+	maxLogLines     = 10000 // trim logs to prevent unbounded memory growth
 )
 
 var (
-	titleStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
-	agentStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	toolStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("4"))
-	fixStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
-	errorStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
-	statusStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	titleStyle         = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
+	agentStyle         = lipgloss.NewStyle()
+	agentHeadingStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
+	userStyle          = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("2"))
+	botStyle           = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("5"))
+	toolStyle          = lipgloss.NewStyle().Foreground(lipgloss.Color("4"))
+	fixStyle           = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
+	errorStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
+	confirmHeaderStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6"))
+	confirmNormal      = lipgloss.NewStyle().PaddingLeft(4)
+	confirmSelected    = lipgloss.NewStyle().PaddingLeft(2).Bold(true).Foreground(lipgloss.Color("2"))
+	confirmHintStyle   = lipgloss.NewStyle().PaddingLeft(4).Foreground(lipgloss.Color("8"))
+	augmentStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
+	tokenStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("5"))
+	systemStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
+	diffAddStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
+	diffDelStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
+	diffHunkStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
+	diffStatStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+
+	toolbarStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+
+	completeBorder   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("8"))
+	completeNormal   = lipgloss.NewStyle().PaddingLeft(1).PaddingRight(1)
+	completeSelected = lipgloss.NewStyle().PaddingLeft(1).PaddingRight(1).Bold(true).Reverse(true)
 )
+
+// CommandItem describes a slash command available in autocomplete.
+type CommandItem struct {
+	Name        string
+	Description string
+	Template    string
+}
 
 // TaskFunc is a function that runs the agent for a given input.
 type TaskFunc func(input string)
+
+// CancelFunc cancels the currently running task.
+type CancelFunc func()
+
+// ContextFunc returns the current conversation context formatted as a string.
+type ContextFunc func() string
+
+// SetModeFn is a callback to set the agent mode and think flag.
+type SetModeFn func(mode agent.Mode, think bool)
+
+// confirmState tracks the sub-state of the confirmation prompt.
+type confirmState int
+
+const (
+	confirmChoose confirmState = iota // Choosing Y/A/E/N
+	confirmEdit                       // Typing augment text
+)
+
+// confirmOption describes one item in the confirm menu.
+type confirmOption struct {
+	labelKey string
+	shortcut string
+	action   agent.ConfirmAction
+}
+
+var confirmMenuOptions = []confirmOption{
+	{labelKey: "confirm.opt.allow_once", shortcut: "1", action: agent.ConfirmAllowOnce},
+	{labelKey: "confirm.opt.allow_session", shortcut: "2", action: agent.ConfirmAllowSession},
+	{labelKey: "confirm.opt.edit", shortcut: "3", action: agent.ConfirmAugment},
+	{labelKey: "confirm.opt.deny", shortcut: "4", action: agent.ConfirmDeny},
+}
+
+// ConfirmRequest represents a pending confirmation from the agent.
+type ConfirmRequest struct {
+	Tool   string
+	Detail string
+	Danger bool // true for dangerous bash commands (rendered in red)
+	Result chan agent.ConfirmResult
+}
+
+// ConfirmMsg wraps a ConfirmRequest as a tea.Msg.
+type ConfirmMsg struct {
+	Request ConfirmRequest
+}
+
+// planConfirmOption describes one item in the plan confirm menu.
+type planConfirmOption struct {
+	labelKey string
+	shortcut string
+	action   agent.PlanConfirmAction
+}
+
+var planConfirmMenuOptions = []planConfirmOption{
+	{labelKey: "plan_confirm.auto_accept", shortcut: "1", action: agent.PlanAutoAccept},
+	{labelKey: "plan_confirm.manual_approve", shortcut: "2", action: agent.PlanManualApprove},
+	{labelKey: "plan_confirm.augment", shortcut: "3", action: agent.PlanAugment},
+}
+
+// PlanConfirmRequest represents a pending plan confirmation from the orchestrator.
+type PlanConfirmRequest struct {
+	Plan   string
+	Result chan agent.PlanConfirmResult
+}
+
+// PlanConfirmMsg wraps a PlanConfirmRequest as a tea.Msg.
+type PlanConfirmMsg struct {
+	Request PlanConfirmRequest
+}
 
 // EventMsg wraps an agent event as a tea.Msg.
 type EventMsg struct {
 	Event agent.Event
 }
 
-// Model is the bubbletea model for the GoAgent TUI.
+// tickMsg is emitted every second while running for timer updates.
+type tickMsg time.Time
+
+type focusTarget int
+
+const (
+	focusInput focusTarget = iota
+	focusViewport
+)
+
+// Model is the bubbletea model for the KodRun TUI.
 type Model struct {
 	viewport  viewport.Model
-	textinput textinput.Model
+	textinput textarea.Model
 	logs      []string
-	model     string
-	taskFn    TaskFunc
+	model       string
+	version     string
+	contextSize int
+	taskFn      TaskFunc
+	cancelFn  CancelFunc
 	events    chan agent.Event
 	ready     bool
 	width     int
 	height    int
 	running   bool
+	workDir   string
+
+	commands     []CommandItem
+	showComplete bool
+	filtered     []CommandItem
+	selectedIdx  int
+
+	// Input history (persisted to .kodrun/history)
+	inputHistory []string
+	historyIdx   int    // -1 = current input, 0..len-1 = history position
+	currentInput string // saved current input when navigating history
+
+	// Confirmation
+	confirmCh      chan ConfirmRequest
+	pendingConfirm *ConfirmRequest
+	confirmSt      confirmState
+	confirmIdx     int // selected menu item (0-based)
+	savedInput     string
+
+	// Plan confirmation (3-option dialog)
+	planConfirmCh      chan PlanConfirmRequest
+	pendingPlanConfirm *PlanConfirmRequest
+	planConfirmSt      confirmState
+	planConfirmIdx     int
+
+	// Group collapsing
+	groupActive   bool
+	groupTitle    string
+	groupLogs     []string
+	groupStartIdx int
+	groupExpanded bool
+
+	// Timer and token tracking
+	taskStart      time.Time
+	pauseStart     time.Time     // when timer was paused (zero if not paused)
+	pausedDuration time.Duration // accumulated paused time
+	totalPrompt    int
+	totalEval      int
+	lastTkPerSec   float64
+
+	// Context usage tracking
+	contextUsed  int
+	contextTotal int
+
+	// Mode and thinking
+	mode      agent.Mode
+	think     bool
+	setModeFn SetModeFn
+
+	// System prompt tokens
+	systemPromptTokens int
+
+	// Context dump
+	contextFn ContextFunc
+
+	focus focusTarget
+
+	mouseEnabled bool
+
+	maxHistory int
+
+	locale *Locale
+}
+
+func (m Model) defaultPlaceholder() string {
+	if m.mode == agent.ModePlan {
+		return m.locale.Get("placeholder.plan")
+	}
+	return m.locale.Get("placeholder.edit")
 }
 
 // NewModel creates a new TUI model.
-func NewModel(modelName string, taskFn TaskFunc, events chan agent.Event) Model {
-	ti := textinput.New()
-	ti.Placeholder = "Enter task or /command..."
+func NewModel(modelName string, version string, contextSize int, taskFn TaskFunc, cancelFn CancelFunc, events chan agent.Event, commands []CommandItem, confirmCh chan ConfirmRequest, planConfirmCh chan PlanConfirmRequest, workDir string, mode agent.Mode, think bool, setModeFn SetModeFn, contextFn ContextFunc, lang string, maxHistory int) Model {
+	locale := NewLocale(lang)
+	ti := textarea.New()
+	if mode == agent.ModePlan {
+		ti.Placeholder = locale.Get("placeholder.plan")
+	} else {
+		ti.Placeholder = locale.Get("placeholder.edit")
+	}
+	ti.Prompt = " > "
+	ti.ShowLineNumbers = false
+	ti.EndOfBufferCharacter = ' '
+	inputBg := lipgloss.Color("255")
+	ti.FocusedStyle.Base = lipgloss.NewStyle().Background(inputBg)
+	ti.FocusedStyle.Prompt = lipgloss.NewStyle().Background(inputBg).Foreground(lipgloss.Color("0")).Bold(true)
+	ti.FocusedStyle.Placeholder = lipgloss.NewStyle().Background(inputBg).Foreground(lipgloss.Color("240"))
+	ti.FocusedStyle.Text = lipgloss.NewStyle().Background(inputBg).Foreground(lipgloss.Color("0"))
+	ti.FocusedStyle.CursorLine = lipgloss.NewStyle().Background(inputBg).Foreground(lipgloss.Color("0"))
+	ti.BlurredStyle = ti.FocusedStyle
+	ti.SetPromptFunc(1, func(line int) string {
+		if line == 0 {
+			return " > "
+		}
+		return "   "
+	})
+	ti.CharLimit = 2000
+	ti.SetHeight(1)
+	ti.MaxHeight = 6
 	ti.Focus()
 
-	return Model{
-		textinput: ti,
-		model:     modelName,
-		taskFn:    taskFn,
-		events:    events,
+	if maxHistory <= 0 {
+		maxHistory = 100
 	}
+	history := LoadHistory(workDir, maxHistory)
+
+	m := Model{
+		textinput:     ti,
+		model:       modelName,
+		version:     version,
+		contextSize: contextSize,
+		taskFn:      taskFn,
+		cancelFn:      cancelFn,
+		events:        events,
+		commands:      commands,
+		confirmCh:     confirmCh,
+		planConfirmCh: planConfirmCh,
+		workDir:       workDir,
+		historyIdx:    -1,
+		inputHistory:  history,
+		mode:          mode,
+		think:         think,
+		setModeFn:     setModeFn,
+		contextFn:     contextFn,
+		focus:         focusInput,
+		mouseEnabled:  true,
+		maxHistory:    maxHistory,
+		locale:        locale,
+	}
+	m.logs = m.headerLines()
+	return m
 }
 
 // Init implements tea.Model.
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(
-		textinput.Blink,
+	cmds := []tea.Cmd{
+		m.textinput.Focus(),
 		m.waitForEvent(),
-	)
+		m.waitForConfirm(),
+	}
+	if m.planConfirmCh != nil {
+		cmds = append(cmds, m.waitForPlanConfirm())
+	}
+	return tea.Batch(cmds...)
 }
 
 func (m Model) waitForEvent() tea.Cmd {
@@ -75,101 +313,1058 @@ func (m Model) waitForEvent() tea.Cmd {
 	}
 }
 
+// executeConfirmAction sends the given action and resets confirm state.
+func (m *Model) executeConfirmAction(action agent.ConfirmAction) tea.Cmd {
+	m.pendingConfirm.Result <- agent.ConfirmResult{Action: action}
+	if !m.pauseStart.IsZero() {
+		m.pausedDuration += time.Since(m.pauseStart)
+		m.pauseStart = time.Time{}
+	}
+	m.pendingConfirm = nil
+	m.focus = focusInput
+	m.textinput.Focus()
+	m.recalcViewport()
+	return m.waitForConfirm()
+}
+
+// executeConfirmOption handles selection of a confirm menu option.
+func (m *Model) executeConfirmOption(opt confirmOption) tea.Cmd {
+	if opt.action == agent.ConfirmAugment {
+		m.confirmSt = confirmEdit
+		m.savedInput = m.textinput.Value()
+		m.textinput.SetValue("")
+		m.textinput.Placeholder = m.locale.Get("placeholder.constraint")
+		m.textinput.Focus()
+		m.addLog(augmentStyle.Render(m.locale.Get("confirm.enter_constraint")))
+		m.recalcViewport()
+		return nil
+	}
+	return m.executeConfirmAction(opt.action)
+}
+
+func (m Model) waitForConfirm() tea.Cmd {
+	return func() tea.Msg {
+		req, ok := <-m.confirmCh
+		if !ok {
+			return nil
+		}
+		return ConfirmMsg{Request: req}
+	}
+}
+
+func (m Model) waitForPlanConfirm() tea.Cmd {
+	return func() tea.Msg {
+		req, ok := <-m.planConfirmCh
+		if !ok {
+			return nil
+		}
+		return PlanConfirmMsg{Request: req}
+	}
+}
+
+// executePlanConfirmAction sends the given plan confirm action and resets state.
+func (m *Model) executePlanConfirmAction(action agent.PlanConfirmAction) tea.Cmd {
+	m.pendingPlanConfirm.Result <- agent.PlanConfirmResult{Action: action}
+	if !m.pauseStart.IsZero() {
+		m.pausedDuration += time.Since(m.pauseStart)
+		m.pauseStart = time.Time{}
+	}
+	for _, opt := range planConfirmMenuOptions {
+		if opt.action == action {
+			m.addLog(confirmHeaderStyle.Render(fmt.Sprintf("  → %s", m.locale.Get(opt.labelKey))))
+			break
+		}
+	}
+	m.pendingPlanConfirm = nil
+	m.focus = focusInput
+	m.textinput.Focus()
+	m.recalcViewport()
+	return m.waitForPlanConfirm()
+}
+
+// executePlanConfirmOption handles selection of a plan confirm menu option.
+func (m *Model) executePlanConfirmOption(opt planConfirmOption) tea.Cmd {
+	if opt.action == agent.PlanAugment {
+		m.planConfirmSt = confirmEdit
+		m.savedInput = m.textinput.Value()
+		m.textinput.SetValue("")
+		m.textinput.Placeholder = m.locale.Get("placeholder.constraint")
+		m.textinput.Focus()
+		m.addLog(augmentStyle.Render(m.locale.Get("plan_confirm.enter_feedback")))
+		m.recalcViewport()
+		return nil
+	}
+	return m.executePlanConfirmAction(opt.action)
+}
+
+func tickEvery() tea.Cmd {
+	return tea.Tick(time.Second, func(t time.Time) tea.Msg {
+		return tickMsg(t)
+	})
+}
+
 // Update implements tea.Model.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		switch msg.Type {
-		case tea.KeyCtrlC, tea.KeyEsc:
-			return m, tea.Quit
-		case tea.KeyEnter:
-			input := m.textinput.Value()
-			if input != "" {
-				m.textinput.SetValue("")
-				m.addLog(fmt.Sprintf("> %s", input))
-				m.running = true
-				go m.taskFn(input)
-			}
-		case tea.KeyCtrlL:
-			m.logs = nil
-			m.updateViewport()
+	case tickMsg:
+		if m.running {
+			cmds = append(cmds, tickEvery())
 		}
+		return m, tea.Batch(cmds...)
+
+	case tea.KeyMsg:
+		// Handle confirmation prompt
+		if m.pendingConfirm != nil {
+			if msg.Type == tea.KeyCtrlC {
+				return m, tea.Quit
+			}
+			switch m.confirmSt {
+			case confirmChoose:
+				switch msg.Type {
+				case tea.KeyUp:
+					if m.confirmIdx > 0 {
+						m.confirmIdx--
+					}
+					return m, nil
+				case tea.KeyDown:
+					if m.confirmIdx < len(confirmMenuOptions)-1 {
+						m.confirmIdx++
+					}
+					return m, nil
+				case tea.KeyEnter:
+					return m, m.executeConfirmOption(confirmMenuOptions[m.confirmIdx])
+				case tea.KeyEsc:
+					return m, m.executeConfirmAction(agent.ConfirmDeny)
+				default:
+					switch msg.String() {
+					case "1":
+						return m, m.executeConfirmAction(agent.ConfirmAllowOnce)
+					case "2":
+						return m, m.executeConfirmAction(agent.ConfirmAllowSession)
+					case "3":
+						return m, m.executeConfirmOption(confirmMenuOptions[2])
+					case "4":
+						return m, m.executeConfirmAction(agent.ConfirmDeny)
+					}
+				}
+				return m, nil
+			case confirmEdit:
+				switch msg.Type {
+				case tea.KeyEsc:
+					m.textinput.SetValue(m.savedInput)
+					m.textinput.Placeholder = m.defaultPlaceholder()
+					m.confirmSt = confirmChoose
+					return m, nil
+				case tea.KeyEnter:
+					text := strings.TrimSpace(m.textinput.Value())
+					if text == "" {
+						return m, nil
+					}
+					m.pendingConfirm.Result <- agent.ConfirmResult{Action: agent.ConfirmAugment, Augment: text}
+					m.addLog(augmentStyle.Render(m.locale.Get("confirm.augment") + text))
+					m.textinput.SetValue(m.savedInput)
+					m.textinput.Placeholder = m.defaultPlaceholder()
+					m.pendingConfirm = nil
+					m.confirmSt = confirmChoose
+					m.focus = focusInput
+					m.textinput.Focus()
+					return m, m.waitForConfirm()
+				}
+			}
+			return m, nil
+		}
+
+		// Handle plan confirmation prompt (3-option)
+		if m.pendingPlanConfirm != nil {
+			if msg.Type == tea.KeyCtrlC {
+				return m, tea.Quit
+			}
+			switch m.planConfirmSt {
+			case confirmChoose:
+				switch msg.Type {
+				case tea.KeyUp:
+					if m.planConfirmIdx > 0 {
+						m.planConfirmIdx--
+					}
+					return m, nil
+				case tea.KeyDown:
+					if m.planConfirmIdx < len(planConfirmMenuOptions)-1 {
+						m.planConfirmIdx++
+					}
+					return m, nil
+				case tea.KeyEnter:
+					return m, m.executePlanConfirmOption(planConfirmMenuOptions[m.planConfirmIdx])
+				case tea.KeyEsc:
+					return m, m.executePlanConfirmAction(agent.PlanDeny)
+				default:
+					switch msg.String() {
+					case "1":
+						return m, m.executePlanConfirmAction(agent.PlanAutoAccept)
+					case "2":
+						return m, m.executePlanConfirmAction(agent.PlanManualApprove)
+					case "3":
+						return m, m.executePlanConfirmOption(planConfirmMenuOptions[2])
+					}
+				}
+				return m, nil
+			case confirmEdit:
+				switch msg.Type {
+				case tea.KeyEsc:
+					m.textinput.SetValue(m.savedInput)
+					m.textinput.Placeholder = m.defaultPlaceholder()
+					m.planConfirmSt = confirmChoose
+					return m, nil
+				case tea.KeyEnter:
+					text := strings.TrimSpace(m.textinput.Value())
+					if text == "" {
+						return m, nil
+					}
+					m.pendingPlanConfirm.Result <- agent.PlanConfirmResult{Action: agent.PlanAugment, Augment: text}
+					m.addLog(augmentStyle.Render(m.locale.Get("plan_confirm.feedback") + text))
+					m.textinput.SetValue(m.savedInput)
+					m.textinput.Placeholder = m.defaultPlaceholder()
+					m.pendingPlanConfirm = nil
+					m.planConfirmSt = confirmChoose
+					m.focus = focusInput
+					m.textinput.Focus()
+					return m, m.waitForPlanConfirm()
+				}
+			}
+			return m, nil
+		}
+
+		if m.showComplete {
+			switch msg.Type {
+			case tea.KeyUp:
+				if m.selectedIdx > 0 {
+					m.selectedIdx--
+				}
+				return m, nil
+			case tea.KeyDown:
+				if m.selectedIdx < len(m.filtered)-1 {
+					m.selectedIdx++
+				}
+				return m, nil
+			case tea.KeyTab, tea.KeyEnter:
+				if msg.Alt {
+					break
+				}
+				if len(m.filtered) > 0 {
+					selected := m.filtered[m.selectedIdx]
+					m.textinput.SetValue("/" + selected.Name + " ")
+					m.textinput.CursorEnd()
+					m.showComplete = false
+				}
+				return m, nil
+			case tea.KeyEsc:
+				m.showComplete = false
+				return m, nil
+			}
+		}
+
+		// Return focus to input on any key except viewport navigation keys.
+		switch msg.Type {
+		case tea.KeyPgUp, tea.KeyPgDown, tea.KeyCtrlU, tea.KeyCtrlD:
+			// keep focusViewport
+		default:
+			m.focus = focusInput
+		}
+
+		switch msg.Type {
+		case tea.KeyShiftTab:
+			wasPlan := m.mode == agent.ModePlan
+			if wasPlan {
+				m.mode = agent.ModeEdit
+				m.think = false
+				m.textinput.Placeholder = m.locale.Get("placeholder.edit")
+			} else {
+				m.mode = agent.ModePlan
+				m.think = true
+				m.textinput.Placeholder = m.locale.Get("placeholder.plan")
+			}
+			if m.setModeFn != nil {
+				m.setModeFn(m.mode, m.think)
+			}
+			if wasPlan {
+				m.addLog(systemStyle.Render(m.locale.Get("status.switched_edit")))
+			} else {
+				m.addLog(systemStyle.Render(m.locale.Get("status.switched_plan")))
+			}
+			return m, nil
+		case tea.KeyF2:
+			m.mouseEnabled = !m.mouseEnabled
+			if m.mouseEnabled {
+				m.addLog(systemStyle.Render(m.locale.Get("status.mouse_on")))
+				return m, tea.EnableMouseCellMotion
+			}
+			m.addLog(systemStyle.Render(m.locale.Get("status.mouse_off")))
+			return m, tea.DisableMouse
+		case tea.KeyCtrlC:
+			return m, tea.Quit
+		case tea.KeyEsc:
+			if m.running {
+				// Cancel current task, don't quit
+				if m.cancelFn != nil {
+					m.cancelFn()
+				}
+				m.addLog(systemStyle.Render(m.locale.Get("status.cancelled")))
+			}
+			return m, nil
+		case tea.KeyCtrlJ:
+			// Ctrl+J inserts a newline (alternative to Shift+Enter).
+			m.textinput.InsertRune('\n')
+			m.resizeInput()
+			return m, nil
+		case tea.KeyEnter:
+			if msg.Alt {
+				m.textinput.InsertRune('\n')
+				m.resizeInput()
+				return m, nil
+			}
+			m.focus = focusInput
+			input := strings.TrimSpace(m.textinput.Value())
+			if input == "" {
+				break
+			}
+
+			// Handle /exit locally
+			if input == "/exit" || input == "/quit" {
+				return m, tea.Quit
+			}
+
+			m.inputHistory = append(m.inputHistory, input)
+			m.inputHistory = dedup(m.inputHistory)
+			if len(m.inputHistory) > m.maxHistory {
+				m.inputHistory = m.inputHistory[len(m.inputHistory)-m.maxHistory:]
+			}
+			m.historyIdx = -1
+			m.currentInput = ""
+			m.textinput.Reset()
+			m.textinput.SetHeight(1)
+			m.textinput.Focus()
+			m.recalcViewport()
+			m.addLog(userStyle.Render(m.locale.Get("avatar.user")) + " " + input)
+
+			// Persist to file
+			AppendHistory(m.workDir, input, m.maxHistory)
+
+			// Don't start a new task if one is already running
+			if m.running {
+				m.addLog(systemStyle.Render(m.locale.Get("status.task_running")))
+				return m, nil
+			}
+
+			m.running = true
+			m.taskStart = time.Now()
+			m.pauseStart = time.Time{}
+			m.pausedDuration = 0
+			m.totalPrompt = 0
+			m.totalEval = 0
+			m.lastTkPerSec = 0
+			m.recalcViewport()
+
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						select {
+						case m.events <- agent.Event{Type: agent.EventError, Message: fmt.Sprintf("task panic: %v", r)}:
+						default:
+						}
+						select {
+						case m.events <- agent.Event{Type: agent.EventDone}:
+						default:
+						}
+					}
+				}()
+				m.taskFn(input)
+			}()
+			return m, tea.Batch(append(cmds, tickEvery())...)
+		case tea.KeyUp:
+			if m.focus == focusInput && len(m.inputHistory) > 0 && m.historyIdx < len(m.inputHistory)-1 {
+				if m.historyIdx == -1 {
+					m.currentInput = m.textinput.Value()
+				}
+				m.historyIdx++
+				m.textinput.SetValue(m.inputHistory[len(m.inputHistory)-1-m.historyIdx])
+				m.textinput.CursorEnd()
+				return m, nil
+			}
+			return m, nil
+		case tea.KeyDown:
+			if m.focus == focusInput && m.historyIdx > -1 {
+				m.historyIdx--
+				if m.historyIdx == -1 {
+					m.textinput.SetValue(m.currentInput)
+				} else {
+					m.textinput.SetValue(m.inputHistory[len(m.inputHistory)-1-m.historyIdx])
+				}
+				m.textinput.CursorEnd()
+				return m, nil
+			}
+			return m, nil
+		case tea.KeyPgUp:
+			m.focus = focusViewport
+			m.viewport.ScrollUp(m.viewport.Height / 2)
+			return m, nil
+		case tea.KeyPgDown:
+			m.focus = focusViewport
+			m.viewport.ScrollDown(m.viewport.Height / 2)
+			return m, nil
+		case tea.KeyCtrlU:
+			m.focus = focusViewport
+			m.viewport.ScrollUp(m.viewport.Height / 2)
+			return m, nil
+		case tea.KeyCtrlD:
+			m.focus = focusViewport
+			m.viewport.ScrollDown(m.viewport.Height / 2)
+			return m, nil
+		case tea.KeyCtrlL:
+			m.logs = m.headerLines()
+			m.updateViewport()
+		case tea.KeyCtrlO:
+			if len(m.groupLogs) > 0 {
+				m.groupExpanded = !m.groupExpanded
+				m.rebuildGroupView()
+			} else if m.contextFn != nil {
+				m.addLog(systemStyle.Render(m.locale.Get("status.context_dump")))
+				m.addLog(m.contextFn())
+				m.addLog(systemStyle.Render(m.locale.Get("status.context_end")))
+			}
+		}
+	case tea.MouseMsg:
+		if msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress {
+			if m.mouseInViewport(msg.Y) {
+				m.focus = focusViewport
+			} else {
+				m.focus = focusInput
+			}
+		}
+		switch msg.Button {
+		case tea.MouseButtonWheelUp:
+			if !m.mouseInViewport(msg.Y) {
+				return m, nil
+			}
+			m.focus = focusViewport
+			m.viewport.ScrollUp(3)
+			return m, nil
+		case tea.MouseButtonWheelDown:
+			if !m.mouseInViewport(msg.Y) {
+				return m, nil
+			}
+			m.focus = focusViewport
+			m.viewport.ScrollDown(3)
+			return m, nil
+		}
+
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		headerHeight := 2
-		footerHeight := 3
-		contentHeight := m.height - headerHeight - footerHeight
+		m.textinput.SetWidth(max(1, m.width))
 		if !m.ready {
-			m.viewport = viewport.New(m.width, contentHeight)
+			m.viewport = viewport.New(m.width, m.viewportHeight())
+			m.viewport.MouseWheelEnabled = false // we handle mouse wheel ourselves
 			m.ready = true
 		} else {
 			m.viewport.Width = m.width
-			m.viewport.Height = contentHeight
+			m.viewport.Height = m.viewportHeight()
 		}
-		m.textinput.Width = m.width - 4
 		m.updateViewport()
 	case EventMsg:
 		e := msg.Event
 		switch e.Type {
 		case agent.EventAgent:
-			m.addLog(agentStyle.Render("[agent] " + e.Message))
-		case agent.EventTool:
-			status := "✓"
-			if !e.Success {
-				status = "✗"
+			if e.SystemPromptTokens > 0 {
+				m.systemPromptTokens = e.SystemPromptTokens
+				m.totalPrompt = e.SystemPromptTokens
 			}
-			m.addLog(toolStyle.Render(fmt.Sprintf("[tool]  %s %s", e.Tool, status)))
+			if e.Message != "" {
+				if m.groupActive {
+					// Route intermediate agent text into the collapsed group.
+					m.groupLogs = append(m.groupLogs, agentStyle.Render(e.Message))
+					m.rebuildGroupView()
+				} else {
+					prefix := botStyle.Render(m.locale.Get("avatar.agent")) + " "
+					prefixW := ansi.StringWidth(prefix)
+					avail := max(m.width-prefixW-2, 20)
+					wrapped := ansi.Wordwrap(e.Message, avail, "")
+					lines := strings.Split(wrapped, "\n")
+					indent := strings.Repeat(" ", prefixW)
+					var buf strings.Builder
+					for i, line := range lines {
+						if i > 0 {
+							buf.WriteByte('\n')
+							buf.WriteString(indent)
+						}
+						buf.WriteString(formatAgentLine(line))
+					}
+					m.addLog(prefix + buf.String())
+				}
+			}
+		case agent.EventTool:
+			toolLine := m.formatToolEvent(e)
+			if m.groupActive {
+				m.groupLogs = append(m.groupLogs, toolLine)
+				m.rebuildGroupView()
+			} else {
+				m.addLog(toolLine)
+				if e.FileAction != "" {
+					if e.LinesAdded > 0 || e.LinesRemoved > 0 {
+						m.addLog(diffStatStyle.Render(fmt.Sprintf("  +%d -%d lines", e.LinesAdded, e.LinesRemoved)))
+					}
+					if e.Diff != "" {
+						m.addDiffLog(e.Diff)
+					}
+				}
+			}
+		case agent.EventGroupStart:
+			m.groupActive = true
+			m.groupTitle = e.Message
+			m.groupLogs = nil
+			m.groupExpanded = false
+			m.addLog(botStyle.Render(m.locale.Get("avatar.agent")) + " " + toolStyle.Render(e.Message))
+			m.groupStartIdx = len(m.logs)
+		case agent.EventGroupEnd:
+			m.groupActive = false
+			m.rebuildGroupView()
 		case agent.EventFix:
-			m.addLog(fixStyle.Render("[fix]   " + e.Message))
+			m.addLog(fixStyle.Render(m.locale.Get("event.fix") + e.Message))
 		case agent.EventError:
-			m.addLog(errorStyle.Render(fmt.Sprintf("[error] %s: %s", e.Tool, e.Message)))
+			m.addLog(errorStyle.Render(fmt.Sprintf("%s%s: %s", m.locale.Get("event.error"), e.Tool, e.Message)))
+		case agent.EventTokens:
+			m.totalPrompt += e.PromptTokens
+			m.totalEval += e.EvalTokens
+			if e.EvalTkPerSec > 0 {
+				m.lastTkPerSec = e.EvalTkPerSec
+			}
+			if e.ContextUsed > 0 {
+				m.contextUsed = e.ContextUsed
+			}
+			if e.ContextTotal > 0 {
+				m.contextTotal = e.ContextTotal
+			}
+		case agent.EventCompact:
+			m.addLog(systemStyle.Render(m.locale.Get("event.compact") + e.Message))
+			if e.ContextUsed > 0 {
+				m.contextUsed = e.ContextUsed
+			}
+			if e.ContextTotal > 0 {
+				m.contextTotal = e.ContextTotal
+			}
+		case agent.EventModeChange:
+			if e.Message == "edit" {
+				m.mode = agent.ModeEdit
+			} else {
+				m.mode = agent.ModePlan
+			}
 		case agent.EventDone:
+			elapsed := m.elapsed()
+			if e.Stats != nil {
+				m.addLog(tokenStyle.Render(m.renderSummary(e.Stats, elapsed)))
+			} else {
+				m.addLog(tokenStyle.Render(fmt.Sprintf("%s%s", m.locale.Get("event.done"), elapsed)))
+			}
 			m.running = false
+			m.textinput.Reset()
+			m.textinput.SetHeight(1)
+			m.textinput.Placeholder = m.defaultPlaceholder()
+			m.textinput.Focus()
+			m.recalcViewport()
 		}
 		cmds = append(cmds, m.waitForEvent())
+	case ConfirmMsg:
+		m.pendingConfirm = &msg.Request
+		m.pauseStart = time.Now()
+		m.focus = focusInput
+		m.confirmSt = confirmChoose
+		m.confirmIdx = 0
+		m.recalcViewport()
+		return m, nil
+	case PlanConfirmMsg:
+		m.pendingPlanConfirm = &msg.Request
+		m.pauseStart = time.Now()
+		m.focus = focusInput
+		m.planConfirmSt = confirmChoose
+		m.planConfirmIdx = 0
+		m.addLog("")
+		m.addLog(confirmHeaderStyle.Render(m.locale.Get("plan_confirm.header")))
+		m.addLog("")
+		m.recalcViewport()
+		return m, nil
 	}
 
 	var cmd tea.Cmd
 	m.textinput, cmd = m.textinput.Update(msg)
 	cmds = append(cmds, cmd)
+	m.resizeInput()
 
 	m.viewport, cmd = m.viewport.Update(msg)
 	cmds = append(cmds, cmd)
 
+	m.updateComplete()
+
 	return m, tea.Batch(cmds...)
 }
 
+func (m *Model) updateComplete() {
+	prev := m.showComplete
+
+	val := m.textinput.Value()
+	if !strings.HasPrefix(val, "/") || len(m.commands) == 0 {
+		m.showComplete = false
+		m.filtered = nil
+		if prev != m.showComplete {
+			m.recalcViewport()
+		}
+		return
+	}
+
+	query := strings.ToLower(strings.TrimPrefix(val, "/"))
+	if strings.Contains(query, " ") {
+		m.showComplete = false
+		m.filtered = nil
+		if prev != m.showComplete {
+			m.recalcViewport()
+		}
+		return
+	}
+
+	prevCount := len(m.filtered)
+	m.filtered = m.filtered[:0]
+	for _, c := range m.commands {
+		if query == "" || strings.Contains(strings.ToLower(c.Name), query) {
+			m.filtered = append(m.filtered, c)
+		}
+	}
+
+	m.showComplete = len(m.filtered) > 0
+	if m.selectedIdx >= len(m.filtered) {
+		m.selectedIdx = max(0, len(m.filtered)-1)
+	}
+
+	if prev != m.showComplete || prevCount != len(m.filtered) {
+		m.recalcViewport()
+	}
+}
+
+// viewportHeight calculates the available viewport height based on current state.
+// Base layout: header(3) + \n + viewport + \n + completePopup + timeLine + \n + inputLine + \n + \n + toolbar(1)
+func (m *Model) viewportHeight() int {
+	var inputH int
+	if m.pendingPlanConfirm != nil && m.planConfirmSt == confirmChoose {
+		// 3 options + blank line + hint line
+		inputH = len(planConfirmMenuOptions) + 2
+	} else if m.pendingConfirm != nil && m.confirmSt == confirmChoose {
+		// 4 options + blank line + hint line
+		inputH = len(confirmMenuOptions) + 2
+	} else {
+		inputH = max(1, m.textinput.Height()) + 2 // input + 2 padding lines
+	}
+	// viewport + \n + \n + inputH + \n + \n + toolbar(1)
+	extra := 5 + inputH
+	if m.running {
+		extra += 2 // timeLine: blank line + status line
+	}
+	if m.showComplete && len(m.filtered) > 0 {
+		visible := min(len(m.filtered), maxVisibleItems)
+		extra += visible + 2 // items + top/bottom borders
+	}
+	return max(1, m.height-extra)
+}
+
+// resizeInput adjusts textarea height to fit content and recalculates viewport.
+func (m *Model) resizeInput() {
+	lines := strings.Count(m.textinput.Value(), "\n") + 1
+	h := max(1, min(lines, m.textinput.MaxHeight))
+	if m.textinput.Height() != h {
+		m.textinput.SetHeight(h)
+		m.recalcViewport()
+	}
+}
+
+// recalcViewport adjusts viewport height for dynamic elements and refreshes content.
+func (m *Model) recalcViewport() {
+	if !m.ready {
+		return
+	}
+	stickBottom := m.viewport.AtBottom() || (m.running && m.focus == focusInput)
+	h := m.viewportHeight()
+	if m.viewport.Height != h {
+		m.viewport.Height = h
+		m.updateViewportWithStickBottom(stickBottom)
+	}
+}
+
+// formatToolEvent formats a tool event as a single log line.
+func (m Model) formatToolEvent(e agent.Event) string {
+	status := "✓"
+	if !e.Success {
+		status = "✗"
+	}
+	if e.FileAction != "" {
+		return toolStyle.Render(fmt.Sprintf("%s %s(%s)", status, e.FileAction, e.Message))
+	}
+	return toolStyle.Render(fmt.Sprintf("%s %s(%s)", status, e.Tool, e.Message))
+}
+
+// rebuildGroupView updates the visible group section in logs.
+// Shows the group title + last N tool calls, with "+X more" if collapsed.
+func (m *Model) rebuildGroupView() {
+	const maxVisible = 5
+
+	// Remove old group entries from logs
+	if m.groupStartIdx < len(m.logs) {
+		m.logs = m.logs[:m.groupStartIdx]
+	}
+
+	total := len(m.groupLogs)
+	if total == 0 {
+		stickBottom := !m.ready || m.viewport.AtBottom() || (m.running && m.focus == focusInput)
+		m.updateViewportWithStickBottom(stickBottom)
+		return
+	}
+
+	if m.groupExpanded || total <= maxVisible {
+		// Show all
+		for _, line := range m.groupLogs {
+			m.logs = append(m.logs, "  "+line)
+		}
+	} else {
+		// Show last maxVisible, hide the rest
+		hidden := total - maxVisible
+		m.logs = append(m.logs, diffStatStyle.Render(fmt.Sprintf(m.locale.Get("group.more_tools"), hidden)))
+		for _, line := range m.groupLogs[hidden:] {
+			m.logs = append(m.logs, "  "+line)
+		}
+	}
+
+	stickBottom := !m.ready || m.viewport.AtBottom() || (m.running && m.focus == focusInput)
+	m.updateViewportWithStickBottom(stickBottom)
+}
+
+func (m *Model) headerLines() []string {
+	line1 := titleStyle.Render(fmt.Sprintf("KodRun %s", m.version))
+	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	line2 := dimStyle.Render(fmt.Sprintf("%s (%s ctx)", m.model, formatContextSize(m.contextSize)))
+	line3 := dimStyle.Render(shortPath(m.workDir))
+	return []string{line1, line2, line3, ""}
+}
+
 func (m *Model) addLog(line string) {
+	stickBottom := !m.ready || m.viewport.AtBottom() || (m.running && m.focus == focusInput)
 	m.logs = append(m.logs, line)
-	m.updateViewport()
+	if len(m.logs) > maxLogLines {
+		// Trim oldest 20% to avoid frequent trimming.
+		trim := maxLogLines / 5
+		m.logs = append([]string(nil), m.logs[trim:]...)
+	}
+	m.updateViewportWithStickBottom(stickBottom)
+}
+
+// formatAgentLine applies markdown-like formatting to a single agent output line.
+// Headings (## ...) are rendered as bold uppercase.
+func formatAgentLine(line string) string {
+	trimmed := strings.TrimSpace(line)
+	if after, ok := strings.CutPrefix(trimmed, "## "); ok {
+		return agentHeadingStyle.Render(strings.ToUpper(after))
+	}
+	return agentStyle.Render(line)
+}
+
+// addDiffLog renders a diff string with colored lines and appends to logs.
+// Limits output to 20 visible diff lines.
+func (m *Model) addDiffLog(diff string) {
+	lines := strings.Split(strings.TrimRight(diff, "\n"), "\n")
+	maxDiffLines := 20
+	shown := 0
+	for _, l := range lines {
+		if shown >= maxDiffLines {
+			m.logs = append(m.logs, diffStatStyle.Render(fmt.Sprintf(m.locale.Get("diff.more_lines"), len(lines)-shown)))
+			break
+		}
+		if len(l) == 0 {
+			continue
+		}
+		var styled string
+		switch l[0] {
+		case '+':
+			styled = diffAddStyle.Render("  " + l)
+		case '-':
+			styled = diffDelStyle.Render("  " + l)
+		case '@':
+			styled = diffHunkStyle.Render("  " + l)
+		default:
+			styled = diffStatStyle.Render("  " + l)
+		}
+		m.logs = append(m.logs, styled)
+		shown++
+	}
+	stickBottom := !m.ready || m.viewport.AtBottom() || (m.running && m.focus == focusInput)
+	m.updateViewportWithStickBottom(stickBottom)
 }
 
 func (m *Model) updateViewport() {
+	m.updateViewportWithStickBottom(false)
+}
+
+func (m *Model) updateViewportWithStickBottom(stickBottom bool) {
 	m.viewport.SetContent(strings.Join(m.logs, "\n"))
-	m.viewport.GotoBottom()
+	if stickBottom {
+		m.viewport.GotoBottom()
+	}
+}
+
+func (m Model) mouseInViewport(y int) bool {
+	return y >= 0 && y < m.viewport.Height
 }
 
 // View implements tea.Model.
 func (m Model) View() string {
 	if !m.ready {
-		return "Initializing..."
+		return m.locale.Get("status.init")
 	}
 
-	header := titleStyle.Render(fmt.Sprintf("─ GoAgent ─── %s ", m.model))
+	var completePopup string
+	if m.showComplete && len(m.filtered) > 0 {
+		completePopup = m.renderComplete()
+	}
 
-	statusText := "ready"
+	toolbar := "  " + m.renderToolbar()
+
+	var inputLine string
+	if m.pendingPlanConfirm != nil && m.planConfirmSt == confirmChoose {
+		inputLine = m.renderPlanConfirmMenu()
+	} else if m.pendingConfirm != nil && m.confirmSt == confirmChoose {
+		inputLine = m.renderConfirmMenu()
+	} else {
+		inputLine = m.renderInput()
+	}
+
+	var timeLine string
 	if m.running {
-		statusText = "working..."
+		elapsed := m.elapsed()
+		timeLine = "\n" + toolbarStyle.Render(fmt.Sprintf("  %s ⏱ %s · %s tk", m.locale.Get("status.working"), elapsed, formatTokens(m.totalEval)))
 	}
-	footer := statusStyle.Render(fmt.Sprintf("─ %s ── Esc: exit ", statusText))
 
-	return fmt.Sprintf("%s\n%s\n%s\n%s",
-		header,
+	out := fmt.Sprintf("%s\n%s%s\n%s\n\n%s",
 		m.viewport.View(),
-		footer,
-		m.textinput.View(),
+		completePopup,
+		timeLine,
+		inputLine,
+		toolbar,
 	)
+
+	// Pad to exactly m.height lines to prevent bubbletea rendering artifacts.
+	if lines := strings.Count(out, "\n") + 1; lines < m.height {
+		out += strings.Repeat("\n", m.height-lines)
+	}
+
+	return out
+}
+
+const (
+	ansiBg255   = "\x1b[48;5;255m" // set background to color 255 (white)
+	ansiReset   = "\x1b[0m"
+	ansiBgReset = "\x1b[0;48;5;255m" // reset attributes but keep bg 255
+)
+
+func (m Model) renderInput() string {
+	w := m.width
+	emptyLine := ansiBg255 + strings.Repeat(" ", w) + ansiReset
+
+	raw := m.textinput.View()
+	// Replace all resets inside textarea output with "reset + restore bg",
+	// so our background color persists through textarea's internal ANSI codes.
+	raw = strings.ReplaceAll(raw, ansiReset, ansiBgReset)
+	raw = strings.TrimRight(raw, "\n")
+
+	lines := strings.Split(raw, "\n")
+	for i, line := range lines {
+		visible := ansi.StringWidth(line)
+		pad := max(0, w-visible)
+		lines[i] = ansiBg255 + line + strings.Repeat(" ", pad) + ansiReset
+	}
+
+	return emptyLine + "\n" + strings.Join(lines, "\n") + "\n" + emptyLine
+}
+
+func (m Model) renderToolbar() string {
+	modeLabel := m.locale.Get("label.edit_mode")
+	if m.mode == agent.ModePlan {
+		modeLabel = m.locale.Get("label.plan_mode")
+	}
+
+	parts := []string{
+		m.model,
+		fmt.Sprintf("%s %s", modeLabel, m.locale.Get("label.shift_tab")),
+		fmt.Sprintf("%s tk", formatTokens(m.totalPrompt+m.totalEval)),
+	}
+
+	if m.lastTkPerSec > 0 {
+		parts = append(parts, fmt.Sprintf("%.1f tk/s", m.lastTkPerSec))
+	}
+
+	var pct int
+	if m.contextTotal > 0 {
+		pct = 100 - (m.contextUsed * 100 / m.contextTotal)
+	}
+	parts = append(parts, fmt.Sprintf(m.locale.Get("label.context_left"), pct))
+
+	return toolbarStyle.Render(strings.Join(parts, " · "))
+}
+
+func (m Model) renderComplete() string {
+	visible := m.filtered
+	if len(visible) > maxVisibleItems {
+		visible = visible[:maxVisibleItems]
+	}
+
+	var lines []string
+	for i, item := range visible {
+		name := fmt.Sprintf("/%s", item.Name)
+		line := fmt.Sprintf("  %-16s %s", name, item.Description)
+		if i == m.selectedIdx {
+			line = completeSelected.Render(line)
+		} else {
+			line = completeNormal.Render(line)
+		}
+		lines = append(lines, line)
+	}
+
+	content := strings.Join(lines, "\n")
+	return completeBorder.Render(content) + "\n"
+}
+
+// renderConfirmMenu renders the numbered confirm menu replacing the input area.
+func (m Model) renderConfirmMenu() string {
+	detail := m.pendingConfirm.Detail
+	if len(detail) > 60 {
+		detail = detail[:60] + "..."
+	}
+
+	var lines []string
+	if m.pendingConfirm.Danger {
+		lines = append(lines, errorStyle.Bold(true).Render("WARNING: dangerous command"))
+	}
+	for i, opt := range confirmMenuOptions {
+		var suffix string
+		switch opt.action {
+		case agent.ConfirmAllowOnce, agent.ConfirmAllowSession:
+			suffix = detail
+		}
+		var label string
+		if suffix != "" {
+			label = fmt.Sprintf("%d. %s (%s)", i+1, m.locale.Get(opt.labelKey), suffix)
+		} else {
+			label = fmt.Sprintf("%d. %s", i+1, m.locale.Get(opt.labelKey))
+		}
+		if i == m.confirmIdx {
+			lines = append(lines, confirmSelected.Render("> "+label))
+		} else {
+			lines = append(lines, confirmNormal.Render(label))
+		}
+	}
+	lines = append(lines, "")
+	lines = append(lines, confirmHintStyle.Render(m.locale.Get("confirm.hint")))
+	return strings.Join(lines, "\n")
+}
+
+// renderPlanConfirmMenu renders the 3-option plan confirm menu.
+func (m Model) renderPlanConfirmMenu() string {
+	var lines []string
+	for i, opt := range planConfirmMenuOptions {
+		label := fmt.Sprintf("%d. %s", i+1, m.locale.Get(opt.labelKey))
+		if i == m.planConfirmIdx {
+			lines = append(lines, confirmSelected.Render("> "+label))
+		} else {
+			lines = append(lines, confirmNormal.Render(label))
+		}
+	}
+	lines = append(lines, "")
+	lines = append(lines, confirmHintStyle.Render(m.locale.Get("plan_confirm.hint")))
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) renderSummary(s *agent.SessionStats, elapsed time.Duration) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s%s", m.locale.Get("event.done"), elapsed)
+
+	// File stats
+	var fileParts []string
+	if s.FilesAdded > 0 {
+		fileParts = append(fileParts, fmt.Sprintf(m.locale.Get("summary.added"), s.FilesAdded))
+	}
+	if s.FilesModified > 0 {
+		fileParts = append(fileParts, fmt.Sprintf(m.locale.Get("summary.modified"), s.FilesModified))
+	}
+	if s.FilesDeleted > 0 {
+		fileParts = append(fileParts, fmt.Sprintf(m.locale.Get("summary.deleted"), s.FilesDeleted))
+	}
+	if s.FilesRenamed > 0 {
+		fileParts = append(fileParts, fmt.Sprintf(m.locale.Get("summary.renamed"), s.FilesRenamed))
+	}
+	if len(fileParts) > 0 {
+		fmt.Fprintf(&b, "%s%s", m.locale.Get("summary.files"), strings.Join(fileParts, ", "))
+	}
+
+	// Line stats
+	if s.LinesAdded > 0 || s.LinesRemoved > 0 {
+		fmt.Fprintf(&b, m.locale.Get("summary.lines"), s.LinesAdded, s.LinesRemoved)
+	}
+
+	// Tool calls and performance
+	var perfParts []string
+	if s.ToolCalls > 0 {
+		perfParts = append(perfParts, fmt.Sprintf(m.locale.Get("summary.tool_calls"), s.ToolCalls))
+	}
+	if s.AvgTkPerSec > 0 {
+		perfParts = append(perfParts, fmt.Sprintf(m.locale.Get("summary.avg_tks"), s.AvgTkPerSec))
+	}
+	if s.PeakContextPct > 0 {
+		perfParts = append(perfParts, fmt.Sprintf(m.locale.Get("summary.peak_ctx"), s.PeakContextPct))
+	}
+	if len(perfParts) > 0 {
+		fmt.Fprintf(&b, "\n  %s", strings.Join(perfParts, " · "))
+	}
+
+	return b.String()
+}
+
+// elapsed returns the task duration excluding paused time.
+func (m Model) elapsed() time.Duration {
+	d := time.Since(m.taskStart) - m.pausedDuration
+	if !m.pauseStart.IsZero() {
+		d -= time.Since(m.pauseStart)
+	}
+	return d.Truncate(time.Second)
+}
+
+func shortPath(dir string) string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return dir
+	}
+	rel, err := filepath.Rel(home, dir)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return dir
+	}
+	return "~/" + rel
+}
+
+func formatContextSize(n int) string {
+	if n >= 1024 && n%1024 == 0 {
+		return fmt.Sprintf("%dk", n/1024)
+	}
+	if n >= 1000 {
+		return fmt.Sprintf("%.1fk", float64(n)/1024)
+	}
+	return fmt.Sprintf("%d", n)
+}
+
+func formatTokens(n int) string {
+	if n < 1000 {
+		return fmt.Sprintf("%d", n)
+	}
+	return fmt.Sprintf("%.1fK", float64(n)/1000)
 }

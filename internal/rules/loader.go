@@ -1,11 +1,17 @@
 package rules
 
 import (
+	"context"
+	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/pkg/errors"
 )
 
 // Priority determines the order rules are included in the prompt.
@@ -29,11 +35,13 @@ const (
 
 // Rule represents a loaded rule file.
 type Rule struct {
-	Path     string
-	Content  string
-	Priority Priority
-	Scope    Scope
-	ModTime  time.Time
+	Path        string
+	Content     string
+	Priority    Priority
+	Scope       Scope
+	ModTime     time.Time
+	RefPaths    []string // which docs this rule references
+	description string   // optional description from front matter
 }
 
 // Command represents a user-defined command.
@@ -50,33 +58,60 @@ type CommandArg struct {
 	Required bool
 }
 
+// Fixed directories for rules, commands, and docs.
+var (
+	RulesDirs    = ".kodrun/rules"
+	CommandsDir  = ".kodrun/commands"
+	DocsDir      = ".kodrun/docs"
+)
+
 // Loader loads and caches rules from directories.
 type Loader struct {
-	dirs     []string
-	rules    []*Rule
-	commands map[string]*Command
+	dirs       []string
+	workDir    string
+	rules      []*Rule
+	commands   map[string]*Command
+	refDocs    map[string]string // path → resolved content (deduplicated)
+	refOrder   []string          // insertion order for deterministic output
+	maxRefSize int               // max size of a single doc (0 = no limit)
 }
 
+// refPattern matches @path references in rule content.
+// Matches: @.claude/docs/file.md, @.kodrun/docs/example.go, etc.
+var refPattern = regexp.MustCompile(`@([^\s,]+\.\w+)`)
+
 // NewLoader creates a rules loader.
-func NewLoader(dirs []string) *Loader {
+// workDir is the project root used to resolve @file references.
+// maxRefSize limits the size of each referenced doc (0 = no limit).
+func NewLoader(workDir string, maxRefSize int) *Loader {
 	return &Loader{
-		dirs:     dirs,
-		commands: make(map[string]*Command),
+		dirs:       []string{RulesDirs, CommandsDir},
+		workDir:    workDir,
+		commands:   make(map[string]*Command),
+		refDocs:    make(map[string]string),
+		maxRefSize: maxRefSize,
 	}
 }
 
-// Load reads all .md files from configured directories.
-func (l *Loader) Load() error {
+// Load reads all rule files (.md) from configured directories.
+func (l *Loader) Load(ctx context.Context) error {
 	l.rules = nil
 	l.commands = make(map[string]*Command)
+	l.refDocs = make(map[string]string)
+	l.refOrder = nil
 
 	for _, dir := range l.dirs {
-		if _, err := os.Stat(dir); os.IsNotExist(err) {
+		absDir := dir
+		if !filepath.IsAbs(dir) {
+			absDir = filepath.Join(l.workDir, dir)
+		}
+
+		if _, err := os.Stat(absDir); os.IsNotExist(err) {
 			continue
 		}
 
-		err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-			if err != nil || info.IsDir() {
+		err := filepath.WalkDir(absDir, func(path string, d fs.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
 				return nil
 			}
 			if filepath.Ext(path) != ".md" {
@@ -88,8 +123,16 @@ func (l *Loader) Load() error {
 				return nil
 			}
 
+			info, err := d.Info()
+			if err != nil {
+				return nil
+			}
+
 			content := string(data)
-			priority, scope, body := parseFrontMatter(content)
+			priority, scope, body, desc := parseFrontMatter(content)
+
+			// Collect @file references: deduplicate into refDocs, replace with labels
+			body, refPaths := l.collectReferences(ctx, body)
 
 			// Check if this is a command definition
 			if strings.Contains(dir, "commands") {
@@ -100,11 +143,13 @@ func (l *Loader) Load() error {
 			}
 
 			l.rules = append(l.rules, &Rule{
-				Path:     path,
-				Content:  body,
-				Priority: priority,
-				Scope:    scope,
-				ModTime:  info.ModTime(),
+				Path:        path,
+				Content:     body,
+				Priority:    priority,
+				Scope:       scope,
+				ModTime:     info.ModTime(),
+				RefPaths:    refPaths,
+				description: desc,
 			})
 
 			return nil
@@ -121,8 +166,93 @@ func (l *Loader) Load() error {
 	return nil
 }
 
+// collectReferences scans @path refs in text, resolves and deduplicates them into
+// refDocs, and replaces inline references with [see: filename] labels.
+// Returns the modified text and list of reference paths.
+func (l *Loader) collectReferences(ctx context.Context, content string) (string, []string) {
+	var refPaths []string
+	seen := make(map[string]bool)
+
+	result := refPattern.ReplaceAllStringFunc(content, func(match string) string {
+		refPath := match[1:] // strip leading @
+
+		// Resolve the actual path (with .claude/ → .kodrun/ fallback)
+		resolvedPath, data, err := l.resolveRef(ctx, refPath)
+		if err != nil {
+			return match // leave as-is if not found
+		}
+
+		base := filepath.Base(resolvedPath)
+
+		// Track this ref for the rule
+		if !seen[resolvedPath] {
+			seen[resolvedPath] = true
+			refPaths = append(refPaths, resolvedPath)
+		}
+
+		// Store in global deduplicated map
+		if _, exists := l.refDocs[resolvedPath]; !exists {
+			docContent := l.formatDoc(ctx, resolvedPath, string(data))
+			l.refDocs[resolvedPath] = docContent
+			l.refOrder = append(l.refOrder, resolvedPath)
+		}
+
+		return fmt.Sprintf("[see: %s]", base)
+	})
+
+	return result, refPaths
+}
+
+// resolveRef tries to read a reference file, with .claude/ → .kodrun/ fallback.
+// Returns the resolved path, file data, and any error.
+func (l *Loader) resolveRef(ctx context.Context, refPath string) (string, []byte, error) {
+	data, err := l.readRef(ctx, refPath)
+	if err != nil && strings.HasPrefix(refPath, ".claude/") {
+		altPath := ".kodrun/" + refPath[len(".claude/"):]
+		data, err = l.readRef(ctx, altPath)
+		if err == nil {
+			return altPath, data, nil
+		}
+	}
+	if err != nil {
+		return "", nil, err
+	}
+	return refPath, data, nil
+}
+
+// formatDoc formats and optionally truncates a doc for inclusion in ReferenceDocs.
+func (l *Loader) formatDoc(_ context.Context, path string, content string) string {
+	if l.maxRefSize > 0 && len(content) > l.maxRefSize {
+		content = content[:l.maxRefSize] + fmt.Sprintf(
+			"\n[truncated — use read_file(%q) for full content]", path,
+		)
+	}
+
+	base := filepath.Base(path)
+	ext := filepath.Ext(path)
+	switch ext {
+	case ".go":
+		return fmt.Sprintf("```go\n// %s\n%s\n```", base, content)
+	default:
+		return fmt.Sprintf("--- %s ---\n%s", base, content)
+	}
+}
+
+func (l *Loader) readRef(_ context.Context, refPath string) ([]byte, error) {
+	absPath := refPath
+	if !filepath.IsAbs(refPath) {
+		absPath = filepath.Join(l.workDir, refPath)
+	}
+	return os.ReadFile(absPath)
+}
+
 // Rules returns loaded rules filtered by scope.
-func (l *Loader) Rules(scope Scope) []*Rule {
+// AllRules returns all loaded rules regardless of scope.
+func (l *Loader) AllRules() []*Rule {
+	return l.rules
+}
+
+func (l *Loader) Rules(_ context.Context, scope Scope) []*Rule {
 	var filtered []*Rule
 	for _, r := range l.rules {
 		if r.Scope == ScopeAll || r.Scope == scope {
@@ -133,14 +263,214 @@ func (l *Loader) Rules(scope Scope) []*Rule {
 }
 
 // AllRulesContent returns concatenated content of all rules for a scope.
-func (l *Loader) AllRulesContent(scope Scope) string {
-	rules := l.Rules(scope)
+func (l *Loader) AllRulesContent(ctx context.Context, scope Scope) string {
+	rules := l.Rules(ctx, scope)
 	var b strings.Builder
 	for _, r := range rules {
 		b.WriteString(r.Content)
 		b.WriteByte('\n')
 	}
 	return b.String()
+}
+
+// ReferenceDocs returns deduplicated documentation referenced by rules of
+// the given scope. Each doc is included at most once, in insertion order.
+func (l *Loader) ReferenceDocs(ctx context.Context, scope Scope) string {
+	rules := l.Rules(ctx, scope)
+
+	// Collect unique ref paths from matching rules
+	needed := make(map[string]bool)
+	for _, r := range rules {
+		for _, p := range r.RefPaths {
+			needed[p] = true
+		}
+	}
+
+	var b strings.Builder
+	for _, path := range l.refOrder {
+		if !needed[path] {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString(l.refDocs[path])
+	}
+	return b.String()
+}
+
+// ReferenceDocPaths returns all unique reference doc paths and their content.
+func (l *Loader) ReferenceDocPaths() map[string]string {
+	result := make(map[string]string, len(l.refDocs))
+	for path, content := range l.refDocs {
+		result[path] = content
+	}
+	return result
+}
+
+// RuleSummary is a compact representation of a rule for the catalog.
+type RuleSummary struct {
+	Name        string   // file name without extension (e.g. "service")
+	Description string   // auto-extracted or from front matter
+	RefFiles    []string // base names of referenced docs
+}
+
+// RuleCatalog returns a compact list of rule summaries for the given scope.
+func (l *Loader) RuleCatalog(ctx context.Context, scope Scope) []RuleSummary {
+	rules := l.Rules(ctx, scope)
+	summaries := make([]RuleSummary, 0, len(rules))
+	for _, r := range rules {
+		name := strings.TrimSuffix(filepath.Base(r.Path), ".md")
+		desc := l.extractDescription(ctx, r)
+
+		var refFiles []string
+		for _, p := range r.RefPaths {
+			refFiles = append(refFiles, filepath.Base(p))
+		}
+
+		summaries = append(summaries, RuleSummary{
+			Name:        name,
+			Description: desc,
+			RefFiles:    refFiles,
+		})
+	}
+	return summaries
+}
+
+// RuleCatalogString returns a formatted catalog string for the system prompt.
+// When useTool is false, returns empty string — rules are not exposed to the model.
+func (l *Loader) RuleCatalogString(ctx context.Context, scope Scope, useTool bool) string {
+	if !useTool {
+		return ""
+	}
+
+	summaries := l.RuleCatalog(ctx, scope)
+	if len(summaries) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	b.WriteString("Available project rules (call get_rule(name) before writing code):\n")
+	for _, s := range summaries {
+		b.WriteString("- ")
+		b.WriteString(s.Name)
+		b.WriteString(": ")
+		b.WriteString(s.Description)
+		if len(s.RefFiles) > 0 {
+			b.WriteString(" [see: ")
+			b.WriteString(strings.Join(s.RefFiles, ", "))
+			b.WriteString("]")
+		}
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+// GetRuleContent returns the full text of a rule and all its referenced docs.
+func (l *Loader) GetRuleContent(ctx context.Context, name string, scope Scope) (string, error) {
+	rules := l.Rules(ctx, scope)
+	for _, r := range rules {
+		ruleName := strings.TrimSuffix(filepath.Base(r.Path), ".md")
+		if ruleName != name {
+			continue
+		}
+
+		var b strings.Builder
+		b.WriteString("# Rule: ")
+		b.WriteString(name)
+		b.WriteString("\n\n")
+		b.WriteString(r.Content)
+		b.WriteString("\n")
+
+		// Append all referenced docs
+		for _, refPath := range r.RefPaths {
+			if doc, ok := l.refDocs[refPath]; ok {
+				b.WriteString("\n\n")
+				b.WriteString(doc)
+			}
+		}
+
+		return b.String(), nil
+	}
+
+	// Try without scope filter as fallback
+	for _, r := range l.rules {
+		ruleName := strings.TrimSuffix(filepath.Base(r.Path), ".md")
+		if ruleName == name {
+			var b strings.Builder
+			b.WriteString("# Rule: ")
+			b.WriteString(name)
+			b.WriteString("\n\n")
+			b.WriteString(r.Content)
+			b.WriteString("\n")
+
+			for _, refPath := range r.RefPaths {
+				if doc, ok := l.refDocs[refPath]; ok {
+					b.WriteString("\n\n")
+					b.WriteString(doc)
+				}
+			}
+
+			return b.String(), nil
+		}
+	}
+
+	return "", errors.Errorf("rule %q not found", name)
+}
+
+// extractDescription derives a description for a rule.
+// Priority: 1) front matter "description" field, 2) first referenced doc heading + first sentence, 3) rule file name.
+func (l *Loader) extractDescription(_ context.Context, r *Rule) string {
+	// Check front matter description
+	if r.description != "" {
+		return r.description
+	}
+
+	// Try to extract from first referenced doc
+	if len(r.RefPaths) > 0 {
+		if doc, ok := l.refDocs[r.RefPaths[0]]; ok {
+			if desc := extractDocDescription(doc); desc != "" {
+				return desc
+			}
+		}
+	}
+
+	// Fallback to file name
+	return strings.TrimSuffix(filepath.Base(r.Path), ".md")
+}
+
+// extractDocDescription extracts heading + first sentence from a formatted doc.
+func extractDocDescription(doc string) string {
+	// Doc format is either "--- filename ---\ncontent" or "```go\n// filename\ncontent\n```"
+	lines := strings.Split(doc, "\n")
+
+	var heading, firstSentence string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "---") || strings.HasPrefix(line, "```") || strings.HasPrefix(line, "//") {
+			continue
+		}
+		if strings.HasPrefix(line, "# ") {
+			heading = strings.TrimPrefix(line, "# ")
+			continue
+		}
+		if heading != "" && firstSentence == "" {
+			// Take first sentence (up to first period or end of line)
+			firstSentence = line
+			if idx := strings.Index(firstSentence, "."); idx >= 0 {
+				firstSentence = firstSentence[:idx]
+			}
+			break
+		}
+	}
+
+	if heading != "" && firstSentence != "" {
+		return heading + " — " + firstSentence
+	}
+	if heading != "" {
+		return heading
+	}
+	return ""
 }
 
 // GetCommand returns a command by name.
@@ -154,17 +484,18 @@ func (l *Loader) Commands() map[string]*Command {
 	return l.commands
 }
 
-func parseFrontMatter(content string) (Priority, Scope, string) {
+func parseFrontMatter(content string) (Priority, Scope, string, string) {
 	priority := PriorityNormal
 	scope := ScopeAll
+	description := ""
 
 	if !strings.HasPrefix(content, "---") {
-		return priority, scope, content
+		return priority, scope, content, description
 	}
 
 	end := strings.Index(content[3:], "---")
 	if end == -1 {
-		return priority, scope, content
+		return priority, scope, content, description
 	}
 
 	frontMatter := content[3 : end+3]
@@ -189,10 +520,12 @@ func parseFrontMatter(content string) (Priority, Scope, string) {
 			}
 		case "scope":
 			scope = Scope(val)
+		case "description":
+			description = strings.Trim(val, "\"")
 		}
 	}
 
-	return priority, scope, strings.TrimSpace(body)
+	return priority, scope, strings.TrimSpace(body), description
 }
 
 func parseCommand(path, content string) *Command {

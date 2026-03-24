@@ -5,11 +5,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"time"
+
+	"github.com/pkg/errors"
 )
+
+// maxErrorBodyBytes limits how much error response body we read to prevent OOM.
+const maxErrorBodyBytes = 1024 * 1024 // 1MB
 
 // Client communicates with the Ollama API.
 type Client struct {
@@ -33,17 +37,17 @@ func NewClient(baseURL string, timeout time.Duration) *Client {
 func (c *Client) Ping(ctx context.Context) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/tags", nil)
 	if err != nil {
-		return fmt.Errorf("create request: %w", err)
+		return errors.WithMessage(err, "create request")
 	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("ollama unreachable at %s: %w (is 'ollama serve' running?)", c.baseURL, err)
+		return errors.WithMessagef(err, "ollama unreachable at %s (is 'ollama serve' running?)", c.baseURL)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("ollama returned status %d", resp.StatusCode)
+		return errors.Errorf("ollama returned status %d", resp.StatusCode)
 	}
 
 	return nil
@@ -58,7 +62,7 @@ func (c *Client) Models(ctx context.Context) ([]Model, error) {
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("list models: %w", err)
+		return nil, errors.WithMessage(err, "list models")
 	}
 	defer resp.Body.Close()
 
@@ -76,7 +80,7 @@ func (c *Client) Chat(ctx context.Context, chatReq ChatRequest) (<-chan ChatChun
 
 	body, err := json.Marshal(chatReq)
 	if err != nil {
-		return nil, fmt.Errorf("marshal request: %w", err)
+		return nil, errors.WithMessage(err, "marshal request")
 	}
 
 	var resp *http.Response
@@ -84,7 +88,7 @@ func (c *Client) Chat(ctx context.Context, chatReq ChatRequest) (<-chan ChatChun
 	for attempt := range c.maxRetries {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/chat", bytes.NewReader(body))
 		if err != nil {
-			return nil, fmt.Errorf("create request: %w", err)
+			return nil, errors.WithMessage(err, "create request")
 		}
 		req.Header.Set("Content-Type", "application/json")
 
@@ -98,7 +102,7 @@ func (c *Client) Chat(ctx context.Context, chatReq ChatRequest) (<-chan ChatChun
 					continue
 				}
 			}
-			return nil, fmt.Errorf("chat request: %w", err)
+			return nil, errors.WithMessage(err, "chat request")
 		}
 
 		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable {
@@ -111,25 +115,25 @@ func (c *Client) Chat(ctx context.Context, chatReq ChatRequest) (<-chan ChatChun
 					continue
 				}
 			}
-			return nil, fmt.Errorf("ollama returned %d after %d retries", resp.StatusCode, c.maxRetries)
+			return nil, errors.Errorf("ollama returned %d after %d retries", resp.StatusCode, c.maxRetries)
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			bodyBytes, _ := io.ReadAll(resp.Body)
+			bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
 			resp.Body.Close()
-			return nil, fmt.Errorf("ollama error %d: %s", resp.StatusCode, string(bodyBytes))
+			return nil, errors.Errorf("ollama error %d: %s", resp.StatusCode, string(bodyBytes))
 		}
 
 		break
 	}
 
 	ch := make(chan ChatChunk, 16)
-	go c.streamResponse(resp, ch)
+	go c.streamResponse(ctx, resp, ch)
 
 	return ch, nil
 }
 
-func (c *Client) streamResponse(resp *http.Response, ch chan<- ChatChunk) {
+func (c *Client) streamResponse(ctx context.Context, resp *http.Response, ch chan<- ChatChunk) {
 	defer close(ch)
 	defer resp.Body.Close()
 
@@ -144,17 +148,30 @@ func (c *Client) streamResponse(resp *http.Response, ch chan<- ChatChunk) {
 
 		var chatResp ChatResponse
 		if err := json.Unmarshal(line, &chatResp); err != nil {
-			ch <- ChatChunk{Error: fmt.Errorf("decode chunk: %w", err)}
+			select {
+			case ch <- ChatChunk{Error: errors.WithMessage(err, "decode chunk")}:
+			case <-ctx.Done():
+			}
 			return
 		}
 
 		chunk := ChatChunk{
-			Content:   chatResp.Message.Content,
-			ToolCalls: chatResp.Message.ToolCalls,
-			Done:      chatResp.Done,
+			Content:            chatResp.Message.Content,
+			ToolCalls:          chatResp.Message.ToolCalls,
+			Done:               chatResp.Done,
+			PromptEvalCount:    chatResp.PromptEvalCount,
+			PromptEvalDuration: chatResp.PromptEvalDuration,
+			EvalCount:          chatResp.EvalCount,
+			EvalDuration:       chatResp.EvalDuration,
+			TotalDuration:      chatResp.TotalDuration,
+			LoadDuration:       chatResp.LoadDuration,
 		}
 
-		ch <- chunk
+		select {
+		case ch <- chunk:
+		case <-ctx.Done():
+			return
+		}
 
 		if chatResp.Done {
 			return
@@ -162,7 +179,10 @@ func (c *Client) streamResponse(resp *http.Response, ch chan<- ChatChunk) {
 	}
 
 	if err := scanner.Err(); err != nil {
-		ch <- ChatChunk{Error: fmt.Errorf("read stream: %w", err)}
+		select {
+		case ch <- ChatChunk{Error: errors.WithMessage(err, "read stream")}:
+		case <-ctx.Done():
+		}
 	}
 }
 
@@ -185,6 +205,25 @@ func (c *Client) ChatSync(ctx context.Context, chatReq ChatRequest) (ChatChunk, 
 			result.ToolCalls = append(result.ToolCalls, chunk.ToolCalls...)
 		}
 		result.Done = chunk.Done
+		// Token counts and timings come in the final chunk (done=true)
+		if chunk.PromptEvalCount > 0 {
+			result.PromptEvalCount = chunk.PromptEvalCount
+		}
+		if chunk.EvalCount > 0 {
+			result.EvalCount = chunk.EvalCount
+		}
+		if chunk.EvalDuration > 0 {
+			result.EvalDuration = chunk.EvalDuration
+		}
+		if chunk.PromptEvalDuration > 0 {
+			result.PromptEvalDuration = chunk.PromptEvalDuration
+		}
+		if chunk.TotalDuration > 0 {
+			result.TotalDuration = chunk.TotalDuration
+		}
+		if chunk.LoadDuration > 0 {
+			result.LoadDuration = chunk.LoadDuration
+		}
 	}
 
 	result.Content = contentBuf.String()
@@ -199,4 +238,36 @@ func (c *Client) ChatSync(ctx context.Context, chatReq ChatRequest) (ChatChunk, 
 	}
 
 	return result, nil
+}
+
+// Embed generates embeddings for the given input texts.
+func (c *Client) Embed(ctx context.Context, req EmbedRequest) (*EmbedResponse, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, errors.WithMessage(err, "marshal embed request")
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/embed", bytes.NewReader(body))
+	if err != nil {
+		return nil, errors.WithMessage(err, "create embed request")
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, errors.WithMessage(err, "embed request")
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
+		return nil, errors.Errorf("embed error %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var result EmbedResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, errors.WithMessage(err, "decode embed response")
+	}
+
+	return &result, nil
 }
