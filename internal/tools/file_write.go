@@ -36,6 +36,20 @@ func (t *WriteFileTool) Schema() ollama.JSONSchema {
 	}
 }
 
+// ResolvePaths returns the absolute path that this write affects, used by the
+// registry to invalidate dependent cache entries.
+func (t *WriteFileTool) ResolvePaths(params map[string]any) []string {
+	p, _ := params["path"].(string)
+	if p == "" {
+		return nil
+	}
+	resolved, err := SafePath(context.TODO(), t.workDir, p)
+	if err != nil {
+		return nil
+	}
+	return []string{resolved}
+}
+
 func (t *WriteFileTool) Execute(ctx context.Context, params map[string]any) (ToolResult, error) {
 	path, _ := params["path"].(string)
 	content, _ := params["content"].(string)

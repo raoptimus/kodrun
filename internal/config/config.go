@@ -33,6 +33,55 @@ func (c *Config) ChatProvider() ProviderConfig {
 	return c.Providers[c.Agent.Provider]
 }
 
+// ThinkingProvider returns the provider used by "thinking" roles
+// (planner, reviewer, response classifier). Falls back to ChatProvider.
+func (c *Config) ThinkingProvider() ProviderConfig {
+	if c.Agent.ThinkingProvider != "" {
+		if p, ok := c.Providers[c.Agent.ThinkingProvider]; ok {
+			return p
+		}
+	}
+	return c.ChatProvider()
+}
+
+// ExecutorProvider returns the provider used by the executor role.
+// Falls back to ChatProvider.
+func (c *Config) ExecutorProvider() ProviderConfig {
+	if c.Agent.ExecutorProvider != "" {
+		if p, ok := c.Providers[c.Agent.ExecutorProvider]; ok {
+			return p
+		}
+	}
+	return c.ChatProvider()
+}
+
+// ExtractorProvider returns the provider used by the extractor role for
+// converting free-form planner output into a structured plan. Defaults to
+// ChatProvider with Temperature=0 and Format="json" overlaid so that the same
+// underlying model produces deterministic JSON without any user configuration.
+func (c *Config) ExtractorProvider() ProviderConfig {
+	var p ProviderConfig
+	if c.Agent.ExtractorProvider != "" {
+		if pp, ok := c.Providers[c.Agent.ExtractorProvider]; ok {
+			p = pp
+		} else {
+			p = c.ChatProvider()
+		}
+	} else {
+		p = c.ChatProvider()
+	}
+	// Default to deterministic JSON if the user did not override.
+	if p.Format == "" {
+		p.Format = "json"
+	}
+	// Temperature 0 is intended unless the user explicitly set something
+	// non-zero in their dedicated extractor profile.
+	if c.Agent.ExtractorProvider == "" {
+		p.Temperature = 0
+	}
+	return p
+}
+
 // RAGProvider returns the provider config for RAG embedding.
 func (c *Config) RAGProvider() ProviderConfig {
 	return c.Providers[c.RAG.Provider]
@@ -50,11 +99,18 @@ type MCPServerConfig struct {
 }
 
 // ProviderConfig describes a single LLM provider instance (currently only Ollama).
+//
+// Temperature and Format are optional generation parameters used by roles that
+// need different behaviour than the default chat profile. The extractor role,
+// for instance, uses Temperature=0 and Format="json" to coerce structured
+// output from the same underlying model.
 type ProviderConfig struct {
 	BaseURL     string        `mapstructure:"base_url"`
 	Model       string        `mapstructure:"model"`
 	Timeout     time.Duration `mapstructure:"timeout"`
 	ContextSize int           `mapstructure:"context_size"`
+	Temperature float64       `mapstructure:"temperature"`
+	Format      string        `mapstructure:"format"`
 }
 
 // OllamaConfig holds Ollama API connection settings (legacy, kept for backward compatibility).
@@ -67,8 +123,13 @@ type OllamaConfig struct {
 
 // AgentConfig holds agent behavior settings.
 type AgentConfig struct {
-	Provider      string `mapstructure:"provider"`
-	MaxIterations int    `mapstructure:"max_iterations"`
+	Provider          string `mapstructure:"provider"`
+	ThinkingProvider  string `mapstructure:"thinking_provider"`
+	ExecutorProvider  string `mapstructure:"executor_provider"`
+	ExtractorProvider string `mapstructure:"extractor_provider"`
+	MaxIterations     int    `mapstructure:"max_iterations"`
+	MaxParallelTasks  int    `mapstructure:"max_parallel_tasks"`
+	MaxReplans        int    `mapstructure:"max_replans"`
 	MaxWorkers    int    `mapstructure:"max_workers"`
 	AutoFix       bool   `mapstructure:"auto_fix"`
 	AutoCommit    bool   `mapstructure:"auto_commit"`
@@ -79,6 +140,9 @@ type AgentConfig struct {
 	Orchestrator  bool   `mapstructure:"orchestrator"`
 	Review        bool   `mapstructure:"review"`
 	PrefetchCode  bool   `mapstructure:"prefetch_code"`
+	// ProjectLanguage overrides automatic project-language detection.
+	// Valid values: "go", "python", "jsts". Empty enables auto-detection.
+	ProjectLanguage string `mapstructure:"project_language"`
 }
 
 // ToolsConfig holds file tool restrictions.
@@ -100,15 +164,19 @@ type SnippetsConfig struct {
 }
 
 // RAGConfig holds RAG (Retrieval-Augmented Generation) settings.
+//
+// The embedding model and connection details come from the provider profile
+// referenced by Provider — there is no per-RAG embedding_model field. To
+// switch embedding model, define a dedicated profile in `providers:` and
+// point `rag.provider` at it.
 type RAGConfig struct {
-	Provider       string   `mapstructure:"provider"`
-	Enabled        bool     `mapstructure:"enabled"`
-	EmbeddingModel string   `mapstructure:"embedding_model"`
-	IndexDirs      []string `mapstructure:"index_dirs"`
-	ChunkSize      int      `mapstructure:"chunk_size"`
-	ChunkOverlap   int      `mapstructure:"chunk_overlap"`
-	TopK           int      `mapstructure:"top_k"`
-	IndexPath      string   `mapstructure:"index_path"`
+	Provider     string   `mapstructure:"provider"`
+	Enabled      bool     `mapstructure:"enabled"`
+	IndexDirs    []string `mapstructure:"index_dirs"`
+	ChunkSize    int      `mapstructure:"chunk_size"`
+	ChunkOverlap int      `mapstructure:"chunk_overlap"`
+	TopK         int      `mapstructure:"top_k"`
+	IndexPath    string   `mapstructure:"index_path"`
 }
 
 // Defaults returns a Config with default values.
@@ -121,9 +189,11 @@ func Defaults() Config {
 			ContextSize: 32768,
 		},
 		Agent: AgentConfig{
-			Provider:      "default",
-			MaxIterations: 50,
-			MaxWorkers:    4,
+			Provider:         "default",
+			MaxIterations:    50,
+			MaxWorkers:       4,
+			MaxParallelTasks: 1,
+			MaxReplans:       2,
 			AutoFix:       true,
 			AutoCommit:    false,
 			DefaultMode:   "plan",
@@ -148,13 +218,12 @@ func Defaults() Config {
 			UseTool: true,
 		},
 		RAG: RAGConfig{
-			Enabled:        false,
-			EmbeddingModel: "nomic-embed-text",
-			IndexDirs:      []string{"."},
-			ChunkSize:      128,
-			ChunkOverlap:   64,
-			TopK:           5,
-			IndexPath:      ".kodrun/rag_index",
+			Enabled:      false,
+			IndexDirs:    []string{"."},
+			ChunkSize:    128,
+			ChunkOverlap: 64,
+			TopK:         5,
+			IndexPath:    ".kodrun/rag_index",
 		},
 		TUI: TUIConfig{
 			MaxHistory: 100,
@@ -251,9 +320,28 @@ func (c *Config) Validate(_ context.Context) error {
 	if _, ok := c.Providers[c.Agent.Provider]; !ok {
 		return errors.Errorf("agent.provider %q not found in providers", c.Agent.Provider)
 	}
+	if c.Agent.ThinkingProvider != "" {
+		if _, ok := c.Providers[c.Agent.ThinkingProvider]; !ok {
+			return errors.Errorf("agent.thinking_provider %q not found in providers", c.Agent.ThinkingProvider)
+		}
+	}
+	if c.Agent.ExecutorProvider != "" {
+		if _, ok := c.Providers[c.Agent.ExecutorProvider]; !ok {
+			return errors.Errorf("agent.executor_provider %q not found in providers", c.Agent.ExecutorProvider)
+		}
+	}
+	if c.Agent.ExtractorProvider != "" {
+		if _, ok := c.Providers[c.Agent.ExtractorProvider]; !ok {
+			return errors.Errorf("agent.extractor_provider %q not found in providers", c.Agent.ExtractorProvider)
+		}
+	}
 	if c.RAG.Enabled {
-		if _, ok := c.Providers[c.RAG.Provider]; !ok {
+		ragProv, ok := c.Providers[c.RAG.Provider]
+		if !ok {
 			return errors.Errorf("rag.provider %q not found in providers", c.RAG.Provider)
+		}
+		if ragProv.Model == "" {
+			return errors.Errorf("rag.provider %q has empty model — set providers.%s.model to your embedding model (e.g. nomic-embed-text)", c.RAG.Provider, c.RAG.Provider)
 		}
 	}
 
@@ -273,6 +361,15 @@ func (c *Config) Validate(_ context.Context) error {
 	}
 	if c.Agent.MaxWorkers <= 0 {
 		c.Agent.MaxWorkers = 1
+	}
+	if c.Agent.MaxParallelTasks <= 0 {
+		c.Agent.MaxParallelTasks = 1
+	}
+	if c.Agent.MaxReplans < 0 {
+		c.Agent.MaxReplans = 0
+	}
+	if c.Agent.MaxReplans == 0 {
+		c.Agent.MaxReplans = 2
 	}
 	if c.Tools.MaxReadLines <= 0 {
 		c.Tools.MaxReadLines = 500

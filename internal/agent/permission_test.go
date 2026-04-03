@@ -10,22 +10,22 @@ func TestFingerprint(t *testing.T) {
 		want string
 	}{
 		{
-			name: "write_file",
+			name: "write_file is per-tool (path-independent)",
 			tool: "write_file",
 			args: map[string]any{"path": "main.go"},
-			want: "write_file:main.go",
+			want: "write_file",
 		},
 		{
-			name: "edit_file",
+			name: "edit_file is per-tool (path-independent)",
 			tool: "edit_file",
 			args: map[string]any{"path": "internal/agent/agent.go"},
-			want: "edit_file:internal/agent/agent.go",
+			want: "edit_file",
 		},
 		{
-			name: "delete_file",
+			name: "delete_file is per-tool (path-independent)",
 			tool: "delete_file",
 			args: map[string]any{"path": "tmp.go"},
-			want: "delete_file:tmp.go",
+			want: "delete_file",
 		},
 		{
 			name: "move_file",
@@ -49,7 +49,13 @@ func TestFingerprint(t *testing.T) {
 			name: "missing path",
 			tool: "write_file",
 			args: map[string]any{},
-			want: "write_file:",
+			want: "write_file",
+		},
+		{
+			name: "edit_file fingerprint independent of path: a vs b",
+			tool: "edit_file",
+			args: map[string]any{"path": "b.go"},
+			want: "edit_file",
 		},
 	}
 

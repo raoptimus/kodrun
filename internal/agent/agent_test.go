@@ -109,7 +109,7 @@ func TestAgent_SendPassesNumCtxAndRules(t *testing.T) {
 	contextSize := 32768
 	ag := New(client, "test-model", reg, 10, workDir, contextSize)
 	ag.SetMode(ModeEdit)
-	ag.SetConfirmFunc(func(_, _ string) ConfirmResult { return ConfirmResult{Action: ConfirmAllowOnce} })
+	ag.SetConfirmFunc(func(_ ConfirmPayload) ConfirmResult { return ConfirmResult{Action: ConfirmAllowOnce} })
 
 	// Load rules
 	loader := rules.NewLoader(workDir, 0)

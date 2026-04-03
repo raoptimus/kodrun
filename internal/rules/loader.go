@@ -71,13 +71,21 @@ type Loader struct {
 	workDir    string
 	rules      []*Rule
 	commands   map[string]*Command
-	refDocs    map[string]string // path → resolved content (deduplicated)
-	refOrder   []string          // insertion order for deterministic output
-	maxRefSize int               // max size of a single doc (0 = no limit)
+	refDocs        map[string]string // path → resolved content (deduplicated)
+	refOrder       []string          // insertion order for deterministic output
+	maxRefSize     int               // max size of a single doc (0 = no limit)
+	unresolvedRefs []UnresolvedRef   // @-references that failed to resolve during Load
+}
+
+// UnresolvedRef describes a single @-reference in a rule file that could not
+// be resolved to an existing file on disk.
+type UnresolvedRef struct {
+	RulePath string // path to the rule file containing the broken reference
+	RefPath  string // the @-target as written in the rule (without the leading @)
 }
 
 // refPattern matches @path references in rule content.
-// Matches: @.claude/docs/file.md, @.kodrun/docs/example.go, etc.
+// Matches: @.kodrun/docs/file.md, @.kodrun/docs/example.go, etc.
 var refPattern = regexp.MustCompile(`@([^\s,]+\.\w+)`)
 
 // NewLoader creates a rules loader.
@@ -99,6 +107,7 @@ func (l *Loader) Load(ctx context.Context) error {
 	l.commands = make(map[string]*Command)
 	l.refDocs = make(map[string]string)
 	l.refOrder = nil
+	l.unresolvedRefs = nil
 
 	for _, dir := range l.dirs {
 		absDir := dir
@@ -132,7 +141,7 @@ func (l *Loader) Load(ctx context.Context) error {
 			priority, scope, body, desc := parseFrontMatter(content)
 
 			// Collect @file references: deduplicate into refDocs, replace with labels
-			body, refPaths := l.collectReferences(ctx, body)
+			body, refPaths := l.collectReferences(ctx, path, body)
 
 			// Check if this is a command definition
 			if strings.Contains(dir, "commands") {
@@ -169,16 +178,21 @@ func (l *Loader) Load(ctx context.Context) error {
 // collectReferences scans @path refs in text, resolves and deduplicates them into
 // refDocs, and replaces inline references with [see: filename] labels.
 // Returns the modified text and list of reference paths.
-func (l *Loader) collectReferences(ctx context.Context, content string) (string, []string) {
+// Any @-reference that fails to resolve is recorded in l.unresolvedRefs so the
+// caller can surface a warning instead of silently dropping the doc from RAG.
+func (l *Loader) collectReferences(ctx context.Context, rulePath, content string) (string, []string) {
 	var refPaths []string
 	seen := make(map[string]bool)
 
 	result := refPattern.ReplaceAllStringFunc(content, func(match string) string {
 		refPath := match[1:] // strip leading @
 
-		// Resolve the actual path (with .claude/ → .kodrun/ fallback)
 		resolvedPath, data, err := l.resolveRef(ctx, refPath)
 		if err != nil {
+			l.unresolvedRefs = append(l.unresolvedRefs, UnresolvedRef{
+				RulePath: rulePath,
+				RefPath:  refPath,
+			})
 			return match // leave as-is if not found
 		}
 
@@ -203,17 +217,10 @@ func (l *Loader) collectReferences(ctx context.Context, content string) (string,
 	return result, refPaths
 }
 
-// resolveRef tries to read a reference file, with .claude/ → .kodrun/ fallback.
-// Returns the resolved path, file data, and any error.
+// resolveRef reads a referenced file. The @-syntax always resolves relative
+// to the project root (workDir); the path is used as-is without any rewriting.
 func (l *Loader) resolveRef(ctx context.Context, refPath string) (string, []byte, error) {
 	data, err := l.readRef(ctx, refPath)
-	if err != nil && strings.HasPrefix(refPath, ".claude/") {
-		altPath := ".kodrun/" + refPath[len(".claude/"):]
-		data, err = l.readRef(ctx, altPath)
-		if err == nil {
-			return altPath, data, nil
-		}
-	}
 	if err != nil {
 		return "", nil, err
 	}
@@ -238,10 +245,19 @@ func (l *Loader) formatDoc(_ context.Context, path string, content string) strin
 	}
 }
 
+// readRef reads a referenced file. The @-syntax always resolves relative to
+// the project root (workDir): a leading "/" is stripped so that @/.kodrun/...
+// behaves the same as @.kodrun/..., and the resolved path must stay inside
+// workDir to prevent escaping via "..".
 func (l *Loader) readRef(_ context.Context, refPath string) ([]byte, error) {
-	absPath := refPath
-	if !filepath.IsAbs(refPath) {
-		absPath = filepath.Join(l.workDir, refPath)
+	cleaned := strings.TrimPrefix(refPath, "/")
+	if filepath.IsAbs(cleaned) {
+		return nil, errors.Errorf("@-reference must be relative to project root, got absolute path %q", refPath)
+	}
+	absPath := filepath.Join(l.workDir, cleaned)
+	rel, err := filepath.Rel(l.workDir, absPath)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return nil, errors.Errorf("@-reference %q escapes project root", refPath)
 	}
 	return os.ReadFile(absPath)
 }
@@ -250,6 +266,14 @@ func (l *Loader) readRef(_ context.Context, refPath string) ([]byte, error) {
 // AllRules returns all loaded rules regardless of scope.
 func (l *Loader) AllRules() []*Rule {
 	return l.rules
+}
+
+// UnresolvedRefs returns all @-references collected during Load that did not
+// resolve to an existing file. The caller can surface these as warnings so a
+// typo in a rule (e.g. @.koderun/... instead of @.kodrun/...) does not silently
+// drop docs from RAG indexing.
+func (l *Loader) UnresolvedRefs() []UnresolvedRef {
+	return l.unresolvedRefs
 }
 
 func (l *Loader) Rules(_ context.Context, scope Scope) []*Rule {

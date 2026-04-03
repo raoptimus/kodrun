@@ -96,9 +96,23 @@ func (idx *Index) Save() error {
 	return os.WriteFile(filepath.Join(idx.path, "index.json"), data, 0o644)
 }
 
+// ProgressFunc is invoked from Build/BuildWithProgress while embedding
+// chunks. done counts chunks that have already been embedded; total is the
+// number of new chunks that need embedding (not the input chunk count, since
+// already-indexed chunks are skipped). label is a short human-readable hint.
+type ProgressFunc func(label string, done, total int)
+
 // Build indexes the given chunks, skipping already-indexed ones.
 // Returns the number of new chunks indexed.
 func (idx *Index) Build(ctx context.Context, chunks []Chunk) (int, error) {
+	return idx.BuildWithProgress(ctx, chunks, nil)
+}
+
+// BuildWithProgress is Build with an optional progress callback. The callback
+// is invoked once with (0, total) when embedding starts, then after each
+// embedding batch with (done, total), and finally with (total, total) when
+// the embedding loop finishes (before merge/prune).
+func (idx *Index) BuildWithProgress(ctx context.Context, chunks []Chunk, progress ProgressFunc) (int, error) {
 	// Phase 1: Read existing hashes under RLock.
 	idx.mu.RLock()
 	existing := make(map[string]bool, len(idx.entries))
@@ -121,11 +135,18 @@ func (idx *Index) Build(ctx context.Context, chunks []Chunk) (int, error) {
 	if len(newChunks) == 0 {
 		// Still need to prune stale entries.
 		idx.pruneStale(chunks)
+		if progress != nil {
+			progress("up to date", 0, 0)
+		}
 		return 0, nil
 	}
 
 	// Phase 2: Embed in batches WITHOUT holding the lock.
 	const batchSize = 4
+	total := len(newChunks)
+	if progress != nil {
+		progress("embedding", 0, total)
+	}
 	newEntries := make([]IndexEntry, 0, len(newChunks))
 	for i := 0; i < len(newChunks); i += batchSize {
 		select {
@@ -165,6 +186,9 @@ func (idx *Index) Build(ctx context.Context, chunks []Chunk) (int, error) {
 				Embedding: emb,
 				Hash:      newHashes[i+j],
 			})
+		}
+		if progress != nil {
+			progress("embedding", len(newEntries), total)
 		}
 	}
 

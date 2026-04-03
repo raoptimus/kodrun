@@ -8,7 +8,7 @@ import (
 )
 
 func TestChunkEmbeddedDocs(t *testing.T) {
-	chunks := ChunkEmbeddedDocs(128, 64)
+	chunks := ChunkEmbeddedDocs("go", 128, 64)
 
 	require.NotEmpty(t, chunks)
 

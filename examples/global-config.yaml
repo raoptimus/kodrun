@@ -1,6 +1,11 @@
 # Global config example (~/.config/kodrun/config.yaml)
 #
 # Applies to all projects. Project-level .kodrun.yaml overrides these values.
+#
+# Keep this file MINIMAL — per-role provider wiring (thinking_provider /
+# executor_provider / extractor_provider) and concurrency tuning belong in the
+# project-level .kodrun.yaml because they depend on the project's models and
+# workload. See examples/kodrun.yaml for the full reference.
 
 ollama:
   base_url: "http://localhost:11434"
@@ -16,5 +21,12 @@ agent:
   language: "en"
   # Auto-compact context when >=99% full
   auto_compact: true
-  # Max parallel read-only tool calls (1 = sequential)
+
+  # Concurrency — see examples/kodrun.yaml for the full explanation.
+  #
+  #   max_workers        — parallel read-only tool calls inside one sub-agent.
+  #   max_parallel_tasks — parallel plan steps in DAG mode (1 = sequential).
+  #   max_replans        — REPLAN cycle hard cap per Run.
   max_workers: 4
+  max_parallel_tasks: 1
+  max_replans: 2

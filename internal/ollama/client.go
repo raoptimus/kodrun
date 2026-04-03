@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/pkg/errors"
@@ -121,6 +122,21 @@ func (c *Client) Chat(ctx context.Context, chatReq ChatRequest) (<-chan ChatChun
 		if resp.StatusCode != http.StatusOK {
 			bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
 			resp.Body.Close()
+
+			// Ollama 500 with "XML syntax error" means the model produced
+			// a malformed tool call that Ollama couldn't parse. Retry once
+			// without tools so the model responds with plain text instead.
+			if resp.StatusCode == http.StatusInternalServerError &&
+				strings.Contains(string(bodyBytes), "XML syntax error") &&
+				len(chatReq.Tools) > 0 {
+				chatReq.Tools = nil
+				body, err = json.Marshal(chatReq)
+				if err != nil {
+					return nil, errors.WithMessage(err, "marshal retry request")
+				}
+				continue
+			}
+
 			return nil, errors.Errorf("ollama error %d: %s", resp.StatusCode, string(bodyBytes))
 		}
 
@@ -228,6 +244,13 @@ func (c *Client) ChatSync(ctx context.Context, chatReq ChatRequest) (ChatChunk, 
 
 	result.Content = contentBuf.String()
 
+	// Detect upstream error JSON returned as content (proxy/policy errors
+	// served with HTTP 200). Surface as a real error so the agent loop
+	// stops instead of treating the JSON as a normal model reply.
+	if msg := detectErrorJSON(result.Content); msg != "" {
+		return ChatChunk{}, errors.Errorf("llm error: %s", msg)
+	}
+
 	// Try parsing tool calls from text if none were returned structurally
 	if len(result.ToolCalls) == 0 && result.Content != "" {
 		if parsed, ok := ParseToolCalls(result.Content); ok {
@@ -238,6 +261,40 @@ func (c *Client) ChatSync(ctx context.Context, chatReq ChatRequest) (ChatChunk, 
 	}
 
 	return result, nil
+}
+
+// detectErrorJSON returns a non-empty message when content is an error envelope
+// like {"error":{"type":"...","message":"..."}} or {"error":"..."}.
+// Returns "" for normal content.
+func detectErrorJSON(content string) string {
+	s := strings.TrimSpace(content)
+	if len(s) < 2 || s[0] != '{' {
+		return ""
+	}
+	var envelope struct {
+		Error json.RawMessage `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(s), &envelope); err != nil || len(envelope.Error) == 0 {
+		return ""
+	}
+	// error может быть строкой или объектом {type,message}
+	var asStr string
+	if err := json.Unmarshal(envelope.Error, &asStr); err == nil && asStr != "" {
+		return asStr
+	}
+	var asObj struct {
+		Type    string `json:"type"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(envelope.Error, &asObj); err == nil {
+		if asObj.Message != "" {
+			return asObj.Message
+		}
+		if asObj.Type != "" {
+			return asObj.Type
+		}
+	}
+	return ""
 }
 
 // Embed generates embeddings for the given input texts.

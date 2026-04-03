@@ -10,8 +10,6 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/raoptimus/kodrun/internal/ollama"
-	"github.com/raoptimus/kodrun/internal/rules"
-	"github.com/raoptimus/kodrun/internal/snippets"
 )
 
 // goTool is the base for all Go command tools.
@@ -221,30 +219,53 @@ func NewGoModTidyTool(workDir string) Tool {
 	}
 }
 
-// RegisterAllTools registers all built-in tools into a registry.
-func RegisterAllTools(_ context.Context, reg *Registry, workDir string, forbidden []string, maxReadLines int, loader *rules.Loader, snippetLoader *snippets.Loader, scope rules.Scope, useRuleTool, useSnippetTool, ragEnabled bool) {
-	reg.Register(NewReadFileTool(workDir, forbidden, maxReadLines))
-	reg.Register(NewWriteFileTool(workDir, forbidden))
-	reg.Register(NewEditFileTool(workDir, forbidden))
-	reg.Register(NewListDirTool(workDir, forbidden))
-	reg.Register(NewFindFilesTool(workDir, forbidden))
-	reg.Register(NewGrepTool(workDir, forbidden))
-	reg.Register(NewDeleteFileTool(workDir, forbidden))
-	reg.Register(NewCreateDirTool(workDir))
-	reg.Register(NewMoveFileTool(workDir, forbidden))
+// NewGoGetTool creates a go_get tool.
+func NewGoGetTool(workDir string) Tool {
+	return &goTool{
+		workDir:     workDir,
+		name:        "go_get",
+		description: "Run go get to add or update a dependency",
+		command:     "go",
+		defaultArgs: []string{"get"},
+		schema: ollama.JSONSchema{
+			Type: "object",
+			Properties: map[string]ollama.JSONSchema{
+				"packages": {Type: "string", Description: "Package path(s) to install, e.g. github.com/pkg/errors@latest"},
+			},
+			Required: []string{"packages"},
+		},
+	}
+}
+
+// NewGoDocTool creates a go_doc tool.
+func NewGoDocTool(workDir string) Tool {
+	return &goTool{
+		workDir:     workDir,
+		name:        "go_doc",
+		description: "Run go doc to view documentation for a package or symbol",
+		command:     "go",
+		defaultArgs: []string{"doc"},
+		schema: ollama.JSONSchema{
+			Type: "object",
+			Properties: map[string]ollama.JSONSchema{
+				"packages": {Type: "string", Description: "Package or symbol to get documentation for, e.g. fmt.Println or encoding/json.Decoder"},
+				"flags":    {Type: "string", Description: "Additional flags, e.g. -all for full docs"},
+			},
+			Required: []string{"packages"},
+		},
+	}
+}
+
+// RegisterGoTools registers Go-specific tools (build/test/vet/fmt/lint/etc.).
+func RegisterGoTools(reg *Registry, workDir string) {
 	reg.Register(NewGoBuildTool(workDir))
 	reg.Register(NewGoTestTool(workDir))
 	reg.Register(NewGoVetTool(workDir))
 	reg.Register(NewGoFmtTool(workDir))
 	reg.Register(NewGoLintTool(workDir))
 	reg.Register(NewGoModTidyTool(workDir))
-	reg.Register(&BashTool{workDir: workDir})
-	if loader != nil && useRuleTool && !ragEnabled {
-		reg.Register(NewRuleTool(loader, scope))
-	}
-	if snippetLoader != nil && useSnippetTool && !ragEnabled {
-		reg.Register(NewSnippetTool(snippetLoader))
-	}
+	reg.Register(NewGoGetTool(workDir))
+	reg.Register(NewGoDocTool(workDir))
 }
 
 // BashTool executes arbitrary shell commands.

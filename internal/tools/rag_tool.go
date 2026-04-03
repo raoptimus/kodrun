@@ -9,14 +9,20 @@ import (
 	"github.com/raoptimus/kodrun/internal/rag"
 )
 
+// RAGSearcher is implemented by both *rag.Index and *rag.MultiIndex.
+type RAGSearcher interface {
+	Search(ctx context.Context, query string, topK int) ([]rag.SearchResult, error)
+}
+
 // RAGSearchTool searches the RAG index for relevant code/docs.
 type RAGSearchTool struct {
-	index *rag.Index
+	index RAGSearcher
 	topK  int
 }
 
-// NewRAGSearchTool creates a new search_docs tool.
-func NewRAGSearchTool(index *rag.Index, topK int) *RAGSearchTool {
+// NewRAGSearchTool creates a new search_docs tool. The index argument
+// can be either *rag.Index or *rag.MultiIndex.
+func NewRAGSearchTool(index RAGSearcher, topK int) *RAGSearchTool {
 	return &RAGSearchTool{index: index, topK: topK}
 }
 

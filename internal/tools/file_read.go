@@ -113,6 +113,29 @@ func (t *ReadFileTool) Execute(ctx context.Context, params map[string]any) (Tool
 	}, nil
 }
 
+// CachePolicy declares read_file results as cacheable, keyed by path/offset/limit
+// and invalidated by any write to the same path.
+func (t *ReadFileTool) CachePolicy() CachePolicy {
+	return CachePolicy{
+		Cacheable:    true,
+		PathParams:   []string{"path"},
+		Invalidators: []string{"write_file", "edit_file", "delete_file", "move_file"},
+	}
+}
+
+// ResolvePaths returns the absolute filesystem path the call depends on.
+func (t *ReadFileTool) ResolvePaths(params map[string]any) []string {
+	path, _ := params["path"].(string)
+	if path == "" {
+		return nil
+	}
+	resolved, err := SafePath(context.TODO(), t.workDir, path)
+	if err != nil {
+		return nil
+	}
+	return []string{resolved}
+}
+
 // toInt extracts an integer from a param value with a fallback default.
 func toInt(v any, def int) int {
 	switch n := v.(type) {

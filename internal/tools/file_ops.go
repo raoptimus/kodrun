@@ -103,6 +103,19 @@ func (t *CreateDirTool) Execute(ctx context.Context, params map[string]any) (Too
 	}, nil
 }
 
+// ResolvePaths returns the absolute path of the file being deleted.
+func (t *DeleteFileTool) ResolvePaths(params map[string]any) []string {
+	p, _ := params["path"].(string)
+	if p == "" {
+		return nil
+	}
+	resolved, err := SafePath(context.TODO(), t.workDir, p)
+	if err != nil {
+		return nil
+	}
+	return []string{resolved}
+}
+
 // MoveFileTool moves/renames a file.
 type MoveFileTool struct {
 	workDir           string
@@ -126,6 +139,25 @@ func (t *MoveFileTool) Schema() ollama.JSONSchema {
 		},
 		Required: []string{"from", "to"},
 	}
+}
+
+// ResolvePaths returns the absolute paths affected by the move (both source
+// and destination so the cache invalidates entries on either side).
+func (t *MoveFileTool) ResolvePaths(params map[string]any) []string {
+	from, _ := params["from"].(string)
+	to, _ := params["to"].(string)
+	out := make([]string, 0, 2)
+	if from != "" {
+		if r, err := SafePath(context.TODO(), t.workDir, from); err == nil {
+			out = append(out, r)
+		}
+	}
+	if to != "" {
+		if r, err := SafePath(context.TODO(), t.workDir, to); err == nil {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 func (t *MoveFileTool) Execute(ctx context.Context, params map[string]any) (ToolResult, error) {

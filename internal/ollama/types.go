@@ -26,6 +26,7 @@ type ChatRequest struct {
 	Messages []Message      `json:"messages"`
 	Tools    []ToolDef      `json:"tools,omitempty"`
 	Options  map[string]any `json:"options,omitempty"`
+	Format   string         `json:"format,omitempty"`
 	Stream   bool           `json:"stream"`
 }
 

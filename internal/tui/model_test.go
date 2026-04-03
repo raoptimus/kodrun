@@ -213,7 +213,14 @@ func setupConfirm(t *testing.T) (Model, chan agent.ConfirmResult) {
 	t.Helper()
 	m := newTestModel(t)
 	resultCh := make(chan agent.ConfirmResult, 1)
-	req := ConfirmRequest{Tool: "bash", Detail: "echo hello", Result: resultCh}
+	req := ConfirmRequest{
+		Payload: agent.ConfirmPayload{
+			Tool:    "bash",
+			Args:    map[string]string{"command": "echo hello"},
+			ArgKeys: []string{"command"},
+		},
+		Result: resultCh,
+	}
 	model, _ := m.Update(ConfirmMsg{Request: req})
 	return model.(Model), resultCh
 }

@@ -7,10 +7,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/pkg/errors"
 	"github.com/raoptimus/kodrun/internal/ollama"
-	"github.com/raoptimus/kodrun/internal/rag"
+	"github.com/raoptimus/kodrun/internal/projectlang"
 	"github.com/raoptimus/kodrun/internal/tools"
 )
 
@@ -47,6 +48,10 @@ var readOnlyTools = map[string]bool{
 	"get_rule":    true,
 	"snippets":    true,
 	"search_docs": true,
+	"go_doc":      true,
+	"git_status":  true,
+	"git_diff":    true,
+	"git_log":     true,
 }
 
 // EventHandler receives agent events for display.
@@ -69,6 +74,16 @@ type Event struct {
 	LinesRemoved       int
 	Diff               string
 	Stats              *SessionStats // set on EventDone
+
+	// CacheHits / CacheMisses are populated on EventCacheStats events.
+	CacheHits   int64
+	CacheMisses int64
+
+	// Progress is set on EventRAGProgress events. Done == Total signals
+	// completion; the TUI hides the indicator on the next event.
+	ProgressDone  int
+	ProgressTotal int
+	ProgressLabel string
 }
 
 // SessionStats accumulates statistics for the current task execution.
@@ -84,6 +99,7 @@ type SessionStats struct {
 	TotalEval      int
 	PeakContextPct int // peak context usage percentage
 	AvgTkPerSec    float64
+	ChangedFiles   []string // paths of files added/modified/deleted/renamed
 	tkPerSecSum    float64
 	tkPerSecCount  int
 }
@@ -92,7 +108,7 @@ func (s *SessionStats) reset() {
 	*s = SessionStats{}
 }
 
-func (s *SessionStats) recordFileAction(action string, added, removed int) {
+func (s *SessionStats) recordFileAction(action, path string, added, removed int) {
 	switch action {
 	case "Add":
 		s.FilesAdded++
@@ -105,6 +121,9 @@ func (s *SessionStats) recordFileAction(action string, added, removed int) {
 	}
 	s.LinesAdded += added
 	s.LinesRemoved += removed
+	if path != "" {
+		s.ChangedFiles = append(s.ChangedFiles, path)
+	}
 }
 
 func (s *SessionStats) recordTokens(prompt, eval int, tkPerSec float64, contextPct int) {
@@ -140,6 +159,19 @@ const (
 	EventGroupStart
 	EventGroupEnd
 	EventModeChange
+	// EventPhase signals an orchestrator phase transition (planning, executing,
+	// reviewing). Message holds the phase name.
+	EventPhase
+	// EventCacheStats reports the latest tool-cache hit/miss counters and hit
+	// rate. The TUI uses these to render a compact footer.
+	EventCacheStats
+	// EventReplan signals that the executor requested a replan because the
+	// approved plan lacked necessary context.
+	EventReplan
+	// EventRAGProgress reports background RAG indexing progress. Fields:
+	// ProgressDone, ProgressTotal, ProgressLabel. When Done == Total the TUI
+	// stops displaying the indicator.
+	EventRAGProgress
 )
 
 // Agent orchestrates the LLM-tool loop.
@@ -168,10 +200,27 @@ type Agent struct {
 	stats               SessionStats
 	hasSnippets         bool
 	hasRAG              bool
-	ragIndex            *rag.Index
+	ragIndex            tools.RAGSearcher
+	langState           *projectlang.State
 	pool                *WorkerPool
 	extraConfirmTools   map[string]bool
 	extraReadOnlyTools  map[string]bool
+	toolsDisabled       bool
+	sessionDir          string
+	sessionID           string
+
+	// Generation overrides used by specialised roles (extractor uses
+	// temperature=0 + format="json" to coerce structured output from the same
+	// underlying model).
+	temperature    float64
+	hasTemperature bool
+	format         string
+
+	// allowedReadPaths, when non-nil, restricts which paths read-only file
+	// tools may access. The executor uses this to prevent the model from
+	// drifting into open-ended exploration after a plan has been approved.
+	// Empty/nil means no restriction.
+	allowedReadPaths map[string]struct{}
 }
 
 // New creates a new Agent.
@@ -229,13 +278,92 @@ func (a *Agent) SetHasRAG(v bool) {
 }
 
 // SetRAGIndex sets the RAG index for automatic context prefetch.
-func (a *Agent) SetRAGIndex(idx *rag.Index) {
+func (a *Agent) SetRAGIndex(idx tools.RAGSearcher) {
 	a.ragIndex = idx
+}
+
+// SetLanguageState wires a project-language state for lazy re-detection.
+// When set, Send/Run will re-detect on each call and lazily register
+// language-specific tools if the language transitions from unknown.
+func (a *Agent) SetLanguageState(s *projectlang.State) {
+	a.langState = s
+}
+
+// LanguageState returns the configured language state, or nil.
+func (a *Agent) LanguageState() *projectlang.State {
+	return a.langState
+}
+
+// ToolRegistry exposes the tool registry for callers that need to register
+// additional tools after construction (e.g. lazy language detection).
+func (a *Agent) ToolRegistry() *tools.Registry {
+	return a.reg
+}
+
+// WorkDir returns the agent's working directory.
+func (a *Agent) WorkDir() string {
+	return a.workDir
 }
 
 // SetMaxWorkers configures the worker pool for parallel tool execution.
 func (a *Agent) SetMaxWorkers(n int) {
 	a.pool = NewWorkerPool(n)
+}
+
+// SetTemperature pins the sampling temperature used in chat requests. This is
+// primarily used by the extractor role to force deterministic JSON output.
+func (a *Agent) SetTemperature(t float64) {
+	a.temperature = t
+	a.hasTemperature = true
+}
+
+// SetFormat sets the response format hint for the LLM (e.g. "json"). When set,
+// it is forwarded to ollama via the chat request Format field.
+func (a *Agent) SetFormat(f string) {
+	a.format = f
+}
+
+// SetAllowedReadPaths constrains which paths the agent's read-only file tools
+// may access. Pass nil to remove the restriction. The path strings are
+// normalised relative to the agent's work directory.
+//
+// This is used by the executor role after plan approval to enforce the
+// "executor does not re-explore the codebase" contract.
+func (a *Agent) SetAllowedReadPaths(paths []string) {
+	if len(paths) == 0 {
+		a.allowedReadPaths = nil
+		return
+	}
+	m := make(map[string]struct{}, len(paths))
+	for _, p := range paths {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		m[p] = struct{}{}
+	}
+	a.allowedReadPaths = m
+}
+
+// pathAllowed returns true if the given path may be read under the current
+// whitelist. When no whitelist is set, all paths are allowed.
+func (a *Agent) pathAllowed(path string) bool {
+	if a.allowedReadPaths == nil {
+		return true
+	}
+	if path == "" {
+		return false
+	}
+	if _, ok := a.allowedReadPaths[path]; ok {
+		return true
+	}
+	// Allow basename matches so that path/to/foo.go and foo.go both work when
+	// either form appears in the plan.
+	base := filepath.Base(path)
+	if _, ok := a.allowedReadPaths[base]; ok {
+		return true
+	}
+	return false
 }
 
 // AddConfirmTools adds tool names that require user confirmation (e.g. MCP tools).
@@ -284,6 +412,19 @@ func (a *Agent) LastPlan() string {
 	return a.lastPlan
 }
 
+// LastAssistantMessage returns the content of the most recent assistant
+// message in the agent's history, or "" if there is none. Used by the
+// structurer/extractor pipeline to fetch raw model output without going
+// through the lastPlan extraction.
+func (a *Agent) LastAssistantMessage() string {
+	for i := len(a.history) - 1; i >= 0; i-- {
+		if a.history[i].Role == "assistant" {
+			return a.history[i].Content
+		}
+	}
+	return ""
+}
+
 // EnterEditWithPlan switches to edit mode, clears context,
 // and injects the approved plan as the first user message.
 func (a *Agent) EnterEditWithPlan() {
@@ -295,6 +436,67 @@ func (a *Agent) EnterEditWithPlan() {
 		{Role: "user", Content: fmt.Sprintf("Execute the following approved plan:\n\n%s\n\nImplement each step. Confirm plan steps as you go. Always respond in %s.", a.lastPlan, langName(a.language))},
 	}
 	a.contextInjected = false
+}
+
+// SetSessionDir enables session auto-save. Sessions are stored in dir.
+func (a *Agent) SetSessionDir(dir string) {
+	a.sessionDir = dir
+	if a.sessionID == "" {
+		a.sessionID = NewSessionID()
+	}
+}
+
+// SessionID returns the current session ID.
+func (a *Agent) SessionID() string {
+	return a.sessionID
+}
+
+// LoadFromSession restores agent state from a saved session.
+func (a *Agent) LoadFromSession(s *Session) {
+	a.history = make([]ollama.Message, len(s.Messages))
+	copy(a.history, s.Messages)
+
+	switch s.Mode {
+	case "plan":
+		a.mode = ModePlan
+	default:
+		a.mode = ModeEdit
+	}
+
+	a.lastPlan = s.Plan
+	a.stats = s.Stats
+	a.sessionID = s.ID
+	a.contextInjected = true // context was already in saved history
+}
+
+// autoSave persists the current agent state to disk if sessionDir is set.
+func (a *Agent) autoSave() {
+	if a.sessionDir == "" {
+		return
+	}
+
+	session := &Session{
+		ID:        a.sessionID,
+		CreatedAt: time.Time{}, // will be set on first save
+		Model:     a.model,
+		Mode:      a.mode.String(),
+		Messages:  a.History(),
+		Plan:      a.lastPlan,
+		Stats:     a.stats,
+		WorkDir:   a.workDir,
+	}
+
+	// Preserve CreatedAt from existing session on disk.
+	existing, err := LoadSession(a.sessionDir, a.sessionID)
+	if err == nil {
+		session.CreatedAt = existing.CreatedAt
+	} else {
+		session.CreatedAt = time.Now()
+	}
+
+	if err := SaveSession(a.sessionDir, session); err != nil {
+		a.emit(Event{Type: EventError, Message: "session auto-save failed: " + err.Error()})
+	}
 }
 
 func (a *Agent) emit(e Event) {
@@ -389,8 +591,24 @@ func (a *Agent) ContextUsage() (used, total int) {
 	return used, a.contextSize
 }
 
+// ensureLanguageDetected re-runs project language detection if it is still
+// unknown and lazily registers the matching language-specific tools when a
+// language is discovered for the first time.
+func (a *Agent) ensureLanguageDetected() {
+	if a.langState == nil {
+		return
+	}
+	lang, changed := a.langState.EnsureDetected()
+	if !changed || lang == projectlang.LangUnknown {
+		return
+	}
+	tools.RegisterLanguageTools(a.reg, lang, a.workDir)
+	a.emit(Event{Type: EventAgent, Message: fmt.Sprintf("Project language detected: %s — language tools registered", lang)})
+}
+
 // Send processes a single user message, preserving conversation history.
 func (a *Agent) Send(ctx context.Context, task string) error {
+	a.ensureLanguageDetected()
 	userContent := task
 	if a.ragIndex != nil {
 		if results, err := a.ragIndex.Search(ctx, task, 5); err == nil && len(results) > 0 {
@@ -440,16 +658,22 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 			}
 		}
 
+		opts := map[string]any{
+			"num_ctx": a.contextSize,
+			"think":   a.think,
+		}
+		if a.hasTemperature {
+			opts["temperature"] = a.temperature
+		}
 		resp, err := a.client.ChatSync(ctx, ollama.ChatRequest{
 			Model:    a.model,
 			Messages: a.history,
 			Tools:    a.toolDefsForMode(),
-			Options: map[string]any{
-				"num_ctx": a.contextSize,
-				"think":   a.think,
-			},
+			Options:  opts,
+			Format:   a.format,
 		})
 		if err != nil {
+			a.emit(Event{Type: EventError, Message: err.Error()})
 			return errors.WithMessage(err, "chat")
 		}
 
@@ -504,6 +728,7 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 			}
 			a.stats.AvgTkPerSec = a.stats.avgTkPerSec()
 			a.emit(Event{Type: EventDone, Message: "Done", Stats: &a.stats})
+			a.autoSave()
 			return nil
 		}
 
@@ -544,7 +769,8 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 			if a.needsConfirm(tc.Function.Name) && a.confirmFn != nil {
 				fp := Fingerprint(tc.Function.Name, tc.Function.Arguments)
 				if !a.permMgr.IsAllowed(fp) {
-					cr := a.confirmFn(tc.Function.Name, detail)
+					payload := a.buildConfirmPayload(tc.Function.Name, tc.Function.Arguments)
+					cr := a.confirmFn(payload)
 					switch cr.Action {
 					case ConfirmDeny:
 						a.history = append(a.history, ollama.Message{
@@ -600,6 +826,7 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 
 	a.stats.AvgTkPerSec = a.stats.avgTkPerSec()
 	a.emit(Event{Type: EventDone, Message: "Max iterations reached", Stats: &a.stats})
+	a.autoSave()
 	return errors.WithStack(ErrMaxIterations)
 }
 
@@ -610,10 +837,20 @@ func (a *Agent) Run(ctx context.Context, task, ruleCatalog string) error {
 }
 
 func (a *Agent) toolDefsForMode() []ollama.ToolDef {
+	if a.toolsDisabled {
+		return nil
+	}
 	if a.mode == ModeEdit {
 		return a.reg.ToolDefs()
 	}
 	return a.reg.ToolDefsFiltered(readOnlyTools)
+}
+
+// SetToolsDisabled forces the agent to advertise no tools to the model and
+// blocks any tool call attempt. Used by the extractor role: a deterministic
+// JSON-only pass that must not be tempted into hallucinating tool calls.
+func (a *Agent) SetToolsDisabled(disabled bool) {
+	a.toolsDisabled = disabled
 }
 
 // canRunParallel returns true if a tool call can safely run in the worker pool.
@@ -629,10 +866,16 @@ func (a *Agent) canRunParallel(toolName string) bool {
 // and appends results to history in the original order.
 func (a *Agent) executeParallel(ctx context.Context, calls []ollama.ToolCall) {
 	tasks := make([]TaskFunc, len(calls))
+	guards := make([]*tools.ToolResult, len(calls))
 	for i, tc := range calls {
+		guards[i] = a.guardReadWhitelist(tc)
 		name := tc.Function.Name
 		args := tc.Function.Arguments
+		idx := i
 		tasks[i] = func(ctx context.Context) (tools.ToolResult, error) {
+			if guards[idx] != nil {
+				return *guards[idx], nil
+			}
 			return a.reg.Execute(ctx, name, args)
 		}
 	}
@@ -654,8 +897,49 @@ func (a *Agent) executeParallel(ctx context.Context, calls []ollama.ToolCall) {
 	}
 }
 
+// guardReadWhitelist returns a synthetic refusal result if the tool call is a
+// read-only file tool targeting a path outside the current allowed-read
+// whitelist. Returns nil when the call is permitted.
+func (a *Agent) guardReadWhitelist(tc ollama.ToolCall) *tools.ToolResult {
+	if a.allowedReadPaths == nil {
+		return nil
+	}
+	name := tc.Function.Name
+	// Only constrain path-bearing read tools.
+	switch name {
+	case "read_file", "list_dir", "find_files", "grep":
+	default:
+		return nil
+	}
+	// Extract the path argument under any of the common keys.
+	var p string
+	if v, ok := tc.Function.Arguments["path"].(string); ok {
+		p = v
+	} else if v, ok := tc.Function.Arguments["root"].(string); ok {
+		p = v
+	}
+	if p == "" {
+		return nil
+	}
+	if a.pathAllowed(p) {
+		return nil
+	}
+	msg := fmt.Sprintf(
+		"refused: %q is not in the executor whitelist for this plan. "+
+			"You may only read files listed in the approved plan. "+
+			"If you need additional context, output `REPLAN: <reason>` and stop.",
+		p,
+	)
+	return &tools.ToolResult{Error: msg, Success: false}
+}
+
 // executeSingle runs a single tool call and records the result.
 func (a *Agent) executeSingle(ctx context.Context, tc ollama.ToolCall) {
+	if guard := a.guardReadWhitelist(tc); guard != nil {
+		a.emit(Event{Type: EventTool, Tool: tc.Function.Name, Message: "blocked by whitelist", Success: false})
+		a.emitToolResult(tc, *guard)
+		return
+	}
 	result, err := a.reg.Execute(ctx, tc.Function.Name, tc.Function.Arguments)
 	if err != nil {
 		a.emit(Event{Type: EventError, Tool: tc.Function.Name, Message: err.Error()})
@@ -701,7 +985,8 @@ func (a *Agent) emitToolResult(tc ollama.ToolCall, result tools.ToolResult) {
 
 	a.stats.ToolCalls++
 	if ev.FileAction != "" {
-		a.stats.recordFileAction(ev.FileAction, ev.LinesAdded, ev.LinesRemoved)
+		filePath, _ := tc.Function.Arguments["path"].(string)
+		a.stats.recordFileAction(ev.FileAction, filePath, ev.LinesAdded, ev.LinesRemoved)
 	}
 
 	resultContent := result.Output
@@ -719,15 +1004,105 @@ func (a *Agent) emitToolResult(tc ollama.ToolCall, result tools.ToolResult) {
 }
 
 func (a *Agent) isToolBlocked(tool string) bool {
-	return a.mode == ModePlan && !readOnlyTools[tool]
+	if a.toolsDisabled {
+		return true
+	}
+	if a.mode != ModePlan {
+		return false
+	}
+	return !readOnlyTools[tool] && !a.extraReadOnlyTools[tool]
 }
 
 func (a *Agent) needsConfirm(tool string) bool {
 	switch tool {
-	case "write_file", "edit_file", "delete_file", "move_file", "bash":
+	case "write_file", "edit_file", "delete_file", "move_file", "bash", "git_commit":
 		return true
 	}
 	return a.extraConfirmTools[tool]
+}
+
+// buildConfirmPayload builds a ConfirmPayload for a tool call. For edit/write
+// tools it tries to read the current file content and produce a unified diff
+// preview so the user can see the change before approving.
+func (a *Agent) buildConfirmPayload(name string, args map[string]any) ConfirmPayload {
+	p := ConfirmPayload{Tool: name, Args: map[string]string{}}
+	put := func(k, v string) {
+		p.Args[k] = v
+		p.ArgKeys = append(p.ArgKeys, k)
+	}
+	switch name {
+	case "edit_file":
+		path, _ := args["path"].(string)
+		oldStr, _ := args["old_str"].(string)
+		newStr, _ := args["new_str"].(string)
+		put("path", path)
+		if resolved, err := tools.SafePath(context.Background(), a.workDir, path); err == nil {
+			if data, err := os.ReadFile(resolved); err == nil {
+				content := string(data)
+				if strings.Contains(content, oldStr) {
+					newContent := strings.Replace(content, oldStr, newStr, 1)
+					p.Preview = tools.SimpleDiff(content, newContent, path, 30)
+				}
+			}
+		}
+		if p.Preview == "" {
+			p.Preview = "- " + truncateOneLine(oldStr, 200) + "\n+ " + truncateOneLine(newStr, 200)
+		}
+	case "write_file":
+		path, _ := args["path"].(string)
+		content, _ := args["content"].(string)
+		put("path", path)
+		var oldContent string
+		existed := false
+		if resolved, err := tools.SafePath(context.Background(), a.workDir, path); err == nil {
+			if data, err := os.ReadFile(resolved); err == nil {
+				oldContent = string(data)
+				existed = true
+			}
+		}
+		if existed {
+			p.Preview = tools.SimpleDiff(oldContent, content, path, 30)
+		} else {
+			p.Preview = previewNewFile(content, 20)
+		}
+	case "delete_file":
+		path, _ := args["path"].(string)
+		put("path", path)
+	case "move_file":
+		from, _ := args["from"].(string)
+		to, _ := args["to"].(string)
+		put("from", from)
+		put("to", to)
+	case "bash":
+		cmd, _ := args["command"].(string)
+		put("command", cmd)
+		p.Danger = tools.IsDangerousCommand(cmd)
+	case "git_commit":
+		if msg, ok := args["message"].(string); ok {
+			put("message", msg)
+		}
+	default:
+		for k, v := range args {
+			put(k, fmt.Sprintf("%v", v))
+		}
+	}
+	return p
+}
+
+func truncateOneLine(s string, n int) string {
+	s = strings.ReplaceAll(s, "\n", "⏎")
+	if len(s) > n {
+		return s[:n] + "..."
+	}
+	return s
+}
+
+func previewNewFile(content string, maxLines int) string {
+	lines := strings.Split(content, "\n")
+	if len(lines) <= maxLines {
+		return content
+	}
+	return strings.Join(lines[:maxLines], "\n") + fmt.Sprintf("\n... (%d more lines)", len(lines)-maxLines)
 }
 
 func toolDetail(name string, args map[string]any) string {
@@ -744,11 +1119,18 @@ func toolDetail(name string, args map[string]any) string {
 		pattern, _ := args["pattern"].(string)
 		path, _ := args["path"].(string)
 		return fmt.Sprintf("%q in %s", pattern, path)
-	case "go_build", "go_test", "go_lint", "go_vet":
-		if p, ok := args["packages"].(string); ok {
+	case "go_build", "go_test", "go_lint", "go_vet", "go_doc":
+		if p, ok := args["packages"].(string); ok && p != "" {
 			return p
 		}
 		return "./..."
+	case "search_docs":
+		if q, ok := args["query"].(string); ok && q != "" {
+			if len(q) > 80 {
+				q = q[:80] + "..."
+			}
+			return q
+		}
 	case "bash":
 		if cmd, ok := args["command"].(string); ok {
 			if len(cmd) > 80 {
@@ -761,8 +1143,33 @@ func toolDetail(name string, args map[string]any) string {
 			return action
 		}
 		return "match"
+	case "git_status":
+		return ""
+	case "git_diff", "git_log":
+		if p, ok := args["path"].(string); ok && p != "" {
+			return p
+		}
+		return ""
+	case "git_commit":
+		if msg, ok := args["message"].(string); ok && msg != "" {
+			return truncateOneLine(msg, 60)
+		}
+		return ""
+	case "get_rule":
+		if n, ok := args["name"].(string); ok && n != "" {
+			return n
+		}
 	}
-	return name
+	// Generic fallback: try common arg keys before giving up.
+	for _, key := range []string{"path", "file", "name", "query", "input", "command", "pattern"} {
+		if v, ok := args[key].(string); ok && v != "" {
+			if len(v) > 80 {
+				v = v[:80] + "..."
+			}
+			return v
+		}
+	}
+	return ""
 }
 
 func langName(code string) string {
@@ -822,9 +1229,11 @@ func (a *Agent) buildSystemPrompt() string {
 		b.WriteString("- Be concise and actionable\n")
 		b.WriteString("- Reference Go best practices and project conventions\n")
 		if a.hasRAG {
-			b.WriteString("\nIMPORTANT — Project conventions (from RAG):\n")
-			b.WriteString("Project conventions and documentation are automatically included in the task context.\n")
-			b.WriteString("You MUST read and follow ALL conventions provided. Incorporate them as requirements in the plan.\n")
+			b.WriteString("\nIMPORTANT — Project rules and conventions (from RAG):\n")
+			b.WriteString("The task context includes MANDATORY RULES marked [MANDATORY PROJECT RULES] and GO STANDARDS marked [GO STANDARDS].\n")
+			b.WriteString("These are NOT suggestions — they are REQUIREMENTS. Treat violations as bugs.\n")
+			b.WriteString("Examples: naming conventions (getter=Owner not GetOwner), error wrapping with pkg/errors, context.Context as first arg, etc.\n")
+			b.WriteString("You MUST check code against ALL provided rules. Include violations in your plan.\n")
 			b.WriteString("You may call search_docs for additional targeted searches if needed.\n")
 		} else if a.hasSnippets {
 			b.WriteString("\nIMPORTANT — Documentation check (MANDATORY):\n")
@@ -845,9 +1254,10 @@ func (a *Agent) buildSystemPrompt() string {
 		b.WriteString("- Be concise in responses\n")
 		b.WriteString("- Do NOT repeat or quote file contents in your responses. Reference files by path only.\n")
 		if a.hasRAG {
-			b.WriteString("\nIMPORTANT — Project conventions (from RAG):\n")
-			b.WriteString("Project conventions and documentation are automatically included in the task context.\n")
-			b.WriteString("You MUST follow ALL conventions provided (naming, structure, patterns, error handling).\n")
+			b.WriteString("\nIMPORTANT — Project rules and conventions (from RAG):\n")
+			b.WriteString("The task context includes MANDATORY RULES marked [MANDATORY PROJECT RULES] and GO STANDARDS marked [GO STANDARDS].\n")
+			b.WriteString("These are REQUIREMENTS, not suggestions. Apply them to every line you write.\n")
+			b.WriteString("Examples: getter naming (Owner not GetOwner), error wrapping with pkg/errors, context.Context as first arg.\n")
 			b.WriteString("You may call search_docs for additional targeted searches if needed.\n")
 		} else if a.hasSnippets {
 			b.WriteString("\nIMPORTANT — Documentation check (MANDATORY):\n")
@@ -868,7 +1278,7 @@ func (a *Agent) buildSystemPrompt() string {
 
 	// Repeat language directive at the end for reinforcement (important for local models).
 	if lang != "English" {
-		fmt.Fprintf(&b, "\nREMINDER: You MUST respond in %s. Never switch to English.\n", lang)
+		fmt.Fprintf(&b, "\nREMINDER: You MUST respond in %s. Never switch to any other language.\n", lang)
 	}
 
 	return b.String()
