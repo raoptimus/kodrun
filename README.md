@@ -161,9 +161,14 @@ ollama:
 agent:
   auto_fix: true
 
+providers:
+  embed:
+    base_url: "http://localhost:11434"
+    model: "nomic-embed-text"
+
 rag:
   enabled: true
-  embedding_model: "nomic-embed-text"
+  provider: embed
 ```
 
 ## Rules
@@ -258,9 +263,14 @@ See more examples in [`examples/commands/`](examples/commands/).
 KodRun can index your project files and perform semantic search to find relevant code context. This is especially useful for large codebases.
 
 ```yaml
+providers:
+  embed:
+    base_url: "http://localhost:11434"
+    model: "nomic-embed-text"      # the embedding model lives here
+
 rag:
   enabled: true
-  embedding_model: "nomic-embed-text"
+  provider: embed                  # references the profile above
   index_dirs: ["."]
   chunk_size: 512
   top_k: 5

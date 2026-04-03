@@ -100,10 +100,10 @@ func TestLoader_ResolveReferences(t *testing.T) {
 	os.WriteFile(filepath.Join(docsDir, "model.md"), []byte("# Model\nUse value objects."), 0o644)
 	os.WriteFile(filepath.Join(docsDir, "example_model.go"), []byte("package model\n\ntype User struct{}"), 0o644)
 
-	// Create rules that reference docs via @.claude/docs/ (compatibility path)
+	// Rules reference docs via @.kodrun/docs/ (the only supported root).
 	rulesDir := filepath.Join(dir, RulesDirs)
 	os.MkdirAll(rulesDir, 0o755)
-	ruleContent := "---\nscope: coding\n---\nСоглашения: @.claude/docs/model.md\nПример: @.claude/docs/example_model.go"
+	ruleContent := "---\nscope: coding\n---\nСоглашения: @.kodrun/docs/model.md\nПример: @.kodrun/docs/example_model.go"
 	os.WriteFile(filepath.Join(rulesDir, "model.md"), []byte(ruleContent), 0o644)
 
 	loader := NewLoader(dir, 0)
@@ -125,7 +125,7 @@ func TestLoader_ResolveReferences(t *testing.T) {
 		t.Errorf("expected [see: example_model.go] label, got:\n%s", content)
 	}
 	// Should NOT contain raw @references
-	if strings.Contains(content, "@.claude/docs/model.md") {
+	if strings.Contains(content, "@.kodrun/docs/model.md") {
 		t.Errorf("expected @reference to be resolved, got:\n%s", content)
 	}
 	// Should NOT contain inline doc content
@@ -303,6 +303,53 @@ func TestLoader_RulesContainLabels(t *testing.T) {
 	// Should NOT contain inline content
 	if strings.Contains(content, "style content") {
 		t.Errorf("rules should not contain inline doc content")
+	}
+}
+
+func TestLoader_ResolveReferences_LeadingSlash(t *testing.T) {
+	dir := t.TempDir()
+
+	docsDir := filepath.Join(dir, DocsDir)
+	os.MkdirAll(docsDir, 0o755)
+	os.WriteFile(filepath.Join(docsDir, "arch.md"), []byte("arch body"), 0o644)
+
+	rulesDir := filepath.Join(dir, RulesDirs)
+	os.MkdirAll(rulesDir, 0o755)
+	ruleContent := "---\nscope: coding\n---\nArch: @/.kodrun/docs/arch.md"
+	os.WriteFile(filepath.Join(rulesDir, "arch.md"), []byte(ruleContent), 0o644)
+
+	loader := NewLoader(dir, 0)
+	if err := loader.Load(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	refDocs := loader.ReferenceDocs(context.Background(), ScopeCoding)
+	if !strings.Contains(refDocs, "arch body") {
+		t.Errorf("ReferenceDocs should resolve @/.kodrun/... as project-root path, got:\n%s", refDocs)
+	}
+}
+
+func TestLoader_ResolveReferences_EscapeRejected(t *testing.T) {
+	dir := t.TempDir()
+
+	// File outside workDir that must NOT be readable via @-reference.
+	outside := t.TempDir()
+	os.WriteFile(filepath.Join(outside, "secret.md"), []byte("SECRET"), 0o644)
+
+	rulesDir := filepath.Join(dir, RulesDirs)
+	os.MkdirAll(rulesDir, 0o755)
+	// Try to escape via "..".
+	ruleContent := "---\nscope: coding\n---\nLeak: @../" + filepath.Base(outside) + "/secret.md"
+	os.WriteFile(filepath.Join(rulesDir, "leak.md"), []byte(ruleContent), 0o644)
+
+	loader := NewLoader(dir, 0)
+	if err := loader.Load(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	refDocs := loader.ReferenceDocs(context.Background(), ScopeCoding)
+	if strings.Contains(refDocs, "SECRET") {
+		t.Errorf("@-reference must not escape project root, but got:\n%s", refDocs)
 	}
 }
 

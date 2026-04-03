@@ -87,7 +87,6 @@ agent:
 rag:
   enabled: true
   provider: local
-  embedding_model: "nomic-embed-text"
 `
 	if err := os.WriteFile(filepath.Join(dir, ".kodrun.yaml"), []byte(configContent), 0o644); err != nil {
 		t.Fatal(err)

@@ -12,6 +12,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/muesli/reflow/wordwrap"
+	"github.com/muesli/reflow/wrap"
 
 	"github.com/raoptimus/kodrun/internal/agent"
 )
@@ -23,8 +25,7 @@ const (
 
 var (
 	titleStyle         = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
-	agentStyle         = lipgloss.NewStyle()
-	agentHeadingStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
+	agentStyle = lipgloss.NewStyle()
 	userStyle          = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("2"))
 	botStyle           = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("5"))
 	toolStyle          = lipgloss.NewStyle().Foreground(lipgloss.Color("4"))
@@ -92,10 +93,8 @@ var confirmMenuOptions = []confirmOption{
 
 // ConfirmRequest represents a pending confirmation from the agent.
 type ConfirmRequest struct {
-	Tool   string
-	Detail string
-	Danger bool // true for dangerous bash commands (rendered in red)
-	Result chan agent.ConfirmResult
+	Payload agent.ConfirmPayload
+	Result  chan agent.ConfirmResult
 }
 
 // ConfirmMsg wraps a ConfirmRequest as a tea.Msg.
@@ -159,6 +158,12 @@ type Model struct {
 	running   bool
 	workDir   string
 
+	// RAG indexing progress (background). When ragProgressTotal > 0 the status
+	// bar shows a percentage indicator. Reset to zero on completion.
+	ragProgressDone  int
+	ragProgressTotal int
+	ragProgressLabel string
+
 	commands     []CommandItem
 	showComplete bool
 	filtered     []CommandItem
@@ -201,6 +206,12 @@ type Model struct {
 	contextUsed  int
 	contextTotal int
 
+	// Block 6: observability fields populated by orchestrator events.
+	phase       string
+	cacheHits   int64
+	cacheMisses int64
+	replans     int
+
 	// Mode and thinking
 	mode      agent.Mode
 	think     bool
@@ -219,6 +230,9 @@ type Model struct {
 	maxHistory int
 
 	locale *Locale
+
+	// Markdown rendering
+	mdRenderer *markdownRenderer
 }
 
 func (m Model) defaultPlaceholder() string {
@@ -285,6 +299,7 @@ func NewModel(modelName string, version string, contextSize int, taskFn TaskFunc
 		mouseEnabled:  true,
 		maxHistory:    maxHistory,
 		locale:        locale,
+		mdRenderer:    &markdownRenderer{},
 	}
 	m.logs = m.headerLines()
 	return m
@@ -409,7 +424,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tickMsg:
-		if m.running {
+		if m.running || m.ragProgressTotal > 0 {
 			cmds = append(cmds, tickEvery())
 		}
 		return m, tea.Batch(cmds...)
@@ -471,6 +486,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.focus = focusInput
 					m.textinput.Focus()
 					return m, m.waitForConfirm()
+				default:
+					var cmd tea.Cmd
+					m.textinput, cmd = m.textinput.Update(msg)
+					m.resizeInput()
+					return m, cmd
 				}
 			}
 			return m, nil
@@ -530,6 +550,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.focus = focusInput
 					m.textinput.Focus()
 					return m, m.waitForPlanConfirm()
+				default:
+					var cmd tea.Cmd
+					m.textinput, cmd = m.textinput.Update(msg)
+					m.resizeInput()
+					return m, cmd
 				}
 			}
 			return m, nil
@@ -788,8 +813,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					prefix := botStyle.Render(m.locale.Get("avatar.agent")) + " "
 					prefixW := ansi.StringWidth(prefix)
 					avail := max(m.width-prefixW-2, 20)
-					wrapped := ansi.Wordwrap(e.Message, avail, "")
-					lines := strings.Split(wrapped, "\n")
+
+					// Render markdown if the message contains markdown markers.
+					rendered := m.renderAgentMessage(e.Message, avail)
+					lines := strings.Split(rendered, "\n")
 					indent := strings.Repeat(" ", prefixW)
 					var buf strings.Builder
 					for i, line := range lines {
@@ -797,7 +824,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							buf.WriteByte('\n')
 							buf.WriteString(indent)
 						}
-						buf.WriteString(formatAgentLine(line))
+						buf.WriteString(line)
 					}
 					m.addLog(prefix + buf.String())
 				}
@@ -857,6 +884,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.mode = agent.ModeEdit
 			} else {
 				m.mode = agent.ModePlan
+			}
+		case agent.EventPhase:
+			m.phase = e.Message
+			m.addLog(systemStyle.Render(fmt.Sprintf("◆ phase: %s", e.Message)))
+		case agent.EventCacheStats:
+			m.cacheHits = e.CacheHits
+			m.cacheMisses = e.CacheMisses
+			m.addLog(systemStyle.Render(e.Message))
+		case agent.EventReplan:
+			m.replans++
+			m.addLog(systemStyle.Render(fmt.Sprintf("⟳ REPLAN requested: %s", e.Message)))
+		case agent.EventRAGProgress:
+			m.ragProgressDone = e.ProgressDone
+			m.ragProgressTotal = e.ProgressTotal
+			m.ragProgressLabel = e.ProgressLabel
+			if e.ProgressTotal == 0 || e.ProgressDone >= e.ProgressTotal {
+				// Completion or no-op: clear shortly so the bar disappears.
+				m.ragProgressDone = 0
+				m.ragProgressTotal = 0
+				m.ragProgressLabel = ""
 			}
 		case agent.EventDone:
 			elapsed := m.elapsed()
@@ -1005,6 +1052,9 @@ func (m Model) formatToolEvent(e agent.Event) string {
 	if e.FileAction != "" {
 		return toolStyle.Render(fmt.Sprintf("%s %s(%s)", status, e.FileAction, e.Message))
 	}
+	if e.Message == "" {
+		return toolStyle.Render(fmt.Sprintf("%s %s", status, e.Tool))
+	}
 	return toolStyle.Render(fmt.Sprintf("%s %s(%s)", status, e.Tool, e.Message))
 }
 
@@ -1062,14 +1112,43 @@ func (m *Model) addLog(line string) {
 	m.updateViewportWithStickBottom(stickBottom)
 }
 
-// formatAgentLine applies markdown-like formatting to a single agent output line.
-// Headings (## ...) are rendered as bold uppercase.
-func formatAgentLine(line string) string {
-	trimmed := strings.TrimSpace(line)
-	if after, ok := strings.CutPrefix(trimmed, "## "); ok {
-		return agentHeadingStyle.Render(strings.ToUpper(after))
+// hasMarkdown detects whether text contains markdown formatting worth rendering.
+func hasMarkdown(text string) bool {
+	for _, line := range strings.Split(text, "\n") {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(trimmed, "## "),
+			strings.HasPrefix(trimmed, "### "),
+			strings.HasPrefix(trimmed, "# "),
+			strings.HasPrefix(trimmed, "- "),
+			strings.HasPrefix(trimmed, "* "),
+			strings.HasPrefix(trimmed, "> "),
+			strings.HasPrefix(trimmed, "```"),
+			strings.Contains(trimmed, "**"),
+			strings.Contains(trimmed, "`"):
+			return true
+		}
+		// Numbered list: "1. ..." or "1) ..."
+		if len(trimmed) > 2 && trimmed[0] >= '1' && trimmed[0] <= '9' &&
+			(trimmed[1] == '.' || trimmed[1] == ')') {
+			return true
+		}
 	}
-	return agentStyle.Render(line)
+	return false
+}
+
+// renderAgentMessage renders agent output, using glamour for markdown-rich text
+// and simple styling for plain text.
+func (m Model) renderAgentMessage(text string, width int) string {
+	if hasMarkdown(text) {
+		return m.mdRenderer.render(text, width)
+	}
+	// Plain text fallback — no markdown detected.
+	if width > 0 {
+		wrapped := wrap.String(wordwrap.String(text, width), width)
+		return agentStyle.Render(wrapped)
+	}
+	return agentStyle.Render(text)
 }
 
 // addDiffLog renders a diff string with colored lines and appends to logs.
@@ -1145,6 +1224,19 @@ func (m Model) View() string {
 	if m.running {
 		elapsed := m.elapsed()
 		timeLine = "\n" + toolbarStyle.Render(fmt.Sprintf("  %s ⏱ %s · %s tk", m.locale.Get("status.working"), elapsed, formatTokens(m.totalEval)))
+	}
+	if m.ragProgressTotal > 0 {
+		pct := m.ragProgressDone * 100 / m.ragProgressTotal
+		label := m.ragProgressLabel
+		if label == "" {
+			label = "indexing"
+		}
+		ragLine := toolbarStyle.Render(fmt.Sprintf("  RAG %s %d%% (%d/%d)", label, pct, m.ragProgressDone, m.ragProgressTotal))
+		if timeLine == "" {
+			timeLine = "\n" + ragLine
+		} else {
+			timeLine += "\n" + ragLine
+		}
 	}
 
 	out := fmt.Sprintf("%s\n%s%s\n%s\n\n%s",
@@ -1236,29 +1328,70 @@ func (m Model) renderComplete() string {
 	return completeBorder.Render(content) + "\n"
 }
 
-// renderConfirmMenu renders the numbered confirm menu replacing the input area.
-func (m Model) renderConfirmMenu() string {
-	detail := m.pendingConfirm.Detail
-	if len(detail) > 60 {
-		detail = detail[:60] + "..."
+// renderConfirmCard renders the action card shown above the confirm menu:
+// tool name, full arguments and (when available) a colored diff/preview.
+func (m Model) renderConfirmCard() string {
+	p := m.pendingConfirm.Payload
+	var lines []string
+
+	if p.Danger {
+		lines = append(lines, errorStyle.Bold(true).Render("⚠ "+m.locale.Get("confirm.card.danger")))
 	}
 
-	var lines []string
-	if m.pendingConfirm.Danger {
-		lines = append(lines, errorStyle.Bold(true).Render("WARNING: dangerous command"))
+	header := fmt.Sprintf("%s %s", m.locale.Get("confirm.card.tool"), p.Tool)
+	lines = append(lines, toolStyle.Bold(true).Render(header))
+
+	for _, k := range p.ArgKeys {
+		v := p.Args[k]
+		lines = append(lines, diffStatStyle.Render(fmt.Sprintf("  %s: %s", k, v)))
 	}
+
+	if p.Preview != "" {
+		lines = append(lines, diffStatStyle.Render("  "+m.locale.Get("confirm.card.preview")))
+		lines = append(lines, renderDiffPreviewLines(p.Preview, 20, m.locale)...)
+	}
+	lines = append(lines, "")
+	return strings.Join(lines, "\n")
+}
+
+// renderDiffPreviewLines colorizes a diff string into TUI lines, capped to maxLines.
+func renderDiffPreviewLines(diff string, maxLines int, locale *Locale) []string {
+	all := strings.Split(strings.TrimRight(diff, "\n"), "\n")
+	out := make([]string, 0, len(all))
+	shown := 0
+	for _, l := range all {
+		if shown >= maxLines {
+			out = append(out, diffStatStyle.Render(fmt.Sprintf(locale.Get("diff.more_lines"), len(all)-shown)))
+			break
+		}
+		if len(l) == 0 {
+			continue
+		}
+		var styled string
+		switch l[0] {
+		case '+':
+			styled = diffAddStyle.Render("  " + l)
+		case '-':
+			styled = diffDelStyle.Render("  " + l)
+		case '@':
+			styled = diffHunkStyle.Render("  " + l)
+		default:
+			styled = diffStatStyle.Render("  " + l)
+		}
+		out = append(out, styled)
+		shown++
+	}
+	return out
+}
+
+// renderConfirmMenu renders the action card and the numbered confirm menu
+// replacing the input area.
+func (m Model) renderConfirmMenu() string {
+	var lines []string
+	lines = append(lines, m.renderConfirmCard())
+
 	for i, opt := range confirmMenuOptions {
-		var suffix string
-		switch opt.action {
-		case agent.ConfirmAllowOnce, agent.ConfirmAllowSession:
-			suffix = detail
-		}
-		var label string
-		if suffix != "" {
-			label = fmt.Sprintf("%d. %s (%s)", i+1, m.locale.Get(opt.labelKey), suffix)
-		} else {
-			label = fmt.Sprintf("%d. %s", i+1, m.locale.Get(opt.labelKey))
-		}
+		label := fmt.Sprintf("%d. %s", i+1, m.locale.Get(opt.labelKey))
 		if i == m.confirmIdx {
 			lines = append(lines, confirmSelected.Render("> "+label))
 		} else {

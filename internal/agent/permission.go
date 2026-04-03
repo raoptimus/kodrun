@@ -21,9 +21,40 @@ type ConfirmResult struct {
 	Augment string // Non-empty only when Action == ConfirmAugment
 }
 
+// ConfirmPayload describes a tool call awaiting user confirmation.
+// It carries everything the UI needs to render an informative confirmation card:
+// the tool name, the relevant arguments (already filtered for display), an
+// optional preview (unified diff for edit/write, command body for bash, etc.),
+// and the danger flag for visually-flagged operations.
+type ConfirmPayload struct {
+	Tool    string
+	Args    map[string]string // ordered key→value pairs for display
+	ArgKeys []string          // preserve insertion order across map iterations
+	Preview string            // unified diff or other multi-line preview
+	Danger  bool
+}
+
+// Detail returns a short single-line summary of the payload, used as a
+// fingerprint-friendly description and as a fallback for compact UIs.
+func (p ConfirmPayload) Detail() string {
+	switch p.Tool {
+	case "move_file":
+		return p.Args["from"] + " → " + p.Args["to"]
+	case "bash":
+		return p.Args["command"]
+	}
+	if v, ok := p.Args["path"]; ok {
+		return v
+	}
+	for _, k := range p.ArgKeys {
+		return p.Args[k]
+	}
+	return p.Tool
+}
+
 // ConfirmFunc asks user to confirm a destructive operation.
 // Returns ConfirmResult with the user's choice.
-type ConfirmFunc func(tool string, detail string) ConfirmResult
+type ConfirmFunc func(payload ConfirmPayload) ConfirmResult
 
 // PlanConfirmAction represents the user's decision on a plan execution.
 type PlanConfirmAction int
@@ -58,8 +89,11 @@ func Fingerprint(tool string, args map[string]any) string {
 		to, _ := args["to"].(string)
 		return fmt.Sprintf("move_file:%s->%s", from, to)
 	default:
-		path, _ := args["path"].(string)
-		return fmt.Sprintf("%s:%s", tool, path)
+		// Per-tool fingerprint: ConfirmAllowSession должен покрывать команду
+		// целиком, а не отдельный path. Иначе каждый новый файл вызывает
+		// повторный диалог подтверждения.
+		_ = args
+		return tool
 	}
 }
 

@@ -273,6 +273,26 @@ func TestValidatePlanQuality_VaguePhrases(t *testing.T) {
 	}
 }
 
+func TestValidatePlanQuality_VagueBulletedReview(t *testing.T) {
+	// Real-world example: model produces review-style output with vague suggestions
+	plan := `### 1. Исправления в коде
+1. **Проверка валидации**
+   - В handler.go строка 37: проверка не нужна, так как http.Server всегда передает запрос
+   - В handler.go строка 40: проверка не нужна аналогично
+2. **Обработка ошибок**
+   - В handler.go строка 54: функция может быть заменена на более корректную
+   - В handler.go строка 57: обработка должна быть более строгой
+3. **Безопасность**
+   - В handler.go строка 54: валидация должна быть более строгой
+   - В handler.go строка 149: проверка дат должна быть более строгой
+   - В handler.go строка 48: логирование должно содержать больше контекста`
+
+	issues := validatePlanQuality(plan)
+	if len(issues) == 0 {
+		t.Error("should detect vague review-style items like 'должна быть более строгой'")
+	}
+}
+
 func TestValidatePlanQuality_GoodPlan(t *testing.T) {
 	plan := `## Plan
 1. [Fix]: error from json.Encode() is ignored — add error check (file: internal/handler/ping.go:38)

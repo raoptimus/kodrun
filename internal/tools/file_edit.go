@@ -35,6 +35,20 @@ func (t *EditFileTool) Schema() ollama.JSONSchema {
 	}
 }
 
+// ResolvePaths returns the absolute path edited, used by the registry for
+// cache invalidation.
+func (t *EditFileTool) ResolvePaths(params map[string]any) []string {
+	p, _ := params["path"].(string)
+	if p == "" {
+		return nil
+	}
+	resolved, err := SafePath(context.TODO(), t.workDir, p)
+	if err != nil {
+		return nil
+	}
+	return []string{resolved}
+}
+
 func (t *EditFileTool) Execute(ctx context.Context, params map[string]any) (ToolResult, error) {
 	path, _ := params["path"].(string)
 	oldStr, _ := params["old_str"].(string)
