@@ -130,7 +130,7 @@ func loadConfig() (config.Config, error) {
 	return cfg, nil
 }
 
-func setupAgent(ctx context.Context, cfg config.Config, scope rules.Scope) (*agent.Agent, *tools.Registry, *rules.Loader, *snippets.Loader, *rag.MultiIndex, *projectlang.State, *mcp.Manager, *ollama.Client) {
+func setupAgent(ctx context.Context, cfg config.Config, scope rules.Scope) (*agent.Agent, *tools.Registry, *rules.Loader, *snippets.Loader, *rag.MultiIndex, tools.GoDocIndexer, *projectlang.State, *mcp.Manager, *ollama.Client) {
 	chatProv := cfg.ChatProvider()
 	chatClient := ollama.NewClient(chatProv.BaseURL, chatProv.Timeout)
 
@@ -155,11 +155,10 @@ func setupAgent(ctx context.Context, cfg config.Config, scope rules.Scope) (*age
 	langState := projectlang.NewState(projectlang.New(flags.workDir), projectlang.Language(cfg.Agent.ProjectLanguage))
 	currentLang, _ := langState.EnsureDetected()
 
-	reg := tools.NewRegistry()
-	tools.RegisterAllTools(ctx, reg, flags.workDir, cfg.Tools.ForbiddenPatterns, cfg.Tools.MaxReadLines, loader, snippetLoader, scope, cfg.Rules.UseTool, cfg.Snippets.UseTool, cfg.RAG.Enabled, currentLang)
-
-	// RAG setup (may use a different provider)
+	// RAG setup (may use a different provider) — must happen before tool
+	// registration so the godoc indexer can be wired into go_doc.
 	var ragIndex *rag.MultiIndex
+	var godocIndexer tools.GoDocIndexer // nil when RAG is disabled
 	if cfg.RAG.Enabled {
 		indexPath := cfg.RAG.IndexPath
 		if !filepath.IsAbs(indexPath) {
@@ -168,16 +167,42 @@ func setupAgent(ctx context.Context, cfg config.Config, scope rules.Scope) (*age
 		ragProv := cfg.RAGProvider()
 		ragClient := ollama.NewClient(ragProv.BaseURL, ragProv.Timeout)
 		ragIndex = rag.NewMultiIndex(ragClient, ragProv.Model, indexPath)
-		ragIndex.SetActiveLanguage(string(currentLang))
+		// Legacy per-language sub-indexes (go/python/jsts) are no longer
+		// used — RAG indexes only project conventions, which are not
+		// partitioned by language. Remove any leftover directories from
+		// earlier kodrun versions so stale code chunks cannot survive.
+		cleanupLegacyLangDirs(indexPath)
 		if err := ragIndex.LoadCommon(); err != nil {
 			slog.Warn("RAG common index load failed", "error", err)
 		}
-		if currentLang != projectlang.LangUnknown {
-			if err := ragIndex.LoadLanguage(string(currentLang)); err != nil {
-				slog.Warn("RAG language index load failed", "error", err)
-			}
+		if err := ragIndex.LoadGodoc(); err != nil {
+			slog.Warn("RAG godoc index load failed", "error", err)
 		}
+		godocIndexer = ragIndex.GodocIndexer()
+	}
+
+	reg := tools.NewRegistry()
+	tools.RegisterAllTools(ctx, reg, flags.workDir, cfg.Tools.ForbiddenPatterns, cfg.Tools.MaxReadLines, loader, snippetLoader, scope, cfg.Rules.UseTool, cfg.Snippets.UseTool, cfg.RAG.Enabled, currentLang, godocIndexer, langState)
+
+	// Register RAG search tools (only when RAG is enabled).
+	if ragIndex != nil {
 		reg.Register(tools.NewRAGSearchTool(ragIndex, cfg.RAG.TopK))
+		// Legacy-code cleanup is deferred to runRoot where the TUI event
+		// channel is available, so any warning is visible to the user
+		// instead of being buried in stderr logs.
+	}
+
+	// Register web_fetch tool (works with and without RAG).
+	{
+		var webIndexer tools.WebIndexer
+		if ragIndex != nil {
+			webIndexer = ragIndex.WebIndexer()
+		}
+		topK := cfg.RAG.TopK
+		if topK <= 0 {
+			topK = 5
+		}
+		reg.Register(tools.NewWebFetchTool(webIndexer, topK))
 	}
 
 	// MCP servers setup
@@ -207,7 +232,8 @@ func setupAgent(ctx context.Context, cfg config.Config, scope rules.Scope) (*age
 
 	ag := agent.New(chatClient, chatProv.Model, reg, cfg.Agent.MaxIterations, flags.workDir, chatProv.ContextSize)
 	ag.SetLanguageState(langState)
-	return ag, reg, loader, snippetLoader, ragIndex, langState, mcpMgr, chatClient
+	ag.SetGodocIndexer(godocIndexer)
+	return ag, reg, loader, snippetLoader, ragIndex, godocIndexer, langState, mcpMgr, chatClient
 }
 
 func runRoot(_ context.Context, cmd *cli.Command) error {
@@ -228,7 +254,7 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	ag, reg, loader, snippetLoader, ragIndex, langState, mcpMgr, client := setupAgent(ctx, cfg, rules.ScopeCoding)
+	ag, reg, loader, snippetLoader, ragIndex, godocIndexer, langState, mcpMgr, client := setupAgent(ctx, cfg, rules.ScopeCoding)
 	if mcpMgr != nil {
 		defer mcpMgr.Close()
 		ag.AddConfirmTools(mcpMgr.ConfirmTools())
@@ -244,7 +270,7 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 	ag.SetThink(cfg.Agent.Think)
 	ag.SetLanguage(cfg.Agent.Language)
 	ag.SetAutoCompact(cfg.Agent.AutoCompact)
-	ag.SetMaxWorkers(cfg.Agent.MaxWorkers)
+	ag.SetMaxToolWorkers(cfg.Agent.MaxToolWorkers)
 	ag.SetHasSnippets(cfg.Snippets.UseTool && !cfg.RAG.Enabled)
 	ag.SetHasRAG(cfg.RAG.Enabled)
 	ag.SetRAGIndex(ragIndex)
@@ -309,6 +335,18 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 	var bgWg sync.WaitGroup
 	var indexing atomic.Bool
 
+	// One-shot migration: if the loaded common index still contains chunks
+	// that point at real source files (leftover from a kodrun version that
+	// indexed project code), wipe it so the background re-indexer rebuilds
+	// the conventions-only corpus from scratch. Runs before background
+	// indexing so users see both messages in order in the TUI.
+	if ragIndex != nil && ragIndex.HasLegacyCodeChunks() {
+		emit(agent.Event{Type: agent.EventAgent, Message: "RAG: dropping legacy code chunks from common index"})
+		if err := ragIndex.Reset(); err != nil {
+			emit(agent.Event{Type: agent.EventAgent, Message: fmt.Sprintf("RAG reset failed: %s", err)})
+		}
+	}
+
 	// Background RAG indexing
 	if ragIndex != nil {
 		indexing.Store(true)
@@ -317,11 +355,13 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 			defer func() {
 				emit(agent.Event{Type: agent.EventRAGProgress})
 			}()
-			chunks, err := rag.ChunkFiles(ctx, flags.workDir, cfg.RAG.IndexDirs, cfg.RAG.ChunkSize, cfg.RAG.ChunkOverlap)
-			if err != nil {
-				emit(agent.Event{Type: agent.EventAgent, Message: fmt.Sprintf("RAG chunking: %s", err)})
-				return
-			}
+			// RAG indexes only project conventions — rules, snippets, docs,
+			// embedded language standards. Source code is NOT indexed: it
+			// changes too fast, chunked snapshots go stale between reindexes,
+			// and reviewers end up citing code that no longer exists. The diff
+			// plus live `read_file` tool calls are the authoritative view of
+			// code; RAG is reserved for stable conventions.
+			var chunks []rag.Chunk
 			// Index snippets into RAG
 			for _, s := range snippetLoader.Snippets() {
 				chunks = append(chunks, rag.ChunkSnippets([]rag.SnippetInfo{{
@@ -338,16 +378,18 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 					Name:    filepath.Base(r.Path),
 					Content: r.Content,
 					Path:    r.Path,
-				}})...)
+				}}, cfg.RAG.ChunkSize, cfg.RAG.ChunkOverlap)...)
 			}
 			// Index reference docs into RAG
 			for path, content := range loader.ReferenceDocPaths() {
 				chunks = append(chunks, rag.ChunkRefDocs([]rag.RefDocInfo{{
 					Path:    path,
 					Content: content,
-				}})...)
+				}}, cfg.RAG.ChunkSize, cfg.RAG.ChunkOverlap)...)
 			}
-			// Index embedded reference docs (Effective Go)
+			// Index built-in language reference docs (e.g. Effective Go) for
+			// the detected project language.
+			chunks = append(chunks, rag.ChunkEmbeddedDocs(string(langState.Current()), cfg.RAG.ChunkSize, cfg.RAG.ChunkOverlap)...)
 			progressFn := func(label string, done, total int) {
 				emit(agent.Event{
 					Type:          agent.EventRAGProgress,
@@ -356,17 +398,24 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 					ProgressLabel: label,
 				})
 			}
+			// All indexed chunks are synthetic (rules://, snippets://,
+			// embedded://) or live under .kodrun/docs — they all route to the
+			// common sub-index. Language sub-indexes are intentionally left
+			// empty now that project source code is no longer indexed.
 			n, err := ragIndex.BuildCommonWithProgress(ctx, chunks, progressFn)
 			if err != nil {
-				emit(agent.Event{Type: agent.EventAgent, Message: fmt.Sprintf("RAG index: %s", err)})
+				emit(agent.Event{Type: agent.EventAgent, Message: fmt.Sprintf("RAG index (common): %s", err)})
 				return
 			}
 			if err := ragIndex.Save(); err != nil {
 				emit(agent.Event{Type: agent.EventAgent, Message: fmt.Sprintf("RAG save: %s", err)})
 				return
 			}
+			// Only announce when the index actually changed. A silent
+			// exit on a fully-cached startup avoids giving the impression
+			// of a reindex that never happened.
 			if n > 0 {
-				emit(agent.Event{Type: agent.EventAgent, Message: fmt.Sprintf("RAG indexed %d new chunks (%d total)", n, ragIndex.Size())})
+				emit(agent.Event{Type: agent.EventAgent, Message: fmt.Sprintf("RAG ready: %d new, %d total", n, ragIndex.Size())})
 			}
 		})
 	}
@@ -515,12 +564,42 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 							// status bar disappears even on error paths.
 							emit(agent.Event{Type: agent.EventRAGProgress})
 						}()
-						chunks, err := rag.ChunkFiles(ctx, flags.workDir, cfg.RAG.IndexDirs, cfg.RAG.ChunkSize, cfg.RAG.ChunkOverlap)
-						if err != nil {
-							emit(agent.Event{Type: agent.EventError, Message: fmt.Sprintf("chunk: %s", err)})
+						// Re-read rules and snippets from disk before rebuilding
+						// the index. Without this, /reindex would use whatever the
+						// loaders cached at process start, missing any rule or
+						// @-referenced doc the user edited during the session.
+						// Fail fast on loader errors: silently continuing would
+						// rebuild the index with stale rules/snippets, which is
+						// exactly what reindex is meant to prevent.
+						if err := loader.Load(ctx); err != nil {
+							emit(agent.Event{Type: agent.EventError, Message: fmt.Sprintf("rules reload: %s", err)})
 							emit(agent.Event{Type: agent.EventDone})
 							return
 						}
+						if err := snippetLoader.Load(ctx); err != nil {
+							emit(agent.Event{Type: agent.EventError, Message: fmt.Sprintf("snippets reload: %s", err)})
+							emit(agent.Event{Type: agent.EventDone})
+							return
+						}
+						// Drop any leftover per-language sub-index directories from
+						// earlier kodrun versions before rebuilding. Idempotent.
+						cleanupLegacyLangDirs(ragIndex.BasePath())
+						// /reindex is an explicit request to rebuild from scratch.
+						// Wipe the in-memory index and the on-disk file so no stale
+						// entries (e.g. source-code chunks from older kodrun builds,
+						// or rules removed since the last run) can leak through
+						// hash-based skipping in BuildWithProgress. The trade-off is
+						// that every /reindex re-embeds every chunk, which is fine
+						// for the small convention-only corpus.
+						if err := ragIndex.Reset(); err != nil {
+							emit(agent.Event{Type: agent.EventError, Message: fmt.Sprintf("reset: %s", err)})
+							emit(agent.Event{Type: agent.EventDone})
+							return
+						}
+						// RAG only indexes conventions (rules/snippets/docs/embedded).
+						// Project source code is intentionally excluded — see the
+						// initial indexing block above for the rationale.
+						var chunks []rag.Chunk
 						// Index snippets into RAG (parity with initial indexing pipeline).
 						for _, s := range snippetLoader.Snippets() {
 							chunks = append(chunks, rag.ChunkSnippets([]rag.SnippetInfo{{
@@ -537,16 +616,18 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 								Name:    filepath.Base(r.Path),
 								Content: r.Content,
 								Path:    r.Path,
-							}})...)
+							}}, cfg.RAG.ChunkSize, cfg.RAG.ChunkOverlap)...)
 						}
 						// Index reference docs into RAG
 						for path, content := range loader.ReferenceDocPaths() {
 							chunks = append(chunks, rag.ChunkRefDocs([]rag.RefDocInfo{{
 								Path:    path,
 								Content: content,
-							}})...)
+							}}, cfg.RAG.ChunkSize, cfg.RAG.ChunkOverlap)...)
 						}
-						// Index embedded reference docs (Effective Go)
+						// Built-in language reference docs (Effective Go etc.) for the
+						// detected project language. Routed to common via embedded:// prefix.
+						chunks = append(chunks, rag.ChunkEmbeddedDocs(string(langState.Current()), cfg.RAG.ChunkSize, cfg.RAG.ChunkOverlap)...)
 						progressFn := func(label string, done, total int) {
 							emit(agent.Event{
 								Type:          agent.EventRAGProgress,
@@ -555,9 +636,10 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 								ProgressLabel: label,
 							})
 						}
+						// Everything routes to common — source code is no longer indexed.
 						n, err := ragIndex.BuildCommonWithProgress(ctx, chunks, progressFn)
 						if err != nil {
-							emit(agent.Event{Type: agent.EventError, Message: fmt.Sprintf("index: %s", err)})
+							emit(agent.Event{Type: agent.EventError, Message: fmt.Sprintf("index (common): %s", err)})
 							emit(agent.Event{Type: agent.EventDone})
 							return
 						}
@@ -566,7 +648,7 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 							emit(agent.Event{Type: agent.EventDone})
 							return
 						}
-						emit(agent.Event{Type: agent.EventAgent, Message: fmt.Sprintf("Indexed %d new chunks (%d total)", n, ragIndex.Size())})
+						emit(agent.Event{Type: agent.EventAgent, Message: fmt.Sprintf("RAG reindex: %d new, %d total", n, ragIndex.Size())})
 						emit(agent.Event{Type: agent.EventDone})
 					})
 				}
@@ -641,36 +723,130 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 				emit(agent.Event{Type: agent.EventDone})
 				return
 			case "code-review":
-				var diffArgs []string
-				if len(parts) > 1 {
-					diffArgs = strings.Fields(parts[1])
+				if indexing.Load() {
+					emit(agent.Event{Type: agent.EventAgent, Message: "Waiting for RAG indexing to finish before review..."})
+					waitForRAGReady(taskCtx, &indexing, 2*time.Minute)
 				}
-				emit(agent.Event{Type: agent.EventAgent, Message: "Collecting diff for code review..."})
+				var diffArgs []string
+				var packageScope string
+				if len(parts) > 1 {
+					rawArgs := strings.Fields(parts[1])
+					// Peel off `--package <path>` (or `--package=<path>`).
+					for i := 0; i < len(rawArgs); i++ {
+						a := rawArgs[i]
+						if a == "--package" && i+1 < len(rawArgs) {
+							packageScope = strings.TrimSuffix(rawArgs[i+1], "/")
+							i++
+							continue
+						}
+						if strings.HasPrefix(a, "--package=") {
+							packageScope = strings.TrimSuffix(strings.TrimPrefix(a, "--package="), "/")
+							continue
+						}
+						diffArgs = append(diffArgs, a)
+					}
+				}
+				if packageScope != "" {
+					emit(agent.Event{Type: agent.EventAgent, Message: fmt.Sprintf("Collecting diff for code review (scope: %s)...", packageScope)})
+				} else {
+					emit(agent.Event{Type: agent.EventAgent, Message: "Collecting diff for code review..."})
+				}
 				diffOut, err := gitDiff(flags.workDir, diffArgs)
 				if err != nil {
 					emit(agent.Event{Type: agent.EventError, Message: err.Error()})
 					emit(agent.Event{Type: agent.EventDone})
 					return
 				}
+				if packageScope != "" {
+					diffOut = filterDiffByPackage(diffOut, packageScope)
+				}
 				if strings.TrimSpace(diffOut) == "" {
-					emit(agent.Event{Type: agent.EventAgent, Message: "No changes to review."})
+					if packageScope != "" {
+						emit(agent.Event{Type: agent.EventAgent, Message: fmt.Sprintf("No changes to review under %q.", packageScope)})
+					} else {
+						emit(agent.Event{Type: agent.EventAgent, Message: "No changes to review."})
+					}
 					emit(agent.Event{Type: agent.EventDone})
 					return
 				}
 				lang := langState.Current()
-				task = buildCodeReviewPrompt(lang, diffOut, cfg)
-				// Pre-fetch RAG context for the changed files. Local models
-				// (qwen, etc.) often ignore "MUST call search_docs" hints in
-				// the system prompt and dive straight into read_file. By
-				// running the searches ourselves and injecting the results as
-				// MANDATORY context, we guarantee that conventions reach the
-				// reviewer regardless of model behaviour.
-				if ragIndex != nil && cfg.RAG.Enabled {
-					if pre := buildCodeReviewRAGPrefetch(taskCtx, ragIndex, diffOut, cfg.RAG.TopK, snippetLoader.Snippets()); pre != "" {
-						task = pre + "\n" + task
+				// Fan-out specialists must NOT receive the monolithic single-
+				// reviewer prompt — it conflicts with their narrow focus and
+				// strict output format (each specialist has its own system
+				// prompt with a read_file gate). Use a thin task for fan-out,
+				// and the full monolithic prompt only for the single-reviewer
+				// fallback.
+				fanout := cfg.Agent.Orchestrator
+				if fanout {
+					// Fan-out specialists MUST call read_file on every
+					// changed file per their system-prompt workflow. Sending
+					// full diff content is unnecessary and harmful: it bloats
+					// the task, causes timeouts on big diffs, and tempts
+					// models to skip read_file. Instead we send only the stat
+					// summary (which files changed and by how many lines) and
+					// the filtered list of source-code files.
+					rawDiff, rerr := gitDiffRaw(flags.workDir, diffArgs)
+					var sourceFiles []string
+					if rerr == nil && rawDiff != "" {
+						if packageScope != "" {
+							rawDiff = filterDiffByPackage(rawDiff, packageScope)
+						}
+						filtered := filterDiffToSourceCode(rawDiff)
+						sourceFiles = changedFilesFromDiff(filtered)
+					}
+					if len(sourceFiles) == 0 {
+						// Fallback: no source files after filter — use full file list.
+						sourceFiles = changedFilesFromDiff(diffOut)
+					}
+					stat := gitStatRaw(flags.workDir, diffArgs)
+					task = buildFanoutReviewTask(stat, sourceFiles)
+					// Skip RAG prefetch for fan-out specialists. The prefetch
+					// block dumps 500+ lines of project conventions (often from
+					// a PINNED overview that targets a different canonical
+					// project) into every specialist's task, drowning the
+					// actual diff and the read_file instruction. Specialists
+					// can still call `search_docs` themselves if they need a
+					// convention lookup.
+				} else {
+					task = buildCodeReviewPrompt(lang, diffOut, cfg)
+					// Pre-fetch RAG context for the single-reviewer fallback.
+					// Local models (qwen, etc.) often ignore "MUST call
+					// search_docs" hints in the system prompt, so the prefetch
+					// guarantees conventions reach the reviewer regardless of
+					// model behaviour.
+					if ragIndex != nil && cfg.RAG.Enabled {
+						if pre := buildCodeReviewRAGPrefetch(taskCtx, ragIndex, diffOut, cfg.RAG.TopK, snippetLoader.Snippets(), cfg.RAG.ReviewBudgetBytes); pre != "" {
+							task = pre + "\n" + task
+						}
 					}
 				}
 				// fall through to the standard agent pipeline
+			}
+
+			// Parallel specialist reviewer path. When max_parallel_tasks > 1,
+			// /code-review is handled by a dedicated orchestrator method that
+			// fans out one focused sub-agent per review axis (rules, idiomatic,
+			// best-practice, security, structure, architecture) and merges their
+			// findings via the extractor into a single plan. Architecture
+			// review is one of these specialists — there is no separate
+			// /arch-review command.
+			if cfg.Agent.Orchestrator && cmdName == "code-review" {
+				roles := agent.SpecialistReviewerRoles
+				var doneSent atomic.Bool
+				wrappedEmit := agent.EventHandler(func(e agent.Event) {
+					if e.Type == agent.EventDone {
+						doneSent.Store(true)
+					}
+					emit(e)
+				})
+				orch := newOrchestrator(client, chatProv, reg, cfg, wrappedEmit, ag.GetConfirmFunc(), planConfirmFn, ruleCatalog, ragIndex, godocIndexer, langState, loader)
+				if err := orch.RunCodeReview(taskCtx, task, roles); err != nil && taskCtx.Err() == nil {
+					emit(agent.Event{Type: agent.EventError, Message: err.Error()})
+				}
+				if !doneSent.Load() {
+					emit(agent.Event{Type: agent.EventDone})
+				}
+				return
 			}
 
 			if cmdName == "orchestrate" {
@@ -678,7 +854,7 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 				if len(parts) > 1 {
 					orchTask = parts[1]
 				}
-				orch := newOrchestrator(client, chatProv, reg, cfg, emit, ag.GetConfirmFunc(), planConfirmFn, ruleCatalog, ragIndex, langState, loader)
+				orch := newOrchestrator(client, chatProv, reg, cfg, emit, ag.GetConfirmFunc(), planConfirmFn, ruleCatalog, ragIndex, godocIndexer, langState, loader)
 				err := orch.Run(taskCtx, orchTask)
 				if err != nil && taskCtx.Err() == nil {
 					emit(agent.Event{Type: agent.EventError, Message: err.Error()})
@@ -704,7 +880,7 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 				}
 				emit(e)
 			})
-			orch := newOrchestrator(client, chatProv, reg, cfg, wrappedEmit, ag.GetConfirmFunc(), planConfirmFn, ruleCatalog, ragIndex, langState, loader)
+			orch := newOrchestrator(client, chatProv, reg, cfg, wrappedEmit, ag.GetConfirmFunc(), planConfirmFn, ruleCatalog, ragIndex, godocIndexer, langState, loader)
 			if err := orch.Run(taskCtx, task); err != nil && taskCtx.Err() == nil {
 				emit(agent.Event{Type: agent.EventError, Message: err.Error()})
 			}
@@ -788,7 +964,7 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 				confirmFn = ag.GetConfirmFunc()
 			}
 			emit(agent.Event{Type: agent.EventAgent, Message: "▸ Executing approved plan..."})
-			orch := newOrchestrator(client, chatProv, reg, cfg, emit, confirmFn, planConfirmFn, ruleCatalog, ragIndex, langState, loader)
+			orch := newOrchestrator(client, chatProv, reg, cfg, emit, confirmFn, planConfirmFn, ruleCatalog, ragIndex, godocIndexer, langState, loader)
 			if err := orch.RunExecutor(taskCtx, responseText, confirmFn); err != nil && taskCtx.Err() == nil {
 				emit(agent.Event{Type: agent.EventError, Message: err.Error()})
 			}
@@ -865,7 +1041,7 @@ func buildCommandItems(loader *rules.Loader) []tui.CommandItem {
 		tui.CommandItem{Name: "rag", Description: "Show RAG index status"},
 		tui.CommandItem{Name: "add_doc", Description: "Add a document to RAG index"},
 		tui.CommandItem{Name: "orchestrate", Description: "Run Plan→Execute→Review pipeline"},
-		tui.CommandItem{Name: "code-review", Description: "Run a language-aware code review of uncommitted or specified changes"},
+		tui.CommandItem{Name: "code-review", Description: "Parallel specialist code review: rules, idiomaticity, best practices, security, structure, architecture"},
 		tui.CommandItem{Name: "exit", Description: "Exit KodRun"},
 	)
 
@@ -880,6 +1056,42 @@ func buildCommandItems(loader *rules.Loader) []tui.CommandItem {
 		return items[i].Name < items[j].Name
 	})
 	return items
+}
+
+// gitDiffRaw runs `git diff <args>` and returns the raw unified-diff output
+// with no Markdown wrapping, stat section, or truncation. It is used by the
+// fan-out code-review path, which filters the diff down to source-code files
+// before applying any size cap — truncating before filtering causes a
+// head-of-alphabet directory like `.kodrun/` to consume the whole budget and
+// starve the real source files later in the alphabet.
+func gitDiffRaw(workDir string, args []string) (string, error) {
+	full := []string{"diff"}
+	full = append(full, args...)
+	cmd := exec.Command("git", full...)
+	cmd.Dir = workDir
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	if err := cmd.Run(); err != nil {
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			return "", errors.WithMessage(err, "git diff")
+		}
+	}
+	return strings.TrimSpace(out.String()), nil
+}
+
+// gitStatRaw runs `git diff --stat <args>` and returns the raw stat output.
+func gitStatRaw(workDir string, args []string) string {
+	full := []string{"diff", "--stat"}
+	full = append(full, args...)
+	cmd := exec.Command("git", full...)
+	cmd.Dir = workDir
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	cmd.Run() // ignore error, stat may be empty
+	return strings.TrimSpace(out.String())
 }
 
 // gitDiff runs git diff and returns formatted output.
@@ -983,7 +1195,7 @@ func buildCodeReviewPrompt(lang projectlang.Language, diff string, cfg config.Co
 
 	// Section 2. Knowledge sources — project knowledge.
 	b.WriteString("\n### Project knowledge (architecture & structure)\n")
-	b.WriteString("- A project architecture overview is PINNED at the top of `[PROJECT RULES — pre-fetched from RAG]`. Read it FIRST. It defines the layer map, dependency direction and component responsibilities; do not contradict it.\n")
+	b.WriteString("- A project architecture overview is PINNED at the top of `[PROJECT CONVENTIONS — rules / snippets / docs]`. Read it FIRST. It defines the layer map, dependency direction and component responsibilities; do not contradict it. That block contains conventions only — for the actual state of any file under review, call `read_file`.\n")
 	b.WriteString("- ALWAYS read `AGENTS.md` next via `read_file` — it is the package map for this repo. If `README.md` exists, skim it too.\n")
 	b.WriteString("- Use `list_dir` on the repo root and on `internal/` (or the language equivalent) to discover what packages exist before reasoning about layering.\n")
 	if cfg.RAG.Enabled {
@@ -1028,7 +1240,7 @@ func buildCodeReviewPrompt(lang projectlang.Language, diff string, cfg config.Co
 
 	// Section 5. Cross-cutting axes.
 	b.WriteString("\n## Cross-cutting axes (always check)\n")
-	b.WriteString("- **Architecture & structure**: does the change fit its layer/package per `AGENTS.md`? Any forbidden dependency direction (e.g. repository calling server)? Premature abstractions or fat helpers?\n")
+	b.WriteString("- **Architecture & structure**: does the change fit its layer/package per `AGENTS.md`? Any forbidden dependency direction (e.g. repository calling server)? Premature abstractions or fat helpers? If you notice that the current project structure diverges from what `AGENTS.md` or the pinned architecture snippets describe (missing layer, orphan package, wrong dependency direction, layer named differently), list every divergence explicitly in the Cross-cutting section — do not stay silent because \"it is not in the diff\".\n")
 	b.WriteString("- **Security**: input validation at boundaries (CLI/HTTP/RPC); no secrets in code or logs; SQL only via parameterized queries; paths free of `..` traversal; no shell injection in command execution; cryptography only from standard libraries; errors must not leak sensitive data into logs.\n")
 	b.WriteString("- **Performance**: no accidental O(n²) on large inputs; no allocations in hot paths; batching where appropriate; no sync calls where a batch is expected.\n")
 	b.WriteString("- **Compatibility**: public API not broken without reason; DB migrations are reversible or explicitly marked irreversible.\n")
@@ -1059,6 +1271,51 @@ func buildCodeReviewPrompt(lang projectlang.Language, diff string, cfg config.Co
 	return b.String()
 }
 
+// buildFanoutReviewTask builds a minimal user task for a specialist reviewer
+// sub-agent in the parallel code-review fan-out. Each specialist already has
+// its own strict system prompt (focus area, read_file gate, output format);
+// the user message must not carry the monolithic single-reviewer instructions,
+// which conflict with the specialist's narrow output contract. The task lists
+// only the diff, the changed files, and a short reminder to read each cited
+// file before emitting a finding.
+// buildFanoutReviewTask builds a minimal user task for a specialist reviewer
+// in the parallel code-review fan-out. It deliberately omits the full diff
+// content: specialists are required to call `read_file` on every file, so
+// including the diff only wastes context and tempts the model to skip tools.
+// Instead the task carries:
+//   - a short stat summary (which files changed and by how many lines);
+//   - a filtered list of source-code files the specialist must read.
+func buildFanoutReviewTask(stat string, files []string) string {
+	var b strings.Builder
+	b.WriteString("# Code review — parallel specialist\n\n")
+	b.WriteString("You are one of several specialist reviewers running in parallel.\n")
+	b.WriteString("Your focus area, output format and read_file workflow are defined in your system prompt. Follow them STRICTLY.\n\n")
+
+	if len(files) > 0 {
+		b.WriteString("## Files changed in this diff\n")
+		for _, f := range files {
+			b.WriteString("- ")
+			b.WriteString(f)
+			b.WriteByte('\n')
+		}
+		b.WriteByte('\n')
+	}
+
+	if stat != "" {
+		b.WriteString("## Change summary (git diff --stat)\n```\n")
+		b.WriteString(stat)
+		b.WriteString("\n```\n\n")
+	}
+
+	b.WriteString("## Reminders\n")
+	b.WriteString("- Diff content is NOT included in this task. You MUST call `read_file(path)` on every file listed above.\n")
+	b.WriteString("- Take line numbers ONLY from `read_file` output, never from memory or guesses.\n")
+	b.WriteString("- Stay strictly within your specialist focus. Do not comment on anything outside it.\n")
+	b.WriteString("- Output format is `path:LINE — SEVERITY — description` per line, or exactly `NO_ISSUES`.\n")
+	b.WriteString("- Do NOT produce Summary / Verdict / Cross-cutting sections.\n\n")
+	return b.String()
+}
+
 // buildCodeReviewRAGPrefetch runs a small fan-out of RAG searches for the
 // files appearing in the diff and formats the results as a MANDATORY context
 // block prepended to the reviewer prompt. This bypasses the unreliable
@@ -1069,18 +1326,49 @@ func buildCodeReviewPrompt(lang projectlang.Language, diff string, cfg config.Co
 // always injected verbatim into the code-review prefetch block, regardless of
 // semantic search ranking. This guarantees the reviewer model sees the project
 // map (e.g. .kodrun/snippets/go-architecture.md) before classifying files.
-var pinnedOverviewTags = map[string]struct{}{
+// pinnedOverviewTags partitions pinned snippet tags into two tiers:
+//
+//   - must: always injected first, even on tight budgets. These are
+//     project-wide maps the reviewer cannot do without (e.g. architecture).
+//   - nice: injected only if at least half of the RAG budget is still free.
+//     These augment the picture but are dropped under pressure.
+//
+// Lookup is via pinnedTagTier, which returns ("must"|"nice"|"").
+var pinnedOverviewTagsMust = map[string]struct{}{
 	"architecture": {},
 	"overview":     {},
-	"structure":    {},
 }
 
-func buildCodeReviewRAGPrefetch(ctx context.Context, ragIndex tools.RAGSearcher, diff string, topK int, allSnippets []snippets.Snippet) string {
+var pinnedOverviewTagsNice = map[string]struct{}{
+	"structure":   {},
+	"conventions": {},
+}
+
+// pinnedTagTier classifies a tag list. "must" wins over "nice" if both
+// apply to the same snippet.
+func pinnedTagTier(tags []string) string {
+	tier := ""
+	for _, t := range tags {
+		norm := strings.ToLower(strings.TrimSpace(t))
+		if _, ok := pinnedOverviewTagsMust[norm]; ok {
+			return "must"
+		}
+		if _, ok := pinnedOverviewTagsNice[norm]; ok {
+			tier = "nice"
+		}
+	}
+	return tier
+}
+
+func buildCodeReviewRAGPrefetch(ctx context.Context, ragIndex tools.RAGSearcher, diff string, topK int, allSnippets []snippets.Snippet, budgetBytes int) string {
 	if ragIndex == nil {
 		return ""
 	}
 	if topK <= 0 {
 		topK = 5
+	}
+	if budgetBytes <= 0 {
+		budgetBytes = 24 * 1024
 	}
 
 	files := changedFilesFromDiff(diff)
@@ -1114,7 +1402,15 @@ func buildCodeReviewRAGPrefetch(ctx context.Context, ragIndex tools.RAGSearcher,
 	}
 	seen := make(map[chunkKey]bool)
 	var results []rag.SearchResult
+	// Track accumulated bytes across all collected chunks for early exit:
+	// once we are clearly over the final injection budget there is no value
+	// in spending more embedding calls on additional queries.
+	var accBytes int
+	earlyExit := false
 	for q := range querySet {
+		if earlyExit {
+			break
+		}
 		hits, err := ragIndex.Search(ctx, q, topK)
 		if err != nil {
 			continue
@@ -1126,28 +1422,40 @@ func buildCodeReviewRAGPrefetch(ctx context.Context, ragIndex tools.RAGSearcher,
 			}
 			seen[k] = true
 			results = append(results, h)
+			accBytes += len(h.Chunk.Content)
+			// 2x budget gives the formatter room to drop low-score chunks.
+			if accBytes > 2*budgetBytes {
+				earlyExit = true
+				break
+			}
 		}
 	}
 	if len(results) == 0 {
 		return ""
 	}
 
-	// Cap the total injected size so we don't blow the context window. ~64KB
-	// of pre-fetched docs fits a typical architecture overview plus a handful
-	// of per-file convention chunks.
-	const maxBytes = 64 * 1024
+	maxBytes := budgetBytes
 	var b strings.Builder
-	b.WriteString("[PROJECT RULES — pre-fetched from RAG, treat as MANDATORY]\n")
-	b.WriteString("The following chunks are project conventions and code templates that ALREADY apply to the changes under review. ")
-	b.WriteString("Read them BEFORE looking at the diff. Every violation must be reported as a finding.\n\n")
+	b.WriteString("[PROJECT CONVENTIONS — rules / snippets / docs]\n")
+	b.WriteString("These chunks are project conventions and code templates pre-fetched from RAG. ")
+	b.WriteString("They are NOT the current state of source files under review. ")
+	b.WriteString("For ANY claim about code, call `read_file` on the real file from the diff — do not cite code from this block. ")
+	b.WriteString("Do not report a finding without first reading the affected file in full.\n\n")
 
 	// Pinned overview snippets first: these describe the project map and
 	// must be visible to the reviewer regardless of semantic ranking.
+	// Two tiers: must (always attempted) and nice (only if budget >50% free).
 	pinnedSeen := make(map[string]bool)
+	var mustSnips, niceSnips []snippets.Snippet
 	for _, s := range allSnippets {
-		if !hasAnyPinnedOverviewTag(s.Tags) {
-			continue
+		switch pinnedTagTier(s.Tags) {
+		case "must":
+			mustSnips = append(mustSnips, s)
+		case "nice":
+			niceSnips = append(niceSnips, s)
 		}
+	}
+	for _, s := range mustSnips {
 		if pinnedSeen[s.SourcePath] {
 			continue
 		}
@@ -1159,6 +1467,20 @@ func buildCodeReviewRAGPrefetch(ctx context.Context, ragIndex tools.RAGSearcher,
 		}
 		b.WriteString(entry)
 	}
+	// Nice-tier snippets only squeeze in when at least half the budget is free.
+	if b.Len() < maxBytes/2 {
+		for _, s := range niceSnips {
+			if pinnedSeen[s.SourcePath] {
+				continue
+			}
+			pinnedSeen[s.SourcePath] = true
+			entry := fmt.Sprintf("--- PINNED OVERVIEW: %s ---\n%s\n\n", s.SourcePath, s.Content)
+			if b.Len()+len(entry) > maxBytes/2 {
+				break
+			}
+			b.WriteString(entry)
+		}
+	}
 
 	for _, r := range results {
 		// Skip chunks that come from a snippet we've already injected in full
@@ -1166,22 +1488,151 @@ func buildCodeReviewRAGPrefetch(ctx context.Context, ragIndex tools.RAGSearcher,
 		if pinnedSeen[r.Chunk.FilePath] {
 			continue
 		}
-		entry := fmt.Sprintf("--- %s:%d-%d ---\n%s\n\n", r.Chunk.FilePath, r.Chunk.StartLine, r.Chunk.EndLine, r.Chunk.Content)
+		content := rag.CompressChunk(r.Chunk.FilePath, r.Chunk.Content)
+		entry := fmt.Sprintf("--- %s:%d-%d ---\n%s\n\n", r.Chunk.FilePath, r.Chunk.StartLine, r.Chunk.EndLine, content)
 		if b.Len()+len(entry) > maxBytes {
 			b.WriteString("[... truncated, additional results omitted ...]\n")
 			break
 		}
 		b.WriteString(entry)
 	}
-	b.WriteString("[END PROJECT RULES]\n")
+	b.WriteString("[END PROJECT CONVENTIONS]\n")
 	return b.String()
 }
 
-// hasAnyPinnedOverviewTag reports whether any of the snippet's tags marks it
-// as a project-wide overview that should always be injected into code-review.
-func hasAnyPinnedOverviewTag(tags []string) bool {
-	for _, t := range tags {
-		if _, ok := pinnedOverviewTags[strings.ToLower(strings.TrimSpace(t))]; ok {
+// waitForRAGReady blocks until the background RAG indexing flag clears or
+// the timeout/context fires. It is a best-effort gate used by review
+// commands so they do not query a half-built index right after startup.
+func waitForRAGReady(ctx context.Context, indexing *atomic.Bool, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for indexing.Load() {
+		if ctx.Err() != nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+}
+
+// filterDiffByPackage keeps only the file sections of a unified-diff whose
+// `+++ b/<path>` line is rooted under the given package scope. Used by
+// `/code-review --package <path>` to narrow review to a single package
+// without re-running git. Empty diff or empty scope return the input as-is.
+func filterDiffByPackage(diff, scope string) string {
+	scope = strings.TrimSuffix(scope, "/")
+	if scope == "" || diff == "" {
+		return diff
+	}
+	prefix := scope + "/"
+	lines := strings.Split(diff, "\n")
+	var out []string
+	keep := false
+	for i := 0; i < len(lines); i++ {
+		line := lines[i]
+		if strings.HasPrefix(line, "diff --git ") {
+			// Look ahead for the +++ b/<path> line that determines whether
+			// we keep this file section. Stop at the next "diff --git" or EOF.
+			path := ""
+			for j := i + 1; j < len(lines) && !strings.HasPrefix(lines[j], "diff --git "); j++ {
+				if strings.HasPrefix(lines[j], "+++ ") {
+					p := strings.TrimPrefix(lines[j], "+++ ")
+					p = strings.TrimPrefix(p, "b/")
+					path = strings.TrimSpace(p)
+					break
+				}
+			}
+			keep = path != "" && (path == scope || strings.HasPrefix(path, prefix))
+		}
+		if keep {
+			out = append(out, line)
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
+// filterDiffToSourceCode keeps only file sections whose `+++ b/<path>` points
+// at actual source code. It drops documentation, configuration and project
+// metadata (markdown, YAML, JSON, lockfiles, `.kodrun/**`, `vendor/**`,
+// `testdata/**`, `go.mod`/`go.sum`, etc.) so fan-out specialist reviewers are
+// not flooded with noise when a large diff mixes a handful of code changes
+// with bulk doc or config updates. Empty diff returns the input as-is.
+func filterDiffToSourceCode(diff string) string {
+	if diff == "" {
+		return diff
+	}
+	lines := strings.Split(diff, "\n")
+	var out []string
+	keep := false
+	for i := 0; i < len(lines); i++ {
+		line := lines[i]
+		if strings.HasPrefix(line, "diff --git ") {
+			path := ""
+			for j := i + 1; j < len(lines) && !strings.HasPrefix(lines[j], "diff --git "); j++ {
+				if strings.HasPrefix(lines[j], "+++ ") {
+					p := strings.TrimPrefix(lines[j], "+++ ")
+					p = strings.TrimPrefix(p, "b/")
+					path = strings.TrimSpace(p)
+					break
+				}
+			}
+			keep = isSourceCodePath(path)
+		}
+		if keep {
+			out = append(out, line)
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
+// isSourceCodePath reports whether path looks like a real source code file
+// worth code-reviewing. The check is extension- and prefix-based, deliberately
+// conservative: extend the allow list when new languages are added rather
+// than trying to derive it from projectlang.
+func isSourceCodePath(path string) bool {
+	if path == "" || path == "/dev/null" {
+		return false
+	}
+	// Deny: project metadata and convention dumps.
+	denyPrefixes := []string{
+		".kodrun/", ".claude/", ".github/", ".git/",
+		"vendor/", "node_modules/", "testdata/", "docs/", "doc/",
+	}
+	for _, p := range denyPrefixes {
+		if strings.HasPrefix(path, p) {
+			return false
+		}
+	}
+	denyNames := map[string]bool{
+		"go.mod": true, "go.sum": true,
+		"package.json": true, "package-lock.json": true, "yarn.lock": true,
+		"pnpm-lock.yaml": true, "Cargo.lock": true, "poetry.lock": true,
+		"Pipfile.lock": true, "AGENTS.md": true, "README.md": true,
+		"CLAUDE.md": true, "Makefile": true, "Dockerfile": true,
+	}
+	base := path
+	if i := strings.LastIndex(base, "/"); i >= 0 {
+		base = base[i+1:]
+	}
+	if denyNames[base] {
+		return false
+	}
+	// Allow: known source-code extensions.
+	allowExts := []string{
+		".go", ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+		".rs", ".java", ".kt", ".kts", ".scala", ".rb", ".php",
+		".c", ".h", ".cc", ".cpp", ".hpp", ".m", ".mm", ".swift",
+		".cs", ".fs", ".vb", ".ex", ".exs", ".erl", ".hrl",
+		".lua", ".pl", ".pm", ".sh", ".bash", ".zsh", ".sql",
+		".proto",
+	}
+	for _, ext := range allowExts {
+		if strings.HasSuffix(path, ext) {
 			return true
 		}
 	}
@@ -1209,7 +1660,7 @@ func changedFilesFromDiff(diff string) []string {
 	return files
 }
 
-func newOrchestrator(client *ollama.Client, chatProv config.ProviderConfig, reg *tools.Registry, cfg config.Config, emit agent.EventHandler, confirmFn agent.ConfirmFunc, planConfirmFn agent.PlanConfirmFunc, ruleCatalog string, ragIndex tools.RAGSearcher, langState *projectlang.State, rulesLoader *rules.Loader) *agent.Orchestrator {
+func newOrchestrator(client *ollama.Client, chatProv config.ProviderConfig, reg *tools.Registry, cfg config.Config, emit agent.EventHandler, confirmFn agent.ConfirmFunc, planConfirmFn agent.PlanConfirmFunc, ruleCatalog string, ragIndex tools.RAGSearcher, godocIndexer tools.GoDocIndexer, langState *projectlang.State, rulesLoader *rules.Loader) *agent.Orchestrator {
 	// Resolve thinking/executor providers (fallback to chat provider).
 	thinkProv := cfg.ThinkingProvider()
 	execProv := cfg.ExecutorProvider()
@@ -1262,6 +1713,7 @@ func newOrchestrator(client *ollama.Client, chatProv config.ProviderConfig, reg 
 		HasRAG:               cfg.RAG.Enabled,
 		PrefetchCode:         cfg.Agent.PrefetchCode,
 		RAGIndex:             ragIndex,
+		GodocIndexer:         godocIndexer,
 		LangState:            langState,
 		RulesLoader:          rulesLoader,
 		ExecutorClient:       execClient,
@@ -1321,7 +1773,7 @@ func fixCmd() *cli.Command {
 			}
 			ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 			defer cancel()
-			ag, _, loader, _, _, _, mcpMgr, _ := setupAgent(ctx, cfg, rules.ScopeFix)
+			ag, _, loader, _, _, _, _, mcpMgr, _ := setupAgent(ctx, cfg, rules.ScopeFix)
 			if mcpMgr != nil {
 				defer mcpMgr.Close()
 			}
@@ -1391,7 +1843,7 @@ func runGoTool(toolName string, args []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	ag, reg, _, _, _, _, mcpMgr, _ := setupAgent(ctx, cfg, rules.ScopeFix)
+	ag, reg, _, _, _, _, _, mcpMgr, _ := setupAgent(ctx, cfg, rules.ScopeFix)
 	if mcpMgr != nil {
 		defer mcpMgr.Close()
 	}
@@ -1433,4 +1885,15 @@ func runGoTool(toolName string, args []string) error {
 		os.Exit(1)
 	}
 	return nil
+}
+
+// cleanupLegacyLangDirs removes per-language RAG sub-index directories left
+// over from earlier kodrun versions that indexed project source code. RAG now
+// stores everything under <basePath>/common; any "go", "python" or "jsts"
+// directory is stale and can only corrupt search results. The call is
+// idempotent — missing directories are silently ignored.
+func cleanupLegacyLangDirs(basePath string) {
+	for _, lang := range []string{"go", "python", "jsts"} {
+		_ = os.RemoveAll(filepath.Join(basePath, lang))
+	}
 }

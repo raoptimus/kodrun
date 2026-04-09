@@ -24,9 +24,9 @@ agent:
 
   # Concurrency — see examples/kodrun.yaml for the full explanation.
   #
-  #   max_workers        — parallel read-only tool calls inside one sub-agent.
+  #   max_tool_workers   — parallel read-only tool calls inside one sub-agent.
   #   max_parallel_tasks — parallel plan steps in DAG mode (1 = sequential).
   #   max_replans        — REPLAN cycle hard cap per Run.
-  max_workers: 4
+  max_tool_workers: 4
   max_parallel_tasks: 1
   max_replans: 2

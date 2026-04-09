@@ -2,12 +2,17 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
+	"sort"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/pkg/errors"
 	"github.com/raoptimus/kodrun/internal/ollama"
@@ -44,6 +49,7 @@ type Orchestrator struct {
 	hasSnippets     bool
 	hasRAG          bool
 	ragIndex        tools.RAGSearcher
+	godocIndexer    tools.GoDocIndexer
 	langState       *projectlang.State
 	rulesLoader     *rules.Loader
 	ruleNames       []string
@@ -57,6 +63,12 @@ type Orchestrator struct {
 	maxReplans       int
 
 	cachedProjectFiles string
+
+	// stepRAGBundles is populated once at the start of runPlanDAG and read
+	// by runStep. Sharing the per-step RAG payload across the DAG run avoids
+	// re-issuing identical embedding searches for every parallel sub-agent.
+	// nil means "fall back to live perStepRAG()" (used outside DAG mode).
+	stepRAGBundles map[int]string
 }
 
 // OrchestratorConfig holds configuration for the orchestrator.
@@ -69,8 +81,9 @@ type OrchestratorConfig struct {
 	Review       bool
 	HasSnippets  bool
 	HasRAG       bool
-	RAGIndex     tools.RAGSearcher
-	LangState    *projectlang.State
+	RAGIndex       tools.RAGSearcher
+	GodocIndexer   tools.GoDocIndexer
+	LangState      *projectlang.State
 	RulesLoader  *rules.Loader
 	PrefetchCode bool
 
@@ -133,13 +146,14 @@ func NewOrchestrator(
 		hasSnippets:     cfg.HasSnippets,
 		hasRAG:          cfg.HasRAG,
 		ragIndex:        cfg.RAGIndex,
+		godocIndexer:    cfg.GodocIndexer,
 		langState:       cfg.LangState,
 		rulesLoader:     cfg.RulesLoader,
 		ruleNames:       collectRuleNames(cfg.RulesLoader),
 		prefetchCode:    cfg.PrefetchCode,
-		maxPlanIter:     100,
-		maxExecIter:     50,
-		maxRevIter:      15,
+		maxPlanIter:       100,
+		maxExecIter:       50,
+		maxRevIter:        15,
 	}
 	if o.execClient == nil {
 		o.execClient = client
@@ -173,7 +187,7 @@ func (o *Orchestrator) ensureLanguageDetected() {
 	if !changed || lang == projectlang.LangUnknown {
 		return
 	}
-	tools.RegisterLanguageTools(o.reg, lang, o.workDir)
+	tools.RegisterLanguageTools(o.reg, lang, o.workDir, o.godocIndexer)
 	o.emit(Event{Type: EventAgent, Message: fmt.Sprintf("Project language detected: %s — language tools registered", lang)})
 }
 
@@ -297,6 +311,13 @@ func (o *Orchestrator) Run(ctx context.Context, task string) error {
 	}
 
 	// Phase 2: Execution
+	// If context was cancelled (e.g. ESC during planning) but user approved
+	// the plan anyway, use a detached context so the executor can proceed.
+	execCtx := ctx
+	if ctx.Err() != nil {
+		execCtx = context.WithoutCancel(ctx)
+	}
+
 	o.emitPhase("executing")
 	o.emit(Event{Type: EventModeChange, Message: "edit"})
 	o.emit(Event{Type: EventAgent, Message: "▸ Phase 2: Executing plan..."})
@@ -306,7 +327,7 @@ func (o *Orchestrator) Run(ctx context.Context, task string) error {
 		confirmForExec = o.confirmFn
 	}
 
-	execStats, err := o.runExecutor(ctx, plan, confirmForExec)
+	execStats, err := o.runExecutor(execCtx, plan, confirmForExec)
 	if err != nil {
 		return errors.WithMessage(err, "executor")
 	}
@@ -639,21 +660,26 @@ func (o *Orchestrator) RunExecutor(ctx context.Context, plan string, confirmFn C
 }
 
 func (o *Orchestrator) runExecutor(ctx context.Context, plan string, confirmFn ConfirmFunc) (SessionStats, error) {
-	// Block 3: parallel DAG path. When MaxParallelTasks > 1, attempt to
-	// structure the plan into a JSON DAG and run independent steps in
-	// parallel. On any failure (structurer unavailable, JSON parse error,
-	// empty plan) we fall through to the sequential single-agent path below.
-	if o.maxParallelTasks > 1 {
-		structured := o.structurePlan(ctx, plan)
-		if structured != nil && len(structured.Steps) > 0 {
-			o.emit(Event{
-				Type:    EventAgent,
-				Message: fmt.Sprintf("Executing plan as DAG: %d steps, max %d parallel", len(structured.Steps), o.maxParallelTasks),
-			})
-			return o.runPlanDAG(ctx, structured, o.maxParallelTasks, confirmFn)
+	// Always attempt to structure the plan into a JSON DAG. maxParallelTasks
+	// controls only the number of concurrent workers, not whether we use the
+	// DAG path. This ensures every step gets its own clean sub-agent context
+	// (and examples, RAG, whitelist) regardless of parallelism settings.
+	structured := o.structurePlan(ctx, plan)
+	if structured != nil && len(structured.Steps) > 0 {
+		parallel := o.maxParallelTasks
+		if parallel < 1 {
+			parallel = 1
 		}
-		o.emit(Event{Type: EventAgent, Message: "Structurer unavailable; falling back to sequential executor"})
+		o.emit(Event{
+			Type:    EventAgent,
+			Message: fmt.Sprintf("Executing plan as DAG: %d steps, max %d parallel", len(structured.Steps), parallel),
+		})
+		return o.runPlanDAG(ctx, structured, parallel, confirmFn)
 	}
+
+	// Fallback: structurer unavailable or returned empty plan. Use single
+	// monolithic executor (no per-step examples in this path).
+	o.emit(Event{Type: EventAgent, Message: "Structurer unavailable; falling back to sequential executor"})
 
 	// Pre-read project files so executor doesn't waste iterations on read_file/list_dir.
 	o.emit(Event{Type: EventGroupStart, Message: "Reading project files..."})
@@ -665,11 +691,11 @@ func (o *Orchestrator) runExecutor(ctx context.Context, plan string, confirmFn C
 	ag.InitWithPrompt(prompt)
 	ag.SetConfirmFunc(confirmFn)
 
-	// Block 1: derive the read-path whitelist from the plan and lock the
-	// executor to it. The executor may only read files mentioned in the plan;
-	// any attempt to read elsewhere is refused with a REPLAN hint.
-	structured := PlanFromMarkdown(plan)
-	whitelist := structured.AffectedFiles()
+	// Derive the read-path whitelist from the plan and lock the executor to
+	// it. The executor may only read files mentioned in the plan; any attempt
+	// to read elsewhere is refused with a REPLAN hint.
+	mdPlan := PlanFromMarkdown(plan)
+	whitelist := mdPlan.AffectedFiles()
 	if len(whitelist) > 0 {
 		ag.SetAllowedReadPaths(whitelist)
 		o.emit(Event{
@@ -687,10 +713,7 @@ func (o *Orchestrator) runExecutor(ctx context.Context, plan string, confirmFn C
 		return ag.Stats(), err
 	}
 
-	// Block 1: detect REPLAN sentinel from the executor and surface it to the
-	// orchestrator's caller via an EventAgent message. Full replan loop is
-	// implemented in a follow-up; for now we surface the signal so the user
-	// sees what happened instead of silently looping.
+	// Detect REPLAN sentinel from the executor.
 	if last := ag.LastPlan(); strings.Contains(last, "REPLAN:") {
 		o.emit(Event{
 			Type:    EventReplan,
@@ -741,9 +764,10 @@ func (o *Orchestrator) newAgent(role Role, maxIter int) *Agent {
 	ag := New(client, model, o.reg, maxIter, o.workDir, ctxSize)
 	ag.SetLanguage(o.language)
 	ag.SetAutoCompact(true)
-	ag.SetMaxWorkers(4)
+	ag.SetMaxToolWorkers(4)
 	ag.SetHasSnippets(o.hasSnippets)
 	ag.SetHasRAG(o.hasRAG)
+	ag.SetTaskLabel(taskLabelForRole(role))
 
 	switch role {
 	case RolePlanner:
@@ -752,7 +776,13 @@ func (o *Orchestrator) newAgent(role Role, maxIter int) *Agent {
 	case RoleExecutor:
 		ag.SetMode(ModeEdit)
 		ag.SetThink(false)
-	case RoleReviewer:
+	case RoleReviewer,
+		RoleReviewerRules,
+		RoleReviewerIdiomatic,
+		RoleReviewerBestPractice,
+		RoleReviewerSecurity,
+		RoleReviewerStructure,
+		RoleReviewerArchitecture:
 		ag.SetMode(ModePlan)
 		ag.SetThink(true)
 	case RoleExtractor:
@@ -970,30 +1000,42 @@ func (o *Orchestrator) structurePlan(ctx context.Context, markdownPlan string) *
 		return nil
 	}
 
-	// Build a structurer agent. Reuses the extractor wiring (deterministic
-	// profile, dedicated client/model when configured).
-	ag := o.newAgent(RoleStructurer, 3)
-	prompt := systemPromptForRole(RoleStructurer, o.language, o.ruleCatalog, nil)
-	ag.InitWithPrompt(prompt)
-
 	task := "Convert the following plan into the JSON schema described in your instructions:\n\n" + markdownPlan
-	if err := ag.Send(ctx, task); err != nil && !errors.Is(err, ErrMaxIterations) {
-		o.emit(Event{Type: EventAgent, Message: "structurer error: " + err.Error()})
-		return nil
-	}
 
-	raw := strings.TrimSpace(ag.LastAssistantMessage())
-	if raw == "" {
-		return nil
-	}
+	// Retry once on transient errors (e.g. Ollama context eviction after
+	// heavy specialist work).
+	const maxAttempts = 2
+	for attempt := range maxAttempts {
+		if ctx.Err() != nil {
+			return nil
+		}
 
-	plan, err := parseStructuredPlan(raw)
-	if err != nil {
-		o.emit(Event{Type: EventAgent, Message: "structurer JSON parse failed: " + err.Error()})
-		return nil
+		ag := o.newAgent(RoleStructurer, 3)
+		prompt := systemPromptForRole(RoleStructurer, o.language, o.ruleCatalog, nil)
+		ag.InitWithPrompt(prompt)
+
+		if err := ag.Send(ctx, task); err != nil && !errors.Is(err, ErrMaxIterations) {
+			o.emit(Event{Type: EventAgent, Message: fmt.Sprintf("structurer error (attempt %d/%d): %s", attempt+1, maxAttempts, err.Error())})
+			if attempt < maxAttempts-1 {
+				time.Sleep(time.Second)
+			}
+			continue
+		}
+
+		raw := strings.TrimSpace(ag.LastAssistantMessage())
+		if raw == "" {
+			continue
+		}
+
+		plan, err := parseStructuredPlan(raw)
+		if err != nil {
+			o.emit(Event{Type: EventAgent, Message: "structurer JSON parse failed: " + err.Error()})
+			continue
+		}
+		plan.Raw = markdownPlan
+		return plan
 	}
-	plan.Raw = markdownPlan
-	return plan
+	return nil
 }
 
 // runExtractor takes raw analysis/review text and converts it to a structured plan
@@ -1017,9 +1059,591 @@ func (o *Orchestrator) runExtractor(ctx context.Context, rawAnalysis string) (st
 	return plan, nil
 }
 
+// RunCodeReview runs specialised reviewer sub-agents in parallel, concatenates
+// their reports and normalises them via the extractor into a single plan that
+// is emitted to the user. The task argument is the fully-prepared review
+// prompt (already containing any RAG prefetch and the diff / project context)
+// and is sent to every specialist as-is.
+//
+// Parallelism is bounded by o.maxParallelTasks. When maxParallelTasks <= 1
+// the reviewers run sequentially. If len(roles) == 1 the fan-out degenerates
+// to a single specialist (used by /arch-review).
+func (o *Orchestrator) RunCodeReview(ctx context.Context, task string, roles []Role) error {
+	if len(roles) == 0 {
+		return errors.New("RunCodeReview: no roles provided")
+	}
+
+	o.ensureLanguageDetected()
+
+	cache := tools.NewResultCache()
+	o.reg.WithCache(cache)
+	defer func() {
+		o.reg.WithCache(nil)
+		o.emitCacheStats(cache)
+	}()
+
+	o.emitPhase("reviewing")
+
+	maxPar := o.maxParallelTasks
+	if maxPar < 1 {
+		maxPar = 1
+	}
+	if maxPar > len(roles) {
+		maxPar = len(roles)
+	}
+
+	const reviewGroupID = "code-review"
+	o.emit(Event{Type: EventGroupStart, GroupID: reviewGroupID, Message: "CodeReview(...)"})
+
+	// Circuit breaker: cancel remaining specialists on first connection error.
+	reviewCtx, reviewCancel := context.WithCancel(ctx)
+	defer reviewCancel()
+
+	results := make([]reviewResult, len(roles))
+	sem := make(chan struct{}, maxPar)
+	var wg sync.WaitGroup
+
+	for i, role := range roles {
+		if reviewCtx.Err() != nil {
+			break
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, role Role) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			defer func() {
+				if r := recover(); r != nil {
+					results[i] = reviewResult{role: role, err: errors.Errorf("panic: %v", r)}
+				}
+			}()
+
+			o.emit(Event{
+				Type:    EventGroupTitleUpdate,
+				GroupID: reviewGroupID,
+				Message: fmt.Sprintf("CodeReview(%s)", reviewerShortLabel(role)),
+			})
+
+			text, err := o.runReviewerSpecialistInGroup(reviewCtx, role, task, reviewGroupID)
+			results[i] = reviewResult{role: role, text: text, err: err}
+
+			if err != nil && isConnectionError(err) {
+				o.emit(Event{Type: EventError, Message: "Ollama unreachable — aborting remaining reviewers."})
+				reviewCancel()
+			}
+		}(i, role)
+	}
+	wg.Wait()
+
+	o.emit(Event{Type: EventGroupEnd, GroupID: reviewGroupID})
+
+	// If the context was cancelled but some reviewers succeeded, continue
+	// processing their results instead of discarding everything.
+	ctxCancelled := ctx.Err() != nil
+	hasSuccess := false
+	for _, r := range results {
+		if r.err == nil {
+			hasSuccess = true
+			break
+		}
+	}
+	if ctxCancelled && !hasSuccess {
+		return ctx.Err()
+	}
+
+	var sections []string
+	var failedCount int
+	for _, r := range results {
+		if r.err != nil {
+			failedCount++
+			continue
+		}
+		text := strings.TrimSpace(r.text)
+		if isNoIssues(text) {
+			continue
+		}
+		sections = append(sections, fmt.Sprintf("## [%s]\n\n%s", strings.ToUpper(string(r.role)), text))
+	}
+
+	if len(sections) == 0 {
+		if failedCount > 0 {
+			o.emit(Event{Type: EventAgent, Message: fmt.Sprintf(
+				"⚠ %d reviewer(s) failed, but no issues found by the rest — treating as LGTM.", failedCount)})
+		} else {
+			o.emit(Event{Type: EventAgent, Message: "LGTM — no issues found."})
+		}
+		o.emit(Event{Type: EventModeChange, Message: "plan"})
+		o.emit(Event{Type: EventDone, Message: "Code review completed"})
+		return nil
+	}
+
+	// Merge specialist findings deterministically in Go. Each specialist is
+	// prompted to emit strict `path:LINE — SEVERITY — description` lines, so
+	// we parse them directly instead of sending the concatenated text to
+	// another LLM (extractor), which tends to drop items under aggressive
+	// dedup.
+	o.emit(Event{Type: EventAgent, Message: "▸ Merging reviewer findings..."})
+	finalPlan := mergeSpecialistFindings(results)
+	if finalPlan == "" {
+		// Fallback: no strict lines parsed — surface this explicitly so the
+		// operator knows why the output looks unstructured, then show raw
+		// concatenated sections so nothing is silently lost.
+		o.emit(Event{Type: EventAgent, Message: "⚠ Specialists did not emit strict finding lines — showing raw concatenated reports."})
+		finalPlan = strings.Join(sections, "\n\n---\n\n")
+	}
+
+	// Run extractor over concatenated specialist reports to produce a
+	// project-level Context paragraph. We discard its plan (deterministic
+	// merge above already has every finding) and splice only its context
+	// ahead of our ## Plan section. Skip if context is already cancelled
+	// to avoid a pointless LLM call that will likely timeout.
+	if !ctxCancelled {
+		concat := strings.Join(sections, "\n\n---\n\n")
+		if ctxPara, err := o.extractReviewContext(ctx, concat); err == nil && ctxPara != "" {
+			finalPlan = "## Context\n\n" + ctxPara + "\n\n" + stripContextSection(finalPlan)
+		}
+	}
+
+	o.emit(Event{Type: EventAgent, Message: finalPlan})
+	o.emit(Event{Type: EventModeChange, Message: "plan"})
+
+	autoAccept := false
+	if o.planConfirm != nil {
+		cr := o.planConfirm(finalPlan)
+		switch cr.Action {
+		case PlanDeny:
+			o.emit(Event{Type: EventAgent, Message: "Execution cancelled by user."})
+			o.emit(Event{Type: EventDone, Message: "Code review completed"})
+			return nil
+		case PlanAugment:
+			o.emit(Event{Type: EventAgent, Message: "▸ Revising plan..."})
+			o.emit(Event{Type: EventGroupStart, Message: "Revise(plan)"})
+			revised, err := o.runPlannerRevision(ctx, finalPlan, cr.Augment)
+			o.emit(Event{Type: EventGroupEnd})
+			if err != nil {
+				o.emit(Event{Type: EventDone, Message: "Code review completed"})
+				return errors.WithMessage(err, "planner revision")
+			}
+			if revised != "" {
+				finalPlan = revised
+				o.emit(Event{Type: EventAgent, Message: finalPlan})
+			}
+		case PlanAutoAccept:
+			autoAccept = true
+		case PlanManualApprove:
+			// keep confirmFn as-is
+		}
+	}
+
+	// Phase 2: Execute the review plan.
+	// If the original context was cancelled (e.g. user pressed ESC during
+	// review) but the user subsequently approved the plan, we need a fresh
+	// context for the executor — otherwise every LLM call returns immediately
+	// with context.Canceled.
+	execCtx := ctx
+	if ctx.Err() != nil {
+		execCtx = context.WithoutCancel(ctx)
+	}
+
+	o.emitPhase("executing")
+	o.emit(Event{Type: EventModeChange, Message: "edit"})
+	o.emit(Event{Type: EventAgent, Message: "▸ Executing review plan..."})
+
+	var confirmForExec ConfirmFunc
+	if !autoAccept {
+		confirmForExec = o.confirmFn
+	}
+
+	execStats, err := o.runExecutor(execCtx, finalPlan, confirmForExec)
+	if err != nil {
+		return errors.WithMessage(err, "executor")
+	}
+
+	o.emit(Event{Type: EventModeChange, Message: "plan"})
+	o.emit(Event{Type: EventDone, Message: "Code review completed", Stats: &execStats})
+	return nil
+}
+
+// extractReviewContext runs the extractor over concatenated specialist
+// reports and returns only the "context" paragraph from its JSON output.
+// The plan items are discarded — we use the deterministic merge for those.
+func (o *Orchestrator) extractReviewContext(ctx context.Context, concat string) (string, error) {
+	raw, err := o.runExtractor(ctx, concat)
+	if err != nil {
+		return "", err
+	}
+	raw = strings.TrimSpace(raw)
+	// Strip optional ```json fences.
+	raw = strings.TrimPrefix(raw, "```json")
+	raw = strings.TrimPrefix(raw, "```")
+	raw = strings.TrimSuffix(raw, "```")
+	raw = strings.TrimSpace(raw)
+
+	// Try JSON first: {"context": "...", "plan": [...]}
+	if start := strings.Index(raw, "{"); start >= 0 {
+		if end := strings.LastIndex(raw, "}"); end > start {
+			var payload struct {
+				Context string `json:"context"`
+			}
+			if jerr := json.Unmarshal([]byte(raw[start:end+1]), &payload); jerr != nil {
+				// Log the parse failure so operators can see why the extractor
+				// output was rejected. We still fall back to markdown below.
+				o.emit(Event{Type: EventAgent, Message: fmt.Sprintf("extractor JSON parse failed: %v", jerr)})
+			} else if c := strings.TrimSpace(payload.Context); c != "" {
+				return c, nil
+			}
+		}
+	}
+	// Fallback: look for a "## Context" markdown section.
+	if idx := strings.Index(raw, "## Context"); idx >= 0 {
+		rest := raw[idx+len("## Context"):]
+		if cut := strings.Index(rest, "## "); cut >= 0 {
+			rest = rest[:cut]
+		}
+		return strings.TrimSpace(rest), nil
+	}
+	return "", nil
+}
+
+// stripContextSection removes a leading "## Context ..." block from text,
+// returning only the remainder (typically starting at "## Plan").
+func stripContextSection(s string) string {
+	s = strings.TrimSpace(s)
+	if !strings.HasPrefix(s, "## Context") {
+		return s
+	}
+	if idx := strings.Index(s, "## Plan"); idx >= 0 {
+		return strings.TrimSpace(s[idx:])
+	}
+	return s
+}
+
+// reviewResult holds the outcome of a single specialist reviewer sub-agent.
+type reviewResult struct {
+	role Role
+	text string
+	err  error
+}
+
+// specialistFinding is a parsed line from a specialist's output in the
+// strict `path:LINE — SEVERITY — description` format.
+type specialistFinding struct {
+	file     string
+	line     int
+	severity string
+	body     string    // description part after the second separator
+	roles    []Role    // specialists that reported this finding (for dedup)
+	examples []Example // EXAMPLE: continuation lines parsed from reviewer output
+}
+
+// severityRank orders findings: blocker first, then major, then minor.
+func severityRank(s string) int {
+	switch strings.ToLower(s) {
+	case "blocker":
+		return 0
+	case "major":
+		return 1
+	case "minor":
+		return 2
+	}
+	return 3
+}
+
+// specialistFindingRe captures file, line, severity and body from a single
+// finding line. Accepts em-dash, en-dash or hyphen as separators and
+// tolerates optional leading list markers.
+var specialistFindingRe = regexp.MustCompile(
+	`(?i)^[\s\-*>0-9.)]*\**\s*([\w./\\-]+?):(\d+)\**\s*[—–\-:]+\s*\**(blocker|major|minor)\**\s*[—–\-:]+\s*(.+?)\**$`,
+)
+
+// exampleLineRe captures EXAMPLE: continuation lines from specialist output.
+// Format: EXAMPLE: path/to/file.go:LINE — reason
+var exampleLineRe = regexp.MustCompile(
+	`(?i)^\s*EXAMPLE:\s*([\w./\\-]+?):(\d+)\s*[—–\-]\s*(.+)$`,
+)
+
+// parseSpecialistFindings extracts strict finding lines from a specialist's
+// raw output. Non-matching lines (headers, prose) are ignored. EXAMPLE:
+// continuation lines are attached to the immediately preceding finding.
+func parseSpecialistFindings(text string, role Role) []specialistFinding {
+	var out []specialistFinding
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// Try EXAMPLE: continuation line first — attach to last finding.
+		if em := exampleLineRe.FindStringSubmatch(line); em != nil {
+			if len(out) > 0 {
+				exLine, _ := strconv.Atoi(em[2])
+				out[len(out)-1].examples = append(out[len(out)-1].examples, Example{
+					File: em[1],
+					Line: exLine,
+					Note: strings.TrimSpace(em[3]),
+				})
+			}
+			continue
+		}
+		m := specialistFindingRe.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		lineNo, err := strconv.Atoi(m[2])
+		if err != nil {
+			continue
+		}
+		out = append(out, specialistFinding{
+			file:     m[1],
+			line:     lineNo,
+			severity: strings.ToLower(m[3]),
+			body:     strings.TrimSpace(m[4]),
+			roles:    []Role{role},
+		})
+	}
+	return out
+}
+
+// mergeExamples appends examples from src into dst, deduplicating by file+line.
+func mergeExamples(dst, src []Example) []Example {
+	for _, s := range src {
+		found := false
+		for _, d := range dst {
+			if d.File == s.File && d.Line == s.Line {
+				found = true
+				break
+			}
+		}
+		if !found {
+			dst = append(dst, s)
+		}
+	}
+	return dst
+}
+
+// normalizeBody returns a key for deduplication: lowercase, trimmed, trailing
+// punctuation stripped.
+func normalizeBody(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.TrimRight(s, ".;,!?…")
+	return s
+}
+
+// isNoIssues reports whether text is a specialist "all clear" response.
+func isNoIssues(text string) bool {
+	return text == "" ||
+		strings.EqualFold(text, "LGTM") ||
+		strings.EqualFold(text, "NO_ISSUES")
+}
+
+// mergeSpecialistFindings collects findings from all specialist reviewers,
+// deduplicates (same file + same description → merge roles and group lines),
+// sorts by severity then file, and renders as a markdown plan. Returns "" if
+// no strict lines were parsed (caller should fall back to raw concatenation).
+func mergeSpecialistFindings(results []reviewResult) string {
+	var all []specialistFinding
+	var unparsed []specialistFinding
+	for _, r := range results {
+		if r.err != nil {
+			continue
+		}
+		parsed := parseSpecialistFindings(r.text, r.role)
+		if len(parsed) > 0 {
+			all = append(all, parsed...)
+			continue
+		}
+		txt := strings.TrimSpace(r.text)
+		if isNoIssues(txt) {
+			continue
+		}
+		for _, line := range strings.Split(r.text, "\n") {
+			line = strings.TrimSpace(strings.TrimLeft(line, "-*>0123456789.) "))
+			if isNoIssues(line) {
+				continue
+			}
+			unparsed = append(unparsed, specialistFinding{
+				file:     "(unstructured)",
+				severity: "minor",
+				body:     line,
+				roles:    []Role{r.role},
+			})
+		}
+	}
+	all = append(all, unparsed...)
+	if len(all) == 0 {
+		return ""
+	}
+
+	// --- Dedup phase B: merge same file:line:body from different specialists ---
+	type dedupKey struct {
+		file string
+		line int
+		body string
+	}
+	byExact := make(map[dedupKey]*specialistFinding)
+	var deduped []specialistFinding
+	for i := range all {
+		f := &all[i]
+		key := dedupKey{file: f.file, line: f.line, body: normalizeBody(f.body)}
+		if existing, ok := byExact[key]; ok {
+			// Merge roles, keep highest severity.
+			for _, r := range f.roles {
+				found := false
+				for _, er := range existing.roles {
+					if er == r {
+						found = true
+						break
+					}
+				}
+				if !found {
+					existing.roles = append(existing.roles, r)
+				}
+			}
+			if severityRank(f.severity) < severityRank(existing.severity) {
+				existing.severity = f.severity
+			}
+			// Merge examples from duplicate findings.
+			existing.examples = mergeExamples(existing.examples, f.examples)
+		} else {
+			clone := *f
+			byExact[key] = &clone
+			deduped = append(deduped, clone)
+		}
+	}
+	// Update deduped entries from map (roles may have been extended).
+	for i := range deduped {
+		key := dedupKey{file: deduped[i].file, line: deduped[i].line, body: normalizeBody(deduped[i].body)}
+		if updated, ok := byExact[key]; ok {
+			deduped[i] = *updated
+		}
+	}
+
+	// --- Dedup phase A: group same file:body across different lines ---
+	type groupKey struct {
+		file string
+		sev  string
+		body string
+	}
+	type lineGroup struct {
+		finding specialistFinding
+		lines   []int
+	}
+	byGroup := make(map[groupKey]*lineGroup)
+	var groupOrder []groupKey
+	for _, f := range deduped {
+		key := groupKey{file: f.file, sev: f.severity, body: normalizeBody(f.body)}
+		if g, ok := byGroup[key]; ok {
+			g.lines = append(g.lines, f.line)
+			// Merge roles.
+			for _, r := range f.roles {
+				found := false
+				for _, er := range g.finding.roles {
+					if er == r {
+						found = true
+						break
+					}
+				}
+				if !found {
+					g.finding.roles = append(g.finding.roles, r)
+				}
+			}
+			// Merge examples.
+			g.finding.examples = mergeExamples(g.finding.examples, f.examples)
+		} else {
+			g := &lineGroup{finding: f, lines: []int{f.line}}
+			byGroup[key] = g
+			groupOrder = append(groupOrder, key)
+		}
+	}
+
+	// Build final grouped findings.
+	var grouped []specialistFinding
+	for _, key := range groupOrder {
+		g := byGroup[key]
+		f := g.finding
+		f.line = g.lines[0] // first line for sorting
+		// Store all lines comma-separated in a helper field embedded in body.
+		if len(g.lines) > 1 {
+			sort.Ints(g.lines)
+			lineStrs := make([]string, len(g.lines))
+			for i, l := range g.lines {
+				lineStrs[i] = strconv.Itoa(l)
+			}
+			f.body = f.body + " (строки: " + strings.Join(lineStrs, ", ") + ")"
+		}
+		grouped = append(grouped, f)
+	}
+
+	// Sort: severity, then file, then first line.
+	sort.SliceStable(grouped, func(i, j int) bool {
+		if si, sj := severityRank(grouped[i].severity), severityRank(grouped[j].severity); si != sj {
+			return si < sj
+		}
+		if grouped[i].file != grouped[j].file {
+			return grouped[i].file < grouped[j].file
+		}
+		return grouped[i].line < grouped[j].line
+	})
+
+	var b strings.Builder
+	b.WriteString("## Plan\n\n")
+	for i, f := range grouped {
+		var roleStrs []string
+		for _, r := range f.roles {
+			roleStrs = append(roleStrs, string(r))
+		}
+		roles := strings.Join(roleStrs, ", ")
+		fmt.Fprintf(&b, "%d. %s:%d — %s — %s [%s]\n", i+1, f.file, f.line, f.severity, f.body, roles)
+		for _, ex := range f.examples {
+			fmt.Fprintf(&b, "   EXAMPLE: %s:%d — %s\n", ex.File, ex.Line, ex.Note)
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// runReviewerSpecialistInGroup runs a single specialist reviewer sub-agent
+// whose events are routed into the given TUI group. It returns the agent's
+// final plan text (LastPlan). Errors other than ErrMaxIterations are
+// returned; an empty result is not an error (treated as LGTM upstream).
+func (o *Orchestrator) runReviewerSpecialistInGroup(ctx context.Context, role Role, task, groupID string) (string, error) {
+	// Specialists must read every changed file before emitting findings, which
+	// on a 5-10 file diff eats ~10-15 iterations on tool calls alone. Cap the
+	// budget from below so the default maxRevIter (often 15) does not starve
+	// the analysis/output phases. maxRevIter stays the source of truth for
+	// the single-reviewer fallback.
+	iter := o.maxRevIter
+	if iter < 30 {
+		iter = 30
+	}
+	ag := o.newAgent(role, iter)
+	// Specialists should not emit a redundant start-label — the group
+	// header already says "Reviewing: security" etc. Their activity in the
+	// UI is expressed purely through tool calls landing in the group.
+	ag.SetTaskLabel("")
+	ag.SetGroupID(groupID)
+	prompt := systemPromptForRole(role, o.language, o.ruleCatalog, ag.reg.NamesFiltered(readOnlyTools), o.hasSnippets, o.hasRAG)
+	ag.InitWithPrompt(prompt)
+	if err := ag.Send(ctx, task); err != nil && !errors.Is(err, ErrMaxIterations) {
+		return "", err
+	}
+	return ag.LastPlan(), nil
+}
+
 func truncateTask(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s
 	}
 	return s[:maxLen] + "..."
+}
+
+// isConnectionError returns true when the error indicates that the LLM backend
+// (ollama) is unreachable — connection refused, DNS failure, or dial timeout.
+// Used by RunCodeReview as a circuit breaker trigger.
+func isConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "no such host") ||
+		strings.Contains(msg, "dial tcp")
 }

@@ -10,6 +10,7 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/rag"
 )
 
 // goTool is the base for all Go command tools.
@@ -237,27 +238,143 @@ func NewGoGetTool(workDir string) Tool {
 	}
 }
 
-// NewGoDocTool creates a go_doc tool.
-func NewGoDocTool(workDir string) Tool {
-	return &goTool{
-		workDir:     workDir,
-		name:        "go_doc",
-		description: "Run go doc to view documentation for a package or symbol",
-		command:     "go",
-		defaultArgs: []string{"doc"},
-		schema: ollama.JSONSchema{
-			Type: "object",
-			Properties: map[string]ollama.JSONSchema{
-				"packages": {Type: "string", Description: "Package or symbol to get documentation for, e.g. fmt.Println or encoding/json.Decoder"},
-				"flags":    {Type: "string", Description: "Additional flags, e.g. -all for full docs"},
+// GoDocIndexer is the interface for indexing and searching go doc output
+// in the godoc RAG sub-index. When nil, go_doc returns full output without
+// indexing or search.
+type GoDocIndexer interface {
+	Build(ctx context.Context, chunks []rag.Chunk) (int, error)
+	Save() error
+	Search(ctx context.Context, query string, topK int) ([]rag.SearchResult, error)
+}
+
+// goDocTool wraps goTool and optionally indexes output into RAG.
+type goDocTool struct {
+	goTool
+	indexer GoDocIndexer // nil when RAG is disabled
+}
+
+// godocSearchTopK is the default number of results for godoc semantic search.
+const godocSearchTopK = 5
+
+// NewGoDocTool creates a go_doc tool. If indexer is non-nil (RAG enabled),
+// the tool indexes go doc output into the godoc RAG sub-index and supports
+// semantic search over previously indexed documentation via the query parameter.
+func NewGoDocTool(workDir string, indexer GoDocIndexer) Tool {
+	return &goDocTool{
+		goTool: goTool{
+			workDir:     workDir,
+			name:        "go_doc",
+			description: "Run go doc to view/index package documentation, or search previously indexed Go docs by query",
+			command:     "go",
+			defaultArgs: []string{"doc"},
+			schema: ollama.JSONSchema{
+				Type: "object",
+				Properties: map[string]ollama.JSONSchema{
+					"packages": {Type: "string", Description: "Package or symbol to get documentation for, e.g. fmt.Println or encoding/json.Decoder"},
+					"flags":    {Type: "string", Description: "Additional flags, e.g. -all for full docs"},
+					"query":    {Type: "string", Description: "Semantic search query over previously indexed Go docs, e.g. 'format string verbs' or 'json decoder options'"},
+				},
 			},
-			Required: []string{"packages"},
 		},
+		indexer: indexer,
 	}
 }
 
+const goDocPreviewBytes = 500
+
+func (t *goDocTool) Execute(ctx context.Context, params map[string]any) (ToolResult, error) {
+	pkgPath, _ := params["packages"].(string)
+	query, _ := params["query"].(string)
+
+	// Search mode: query without packages.
+	if query != "" && pkgPath == "" {
+		return t.searchGodoc(ctx, query)
+	}
+
+	if pkgPath == "" {
+		return ToolResult{Error: "either packages or query is required", Success: false}, nil
+	}
+
+	result, err := t.goTool.Execute(ctx, params)
+	if err != nil || !result.Success {
+		return result, err
+	}
+
+	// No indexer — return full output as before.
+	if t.indexer == nil {
+		return result, nil
+	}
+
+	chunks := rag.ChunkGoDoc(pkgPath, result.Output, rag.MaxChunkBytes)
+	if len(chunks) == 0 {
+		return result, nil
+	}
+
+	n, buildErr := t.indexer.Build(ctx, chunks)
+	if buildErr != nil {
+		// Indexing failed — still return full output so the agent is not blocked.
+		return result, nil
+	}
+	_ = t.indexer.Save()
+
+	// Return a short preview + instruction to search.
+	preview := result.Output
+	if len(preview) > goDocPreviewBytes {
+		preview = preview[:goDocPreviewBytes] + "\n... (truncated)"
+	}
+
+	result.Output = fmt.Sprintf("Indexed documentation for %s (%d chunks, %d new). Use go_doc with query parameter to search indexed docs.\n\n%s",
+		pkgPath, len(chunks), n, preview)
+	if result.Meta == nil {
+		result.Meta = make(map[string]any)
+	}
+	result.Meta["indexed_chunks"] = len(chunks)
+
+	return result, nil
+}
+
+// searchGodoc performs semantic search over previously indexed Go documentation.
+func (t *goDocTool) searchGodoc(ctx context.Context, query string) (ToolResult, error) {
+	if t.indexer == nil {
+		return ToolResult{
+			Output:  "RAG is disabled. Run go_doc with packages parameter to view documentation directly.",
+			Success: true,
+		}, nil
+	}
+
+	results, err := t.indexer.Search(ctx, query, godocSearchTopK)
+	if err != nil {
+		return ToolResult{Error: fmt.Sprintf("doc search: %s", err), Success: false}, nil
+	}
+
+	if len(results) == 0 {
+		return ToolResult{
+			Output:  "No Go documentation found. Use go_doc with packages parameter first to index a package, then search with query.",
+			Success: true,
+		}, nil
+	}
+
+	var b strings.Builder
+	b.WriteString("[GO DOCUMENTATION]\n\n")
+	for i, r := range results {
+		fmt.Fprintf(&b, "--- Doc %d (%.2f) %s:%d-%d ---\n%s\n\n",
+			i+1, r.Score, r.Chunk.FilePath, r.Chunk.StartLine, r.Chunk.EndLine, r.Chunk.Content)
+	}
+
+	return ToolResult{
+		Output:  b.String(),
+		Success: true,
+		Meta: map[string]any{
+			"results": len(results),
+		},
+	}, nil
+}
+
 // RegisterGoTools registers Go-specific tools (build/test/vet/fmt/lint/etc.).
-func RegisterGoTools(reg *Registry, workDir string) {
+// The indexer is optional: when non-nil (RAG enabled) go_doc indexes its
+// output into the godoc RAG sub-index and supports semantic search via the
+// query parameter.
+func RegisterGoTools(reg *Registry, workDir string, indexer GoDocIndexer) {
 	reg.Register(NewGoBuildTool(workDir))
 	reg.Register(NewGoTestTool(workDir))
 	reg.Register(NewGoVetTool(workDir))
@@ -265,7 +382,7 @@ func RegisterGoTools(reg *Registry, workDir string) {
 	reg.Register(NewGoLintTool(workDir))
 	reg.Register(NewGoModTidyTool(workDir))
 	reg.Register(NewGoGetTool(workDir))
-	reg.Register(NewGoDocTool(workDir))
+	reg.Register(NewGoDocTool(workDir, indexer))
 }
 
 // BashTool executes arbitrary shell commands.

@@ -3,84 +3,63 @@ package rag
 import (
 	"context"
 	"path/filepath"
-	"sort"
-	"sync"
 	"time"
 
 	"github.com/raoptimus/kodrun/internal/ollama"
 )
 
-// commonKey is the subdirectory and map key used for the language-neutral
-// portion of a MultiIndex (project files, project rules, snippets).
+// commonKey is the subdirectory used for the single on-disk sub-index.
+// The name is preserved for backward compatibility with existing index
+// layouts on disk (`.kodrun/rag_index/common/index.json`).
 const commonKey = "common"
 
-// MultiIndex composes multiple per-language Index instances plus a shared
-// "common" Index for language-neutral chunks. Persistence is split: each
-// sub-index lives in its own subdirectory under basePath, so switching the
-// active language does not require re-embedding common chunks.
+// godocKey is the subdirectory for the Go documentation sub-index.
+const godocKey = "godoc"
+
+// MultiIndex wraps a single Index sub-directory. Historically it supported
+// per-language sub-indexes so that switching the active project language
+// would not require re-embedding language-neutral chunks, but RAG now only
+// indexes project conventions (rules / snippets / docs / embedded language
+// standards) — none of which are language-partitioned — so a single common
+// sub-index is sufficient. The MultiIndex wrapper is kept purely to avoid
+// churning every caller; the name is historical.
 type MultiIndex struct {
-	mu         sync.RWMutex
-	basePath   string
-	client     *ollama.Client
-	model      string
-	common     *Index
-	byLang     map[string]*Index
-	activeLang string
+	basePath string
+	common   *Index
+	godoc    *Index
+	web      *Index // in-memory, session-scoped; never persisted to disk
 }
 
 // NewMultiIndex creates a new MultiIndex rooted at basePath.
-// The common sub-index is created eagerly; per-language sub-indices are
-// instantiated on demand.
 func NewMultiIndex(client *ollama.Client, model, basePath string) *MultiIndex {
 	return &MultiIndex{
 		basePath: basePath,
-		client:   client,
-		model:    model,
 		common:   NewIndex(client, model, filepath.Join(basePath, commonKey)),
-		byLang:   make(map[string]*Index),
+		godoc:    NewIndex(client, model, filepath.Join(basePath, godocKey)),
+		web:      NewIndex(client, model, ""), // in-memory only
 	}
 }
 
-// SetActiveLanguage sets the language whose sub-index participates in Search.
-// Empty string disables per-language search and uses only the common index.
-func (m *MultiIndex) SetActiveLanguage(lang string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.activeLang = lang
-}
+// BasePath returns the root directory the index is stored under.
+func (m *MultiIndex) BasePath() string { return m.basePath }
 
-// ActiveLanguage returns the currently active language tag.
-func (m *MultiIndex) ActiveLanguage() string {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.activeLang
-}
-
-// langIndex returns the sub-index for lang, creating it if needed.
-func (m *MultiIndex) langIndex(lang string) *Index {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if idx, ok := m.byLang[lang]; ok {
-		return idx
-	}
-	idx := NewIndex(m.client, m.model, filepath.Join(m.basePath, lang))
-	m.byLang[lang] = idx
-	return idx
-}
-
-// LoadCommon loads the common sub-index from disk.
+// LoadCommon loads the sub-index from disk.
 func (m *MultiIndex) LoadCommon() error { return m.common.Load() }
 
-// LoadLanguage loads the per-language sub-index from disk, creating an
-// empty one if no file exists yet.
-func (m *MultiIndex) LoadLanguage(lang string) error {
-	if lang == "" {
-		return nil
-	}
-	return m.langIndex(lang).Load()
+// Reset wipes the sub-index both in memory and on disk. /reindex uses it
+// to start every rebuild from a clean slate.
+func (m *MultiIndex) Reset() error { return m.common.Reset() }
+
+// HasLegacyCodeChunks reports whether the loaded index contains entries
+// whose FilePath points at real source files (not rules://, snippets://,
+// embedded:// or files under a /docs/ directory). Such entries are leftovers
+// from earlier kodrun versions that indexed project code; they must be
+// wiped on startup so stale snippets cannot surface in /code-review.
+func (m *MultiIndex) HasLegacyCodeChunks() bool {
+	return m.common.hasLegacyCodeChunks()
 }
 
-// BuildCommon embeds chunks into the common sub-index.
+// BuildCommon embeds chunks into the sub-index.
 func (m *MultiIndex) BuildCommon(ctx context.Context, chunks []Chunk) (int, error) {
 	return m.common.Build(ctx, chunks)
 }
@@ -91,109 +70,102 @@ func (m *MultiIndex) BuildCommonWithProgress(ctx context.Context, chunks []Chunk
 	return m.common.BuildWithProgress(ctx, chunks, progress)
 }
 
-// BuildLanguage embeds chunks into the per-language sub-index.
-func (m *MultiIndex) BuildLanguage(ctx context.Context, lang string, chunks []Chunk) (int, error) {
-	if lang == "" {
-		return 0, nil
-	}
-	return m.langIndex(lang).Build(ctx, chunks)
-}
-
-// Build is a convenience alias for BuildCommon used by callers that
-// add language-neutral content (e.g. /add_doc, /reindex).
+// Build is a convenience alias for BuildCommon used by callers that add
+// language-neutral content (e.g. /add_doc, /reindex).
 func (m *MultiIndex) Build(ctx context.Context, chunks []Chunk) (int, error) {
 	return m.BuildCommon(ctx, chunks)
 }
 
-// Save persists every loaded sub-index. Alias for SaveAll.
-func (m *MultiIndex) Save() error { return m.SaveAll() }
+// Save persists the sub-index.
+func (m *MultiIndex) Save() error { return m.common.Save() }
 
-// SaveCommon writes the common sub-index to disk.
+// SaveCommon writes the sub-index to disk.
 func (m *MultiIndex) SaveCommon() error { return m.common.Save() }
 
-// SaveLanguage writes the per-language sub-index to disk.
-func (m *MultiIndex) SaveLanguage(lang string) error {
-	if lang == "" {
-		return nil
-	}
-	return m.langIndex(lang).Save()
-}
-
-// SaveAll writes the common index and every loaded per-language index.
-func (m *MultiIndex) SaveAll() error {
-	if err := m.common.Save(); err != nil {
-		return err
-	}
-	m.mu.RLock()
-	langs := make([]string, 0, len(m.byLang))
-	for l := range m.byLang {
-		langs = append(langs, l)
-	}
-	m.mu.RUnlock()
-	for _, l := range langs {
-		if err := m.SaveLanguage(l); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// Search returns the top-k chunks across the common sub-index and the
-// active language sub-index combined. Results from both pools compete on
-// similarity score and the global top-k is returned.
+// Search returns the top-k chunks matching query from the sub-index.
 func (m *MultiIndex) Search(ctx context.Context, query string, topK int) ([]SearchResult, error) {
-	common, err := m.common.Search(ctx, query, topK)
-	if err != nil {
-		return nil, err
-	}
-
-	m.mu.RLock()
-	lang := m.activeLang
-	langIdx := m.byLang[lang]
-	m.mu.RUnlock()
-
-	var langResults []SearchResult
-	if lang != "" && langIdx != nil {
-		langResults, err = langIdx.Search(ctx, query, topK)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	if len(langResults) == 0 {
-		return common, nil
-	}
-
-	merged := make([]SearchResult, 0, len(common)+len(langResults))
-	merged = append(merged, common...)
-	merged = append(merged, langResults...)
-	sort.Slice(merged, func(i, j int) bool { return merged[i].Score > merged[j].Score })
-	if topK > 0 && len(merged) > topK {
-		merged = merged[:topK]
-	}
-	return merged, nil
+	return m.common.Search(ctx, query, topK)
 }
 
-// Size returns the total number of indexed entries across all sub-indices.
-func (m *MultiIndex) Size() int {
-	total := m.common.Size()
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	for _, idx := range m.byLang {
-		total += idx.Size()
-	}
-	return total
+// Size returns the number of indexed entries.
+func (m *MultiIndex) Size() int { return m.common.Size() }
+
+// Updated returns the most recent update timestamp.
+func (m *MultiIndex) Updated() time.Time { return m.common.Updated() }
+
+// LoadGodoc loads the godoc sub-index from disk.
+func (m *MultiIndex) LoadGodoc() error { return m.godoc.Load() }
+
+// BuildGodoc embeds Go documentation chunks into the godoc sub-index.
+func (m *MultiIndex) BuildGodoc(ctx context.Context, chunks []Chunk) (int, error) {
+	return m.godoc.Build(ctx, chunks)
 }
 
-// Updated returns the most recent update timestamp across sub-indices.
-func (m *MultiIndex) Updated() time.Time {
-	latest := m.common.Updated()
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	for _, idx := range m.byLang {
-		if u := idx.Updated(); u.After(latest) {
-			latest = u
-		}
-	}
-	return latest
+// SaveGodoc persists the godoc sub-index to disk.
+func (m *MultiIndex) SaveGodoc() error { return m.godoc.Save() }
+
+// SearchGodoc returns the top-k chunks matching query from the godoc sub-index.
+func (m *MultiIndex) SearchGodoc(ctx context.Context, query string, topK int) ([]SearchResult, error) {
+	return m.godoc.Search(ctx, query, topK)
+}
+
+// ResetGodoc wipes the godoc sub-index both in memory and on disk.
+func (m *MultiIndex) ResetGodoc() error { return m.godoc.Reset() }
+
+// GodocSize returns the number of entries in the godoc sub-index.
+func (m *MultiIndex) GodocSize() int { return m.godoc.Size() }
+
+// BuildWeb embeds chunks into the in-memory web sub-index.
+func (m *MultiIndex) BuildWeb(ctx context.Context, chunks []Chunk) (int, error) {
+	return m.web.Build(ctx, chunks)
+}
+
+// SearchWeb returns the top-k chunks matching query from the web sub-index.
+func (m *MultiIndex) SearchWeb(ctx context.Context, query string, topK int) ([]SearchResult, error) {
+	return m.web.Search(ctx, query, topK)
+}
+
+// WebSize returns the number of entries in the web sub-index.
+func (m *MultiIndex) WebSize() int { return m.web.Size() }
+
+// GodocIndexer returns an adapter that satisfies the tools.GoDocIndexer
+// interface by delegating to the godoc sub-index.
+func (m *MultiIndex) GodocIndexer() *godocIndexerAdapter {
+	return &godocIndexerAdapter{m: m}
+}
+
+// godocIndexerAdapter adapts MultiIndex to the GoDocIndexer interface
+// (Build + Save) by routing to the godoc sub-index methods.
+type godocIndexerAdapter struct {
+	m *MultiIndex
+}
+
+func (a *godocIndexerAdapter) Build(ctx context.Context, chunks []Chunk) (int, error) {
+	return a.m.BuildGodoc(ctx, chunks)
+}
+
+func (a *godocIndexerAdapter) Save() error {
+	return a.m.SaveGodoc()
+}
+
+func (a *godocIndexerAdapter) Search(ctx context.Context, query string, topK int) ([]SearchResult, error) {
+	return a.m.SearchGodoc(ctx, query, topK)
+}
+
+// WebIndexer returns an adapter for the in-memory web sub-index.
+func (m *MultiIndex) WebIndexer() *webIndexerAdapter {
+	return &webIndexerAdapter{m: m}
+}
+
+// webIndexerAdapter adapts MultiIndex to the tools.WebIndexer interface.
+type webIndexerAdapter struct {
+	m *MultiIndex
+}
+
+func (a *webIndexerAdapter) Build(ctx context.Context, chunks []Chunk) (int, error) {
+	return a.m.BuildWeb(ctx, chunks)
+}
+
+func (a *webIndexerAdapter) Search(ctx context.Context, query string, topK int) ([]SearchResult, error) {
+	return a.m.SearchWeb(ctx, query, topK)
 }

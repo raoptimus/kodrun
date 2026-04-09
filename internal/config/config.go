@@ -130,7 +130,7 @@ type AgentConfig struct {
 	MaxIterations     int    `mapstructure:"max_iterations"`
 	MaxParallelTasks  int    `mapstructure:"max_parallel_tasks"`
 	MaxReplans        int    `mapstructure:"max_replans"`
-	MaxWorkers    int    `mapstructure:"max_workers"`
+	MaxToolWorkers int   `mapstructure:"max_tool_workers"`
 	AutoFix       bool   `mapstructure:"auto_fix"`
 	AutoCommit    bool   `mapstructure:"auto_commit"`
 	DefaultMode   string `mapstructure:"default_mode"`
@@ -169,14 +169,32 @@ type SnippetsConfig struct {
 // referenced by Provider — there is no per-RAG embedding_model field. To
 // switch embedding model, define a dedicated profile in `providers:` and
 // point `rag.provider` at it.
+//
+// Scope: RAG indexes project conventions only — files under
+// `.kodrun/rules/`, `.kodrun/snippets/`, `.kodrun/docs/`, plus embedded
+// language standards (e.g. Effective Go). Project source code is NOT
+// indexed: chunked code snapshots go stale between reindexes and lead to
+// reviewers citing code that no longer exists. Live `read_file` calls are
+// the authoritative view of source files.
 type RAGConfig struct {
-	Provider     string   `mapstructure:"provider"`
-	Enabled      bool     `mapstructure:"enabled"`
-	IndexDirs    []string `mapstructure:"index_dirs"`
+	Provider string `mapstructure:"provider"`
+	Enabled  bool   `mapstructure:"enabled"`
+	// Deprecated: kodrun no longer indexes project source code. Only
+	// .kodrun/rules, .kodrun/snippets, .kodrun/docs and embedded language
+	// standards are indexed. The field is kept so old configs continue to
+	// parse, but it is ignored at runtime.
+	IndexDirs []string `mapstructure:"index_dirs"`
+	// Deprecated: no longer used — see IndexDirs.
+	ExcludeDirs  []string `mapstructure:"exclude_dirs"`
 	ChunkSize    int      `mapstructure:"chunk_size"`
 	ChunkOverlap int      `mapstructure:"chunk_overlap"`
-	TopK         int      `mapstructure:"top_k"`
-	IndexPath    string   `mapstructure:"index_path"`
+	// Deprecated: no longer used — see IndexDirs.
+	MaxChunksPerFile int `mapstructure:"max_chunks_per_file"`
+	TopK             int `mapstructure:"top_k"`
+	// ReviewBudgetBytes caps the size of the RAG prefetch block injected
+	// into /code-review prompts. 0 falls back to the built-in default.
+	ReviewBudgetBytes int    `mapstructure:"review_budget_bytes"`
+	IndexPath         string `mapstructure:"index_path"`
 }
 
 // Defaults returns a Config with default values.
@@ -191,7 +209,7 @@ func Defaults() Config {
 		Agent: AgentConfig{
 			Provider:         "default",
 			MaxIterations:    50,
-			MaxWorkers:       4,
+			MaxToolWorkers:       4,
 			MaxParallelTasks: 1,
 			MaxReplans:       2,
 			AutoFix:       true,
@@ -218,12 +236,15 @@ func Defaults() Config {
 			UseTool: true,
 		},
 		RAG: RAGConfig{
-			Enabled:      false,
-			IndexDirs:    []string{"."},
-			ChunkSize:    128,
-			ChunkOverlap: 64,
-			TopK:         5,
-			IndexPath:    ".kodrun/rag_index",
+			Enabled:           false,
+			IndexDirs:         []string{"."},
+			ExcludeDirs:       []string{".claude", ".git", "vendor", "node_modules", ".kodrun/rag_index"},
+			ChunkSize:         128,
+			ChunkOverlap:      16,
+			MaxChunksPerFile:  8,
+			TopK:              5,
+			ReviewBudgetBytes: 24 * 1024,
+			IndexPath:         ".kodrun/rag_index",
 		},
 		TUI: TUIConfig{
 			MaxHistory: 100,
@@ -244,7 +265,7 @@ func Load(ctx context.Context, configPath, workDir string) (Config, error) {
 	v.SetDefault("ollama.timeout", cfg.Ollama.Timeout)
 	v.SetDefault("ollama.context_size", cfg.Ollama.ContextSize)
 	v.SetDefault("agent.max_iterations", cfg.Agent.MaxIterations)
-	v.SetDefault("agent.max_workers", cfg.Agent.MaxWorkers)
+	v.SetDefault("agent.max_tool_workers", cfg.Agent.MaxToolWorkers)
 	v.SetDefault("agent.auto_fix", cfg.Agent.AutoFix)
 	v.SetDefault("agent.auto_commit", cfg.Agent.AutoCommit)
 	v.SetDefault("agent.default_mode", cfg.Agent.DefaultMode)
@@ -359,8 +380,8 @@ func (c *Config) Validate(_ context.Context) error {
 	if c.Agent.MaxIterations <= 0 {
 		c.Agent.MaxIterations = 50
 	}
-	if c.Agent.MaxWorkers <= 0 {
-		c.Agent.MaxWorkers = 1
+	if c.Agent.MaxToolWorkers <= 0 {
+		c.Agent.MaxToolWorkers = 1
 	}
 	if c.Agent.MaxParallelTasks <= 0 {
 		c.Agent.MaxParallelTasks = 1

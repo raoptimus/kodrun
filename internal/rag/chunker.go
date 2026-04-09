@@ -34,10 +34,45 @@ func ChunkFile(filePath string, chunkSize, chunkOverlap int) ([]Chunk, error) {
 	return splitIntoChunks(filePath, content, chunkSize, chunkOverlap), nil
 }
 
+// ChunkOptions carries optional chunking controls. A zero value is safe:
+// empty ExcludeDirs means "skip only the built-in noise directories"
+// (.git, vendor, node_modules, any dot-prefixed dir), and MaxChunksPerFile=0
+// disables the per-file cap.
+type ChunkOptions struct {
+	// ExcludeDirs are directory names or workDir-relative paths to skip
+	// in addition to the built-in defaults. An entry like ".claude" skips
+	// every directory with that base name; "tmp/fixtures" skips that
+	// specific relative path under workDir.
+	ExcludeDirs []string
+	// MaxChunksPerFile caps how many chunks a single file can contribute.
+	// 0 means unlimited.
+	MaxChunksPerFile int
+}
+
 // ChunkFiles walks the given directories and splits files into chunks.
 // It respects forbidden patterns and only processes text-like files.
 func ChunkFiles(ctx context.Context, workDir string, dirs []string, chunkSize, chunkOverlap int) ([]Chunk, error) {
+	return ChunkFilesOpts(ctx, workDir, dirs, chunkSize, chunkOverlap, ChunkOptions{})
+}
+
+// ChunkFilesOpts is ChunkFiles with explicit ChunkOptions.
+func ChunkFilesOpts(ctx context.Context, workDir string, dirs []string, chunkSize, chunkOverlap int, opts ChunkOptions) ([]Chunk, error) {
 	var chunks []Chunk
+
+	// Pre-compute exclude sets for O(1) lookup.
+	excludeBase := map[string]bool{}
+	var excludeRel []string
+	for _, e := range opts.ExcludeDirs {
+		e = strings.TrimSpace(e)
+		if e == "" {
+			continue
+		}
+		if strings.ContainsRune(e, filepath.Separator) {
+			excludeRel = append(excludeRel, filepath.Clean(e))
+		} else {
+			excludeBase[e] = true
+		}
+	}
 
 	seen := make(map[string]bool)
 	for _, dir := range dirs {
@@ -57,6 +92,18 @@ func ChunkFiles(ctx context.Context, workDir string, dirs []string, chunkSize, c
 				base := filepath.Base(path)
 				if strings.HasPrefix(base, ".") || base == "vendor" || base == "node_modules" {
 					return filepath.SkipDir
+				}
+				if excludeBase[base] {
+					return filepath.SkipDir
+				}
+				if len(excludeRel) > 0 {
+					rel, _ := filepath.Rel(workDir, path)
+					rel = filepath.Clean(rel)
+					for _, ex := range excludeRel {
+						if rel == ex || strings.HasPrefix(rel, ex+string(filepath.Separator)) {
+							return filepath.SkipDir
+						}
+					}
 				}
 				return nil
 			}
@@ -82,6 +129,9 @@ func ChunkFiles(ctx context.Context, workDir string, dirs []string, chunkSize, c
 			}
 
 			fileChunks := splitIntoChunks(relPath, content, chunkSize, chunkOverlap)
+			if opts.MaxChunksPerFile > 0 && len(fileChunks) > opts.MaxChunksPerFile {
+				fileChunks = fileChunks[:opts.MaxChunksPerFile]
+			}
 			chunks = append(chunks, fileChunks...)
 			return nil
 		})
@@ -91,6 +141,12 @@ func ChunkFiles(ctx context.Context, workDir string, dirs []string, chunkSize, c
 	}
 
 	return chunks, nil
+}
+
+// ChunkText splits arbitrary text into chunks. The source parameter is used
+// as FilePath in the resulting chunks (e.g. "web://example.com/page").
+func ChunkText(source, content string, chunkSize, chunkOverlap int) []Chunk {
+	return splitIntoChunks(source, content, chunkSize, chunkOverlap)
 }
 
 func splitIntoChunks(filePath, content string, chunkSize, overlap int) []Chunk {

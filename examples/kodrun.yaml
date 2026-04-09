@@ -81,13 +81,13 @@ agent:
   # --------------------------------------------------------------------------
   provider: default              # chat + default fallback for unset roles
   thinking_provider: thinking    # planner + reviewer
-  executor_provider: default     # executor + step_executor (try `precise` for stricter edits)
+  executor_provider: default     # executor + step_executor — set to `precise` (T=0.2) if your local model answers EDIT tasks with markdown plans instead of tool calls
   extractor_provider: default    # extractor + structurer (json/temp=0 forced)
 
   # --------------------------------------------------------------------------
   # 3. CONCURRENCY — two independent levels of parallelism.
   #
-  #   max_workers        — parallel read-only TOOL CALLS inside ONE sub-agent.
+  #   max_tool_workers   — parallel read-only TOOL CALLS inside ONE sub-agent.
   #                        Each chat turn may produce many tool calls; this
   #                        caps how many run concurrently. Default 4.
   #
@@ -102,7 +102,7 @@ agent:
   #                        executor emits REPLAN when the approved plan lacks
   #                        context. Default 2.
   # --------------------------------------------------------------------------
-  max_workers: 4
+  max_tool_workers: 4
   max_parallel_tasks: 1
   max_replans: 2
 
@@ -160,17 +160,31 @@ rag:
   # Provider name for embedding (from providers section above). The provider's
   # `model` field IS the embedding model — there is no separate setting here.
   provider: embed
-  # Enable RAG (semantic search over the project)
+  # Enable RAG (semantic search over project conventions).
+  #
+  # Scope: RAG indexes ONLY project conventions — files under .kodrun/rules/,
+  # .kodrun/snippets/, .kodrun/docs/, plus embedded language standards (e.g.
+  # Effective Go). Project source code is intentionally NOT indexed: chunked
+  # code snapshots go stale between reindexes and lead reviewers to cite code
+  # that no longer exists. Source files are read live via the `read_file`
+  # tool, which is always authoritative.
   enabled: false
-  # Directories to index
-  index_dirs:
-    - "."
-  # Chunk size (in lines)
-  chunk_size: 512
-  # Overlap between chunks (in lines)
-  chunk_overlap: 64
+  # Deprecated: no longer used. Kept for backward compatibility — kodrun no
+  # longer indexes project source code. Remove these fields from your config.
+  # index_dirs:
+  #   - "."
+  # exclude_dirs:
+  #   - ".git"
+  # max_chunks_per_file: 8
+  # Chunk size (in lines) — applies to rules/snippets/docs chunking.
+  chunk_size: 128
+  # Overlap between chunks (in lines). Lower values reduce index duplication.
+  chunk_overlap: 16
   # Number of search results
   top_k: 5
+  # Hard cap on the RAG prefetch block injected into /code-review prompts.
+  # 0 falls back to the built-in default (24 KB).
+  review_budget_bytes: 24576
   # Index storage path
   index_path: ".kodrun/rag_index"
 
