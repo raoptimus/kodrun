@@ -41,17 +41,19 @@ func (m Mode) String() string {
 
 // readOnlyTools is the set of tools allowed in plan mode.
 var readOnlyTools = map[string]bool{
-	"read_file":   true,
-	"list_dir":    true,
-	"find_files":  true,
-	"grep":        true,
-	"get_rule":    true,
-	"snippets":    true,
-	"search_docs": true,
-	"go_doc":      true,
-	"git_status":  true,
-	"git_diff":    true,
-	"git_log":     true,
+	"read_file":          true,
+	"read_changed_files": true,
+	"web_fetch":          true,
+	"list_dir":           true,
+	"find_files":         true,
+	"grep":               true,
+	"get_rule":           true,
+	"snippets":           true,
+	"search_docs":        true,
+	"go_doc":             true,
+	"git_status":         true,
+	"git_diff":           true,
+	"git_log":            true,
 }
 
 // EventHandler receives agent events for display.
@@ -59,7 +61,14 @@ type EventHandler func(event Event)
 
 // Event represents an agent lifecycle event.
 type Event struct {
-	Type               EventType
+	Type EventType
+	// GroupID optionally associates the event with a named collapsible group
+	// in the TUI. When non-empty, EventAgent/EventTool events are routed
+	// into that group's log buffer instead of the main log. The group is
+	// created by an EventGroupStart and closed by an EventGroupEnd carrying
+	// the same GroupID. Events without GroupID retain the legacy single-
+	// active-group behaviour.
+	GroupID            string
 	Message            string
 	Tool               string
 	Success            bool
@@ -84,6 +93,13 @@ type Event struct {
 	ProgressDone  int
 	ProgressTotal int
 	ProgressLabel string
+
+	// CacheHit is true when the tool result was served from cache.
+	CacheHit bool
+
+	// FullOutput carries the complete tool result for the transcript view.
+	// Only populated on EventTool events; empty for other event types.
+	FullOutput string
 }
 
 // SessionStats accumulates statistics for the current task execution.
@@ -158,6 +174,7 @@ const (
 	EventCompact
 	EventGroupStart
 	EventGroupEnd
+	EventGroupTitleUpdate
 	EventModeChange
 	// EventPhase signals an orchestrator phase transition (planning, executing,
 	// reviewing). Message holds the phase name.
@@ -200,7 +217,10 @@ type Agent struct {
 	stats               SessionStats
 	hasSnippets         bool
 	hasRAG              bool
+	taskLabel           string
+	groupID             string
 	ragIndex            tools.RAGSearcher
+	godocIndexer        tools.GoDocIndexer
 	langState           *projectlang.State
 	pool                *WorkerPool
 	extraConfirmTools   map[string]bool
@@ -221,6 +241,12 @@ type Agent struct {
 	// drifting into open-ended exploration after a plan has been approved.
 	// Empty/nil means no restriction.
 	allowedReadPaths map[string]struct{}
+
+	// editNudges counts how many times the current Send() invocation has
+	// pushed a "stop describing, call tools" follow-up message into history
+	// because the model returned a markdown plan instead of tool calls in
+	// EDIT mode. Reset at the start of every Send. See nudgeOrTerminate.
+	editNudges int
 }
 
 // New creates a new Agent.
@@ -267,6 +293,23 @@ func (a *Agent) SetAutoCompact(enabled bool) {
 	a.autoCompact = enabled
 }
 
+// SetTaskLabel sets a human-readable label that Send() emits instead of the
+// generic "Processing task..." message, so the TUI can show which sub-agent
+// is currently working (e.g. "Reviewing: security"). Empty string disables
+// the start-of-task status line entirely (useful for sub-agents that run
+// inside a group and whose activity is expressed by tool events).
+func (a *Agent) SetTaskLabel(label string) {
+	a.taskLabel = label
+}
+
+// SetGroupID associates every event this agent emits with the given TUI
+// group. Sub-agents running concurrently inside their own collapsible
+// group (e.g. parallel specialist reviewers) set this so their tool calls
+// and status messages do not pollute the main log or another agent's group.
+func (a *Agent) SetGroupID(id string) {
+	a.groupID = id
+}
+
 // SetHasSnippets marks that the snippets tool is available.
 func (a *Agent) SetHasSnippets(v bool) {
 	a.hasSnippets = v
@@ -280,6 +323,12 @@ func (a *Agent) SetHasRAG(v bool) {
 // SetRAGIndex sets the RAG index for automatic context prefetch.
 func (a *Agent) SetRAGIndex(idx tools.RAGSearcher) {
 	a.ragIndex = idx
+}
+
+// SetGodocIndexer sets the Go documentation RAG indexer used by go_doc
+// for lazy language tool re-registration.
+func (a *Agent) SetGodocIndexer(idx tools.GoDocIndexer) {
+	a.godocIndexer = idx
 }
 
 // SetLanguageState wires a project-language state for lazy re-detection.
@@ -305,8 +354,8 @@ func (a *Agent) WorkDir() string {
 	return a.workDir
 }
 
-// SetMaxWorkers configures the worker pool for parallel tool execution.
-func (a *Agent) SetMaxWorkers(n int) {
+// SetMaxToolWorkers configures the worker pool for parallel tool execution.
+func (a *Agent) SetMaxToolWorkers(n int) {
 	a.pool = NewWorkerPool(n)
 }
 
@@ -500,9 +549,16 @@ func (a *Agent) autoSave() {
 }
 
 func (a *Agent) emit(e Event) {
-	if a.onEvent != nil {
-		a.onEvent(e)
+	if a.onEvent == nil {
+		return
 	}
+	// Stamp the caller's group id if the event does not already carry one.
+	// This is how sub-agents inherit their parent group in the TUI without
+	// every call site having to know about groups.
+	if e.GroupID == "" && a.groupID != "" {
+		e.GroupID = a.groupID
+	}
+	a.onEvent(e)
 }
 
 // Init initializes the agent with system prompt. Call once before Send().
@@ -602,7 +658,7 @@ func (a *Agent) ensureLanguageDetected() {
 	if !changed || lang == projectlang.LangUnknown {
 		return
 	}
-	tools.RegisterLanguageTools(a.reg, lang, a.workDir)
+	tools.RegisterLanguageTools(a.reg, lang, a.workDir, a.godocIndexer)
 	a.emit(Event{Type: EventAgent, Message: fmt.Sprintf("Project language detected: %s — language tools registered", lang)})
 }
 
@@ -622,8 +678,15 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 	a.history = append(a.history, ollama.Message{Role: "user", Content: userContent})
 	a.stats.reset()
 	a.planBuf.Reset()
+	a.editNudges = 0
 
-	a.emit(Event{Type: EventAgent, Message: "Processing task..."})
+	// Emit a start-of-task status line only when a label was set. Sub-agents
+	// that live inside a collapsible group (parallel specialist reviewers)
+	// set an empty label on purpose so their activity in the UI is limited
+	// to actual tool calls, keeping the group tail free for read_file/etc.
+	if a.taskLabel != "" {
+		a.emit(Event{Type: EventAgent, Message: a.taskLabel})
+	}
 
 	for range a.maxIter {
 		if ctx.Err() != nil {
@@ -711,8 +774,22 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 		}
 		a.history = append(a.history, msg)
 
-		// No tool calls = final response
+		// No tool calls = candidate final response.
 		if len(resp.ToolCalls) == 0 {
+			// EDIT-mode nudge: local models routinely answer an action task
+			// with a markdown plan instead of calling write_file/edit_file.
+			// Detect that pattern and push one or two follow-ups before
+			// giving up. This is the safety net behind the EDIT system
+			// prompt — it does not fix the model, only the symptom.
+			if a.mode == ModeEdit && a.editNudges < maxEditNudges && looksLikeMarkdownPlan(resp.Content) {
+				a.editNudges++
+				a.emit(Event{Type: EventAgent, Message: fmt.Sprintf("Model responded with text instead of tool calls; nudging (%d/%d)...", a.editNudges, maxEditNudges)})
+				a.history = append(a.history, ollama.Message{
+					Role: "user",
+					Content: "Stop. You are in EDIT mode. Do NOT describe the changes — apply them now via write_file/edit_file/bash. Begin with the first tool call. Do not explain. Do not output another plan.",
+				})
+				continue
+			}
 			if a.mode == ModePlan {
 				if resp.Content != "" {
 					a.planBuf.WriteString(resp.Content)
@@ -725,6 +802,9 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 				}
 			} else if resp.Content != "" {
 				a.emit(Event{Type: EventAgent, Message: resp.Content})
+				if a.editNudges >= maxEditNudges {
+					a.emit(Event{Type: EventAgent, Message: fmt.Sprintf("Model returned text-only response in EDIT mode after %d nudges — aborting without changes. Consider using a stronger model or lowering executor temperature (see executor_provider: precise).", maxEditNudges)})
+				}
 			}
 			a.stats.AvgTkPerSec = a.stats.avgTkPerSec()
 			a.emit(Event{Type: EventDone, Message: "Done", Stats: &a.stats})
@@ -959,15 +1039,42 @@ func (a *Agent) emitToolResult(tc ollama.ToolCall, result tools.ToolResult) {
 	// For read-only tools, show detail (path) instead of output content.
 	msg := truncate(result.Output, 200)
 	if readOnlyTools[tc.Function.Name] {
-		msg = toolDetail(tc.Function.Name, tc.Function.Arguments)
+		detail := toolDetail(tc.Function.Name, tc.Function.Arguments)
+		if detail != "" {
+			msg = detail
+		} else if !result.Success && result.Error != "" {
+			msg = truncate(result.Error, 120)
+		}
 	}
+	// For batch-read tools, show file list from result meta.
+	if msg == "" && result.Meta != nil {
+		if fl, ok := result.Meta["file_list"].([]string); ok && len(fl) > 0 {
+			msg = strings.Join(fl, ", ")
+			if len(msg) > 120 {
+				msg = msg[:120] + "..."
+			}
+		}
+	}
+	// Build full output for transcript view (same truncation as LLM history).
+	fullOutput := result.Output
+	if !result.Success && result.Error != "" {
+		fullOutput = "Error: " + result.Error
+	}
+	if len(fullOutput) > maxToolResultBytes {
+		fullOutput = fullOutput[:maxToolResultBytes] + "\n... [truncated]"
+	}
+
 	ev := Event{
-		Type:    EventTool,
-		Tool:    tc.Function.Name,
-		Message: msg,
-		Success: result.Success,
+		Type:       EventTool,
+		Tool:       tc.Function.Name,
+		Message:    msg,
+		Success:    result.Success,
+		FullOutput: fullOutput,
 	}
 	if result.Meta != nil {
+		if v, ok := result.Meta["cache_hit"].(bool); ok && v {
+			ev.CacheHit = true
+		}
 		if v, ok := result.Meta["action"].(string); ok {
 			ev.FileAction = v
 		}
@@ -1119,11 +1226,21 @@ func toolDetail(name string, args map[string]any) string {
 		pattern, _ := args["pattern"].(string)
 		path, _ := args["path"].(string)
 		return fmt.Sprintf("%q in %s", pattern, path)
-	case "go_build", "go_test", "go_lint", "go_vet", "go_doc":
+	case "go_build", "go_test", "go_lint", "go_vet":
 		if p, ok := args["packages"].(string); ok && p != "" {
 			return p
 		}
 		return "./..."
+	case "go_doc":
+		if p, ok := args["packages"].(string); ok && p != "" {
+			return p
+		}
+		if q, ok := args["query"].(string); ok && q != "" {
+			if len(q) > 80 {
+				q = q[:80] + "..."
+			}
+			return q
+		}
 	case "search_docs":
 		if q, ok := args["query"].(string); ok && q != "" {
 			if len(q) > 80 {
@@ -1243,7 +1360,13 @@ func (a *Agent) buildSystemPrompt() string {
 			b.WriteString("3. Only then create the plan, incorporating found conventions as requirements\n")
 		}
 	} else {
-		b.WriteString("You are in EDIT mode.\n")
+		b.WriteString("You are in EDIT mode. EDIT mode is for ACTING on the code, not for describing changes.\n\n")
+		b.WriteString("CRITICAL — Action vs description:\n")
+		b.WriteString("- If the user's input is a TASK to change code (fix, refactor, create, edit, move, restructure, apply plan, implement, ...) you MUST start your response with tool calls (write_file, edit_file, bash, read_file as needed). Do NOT output a markdown plan, do NOT write \"АНАЛИЗ\" or \"ПЛАН ИСПРАВЛЕНИЙ\" sections, do NOT explain what you are about to do — just call the tools.\n")
+		b.WriteString("- A textual response without tool calls is allowed ONLY when the user asked a pure question (no action verb). When in doubt, assume it is a task and call tools.\n")
+		b.WriteString("- If you need to read a file before editing it, call read_file as the first tool — that still counts as \"starting with a tool\".\n")
+		b.WriteString("- If the user pasted a numbered plan, your job is to EXECUTE it, not to rewrite it back. Skip directly to the first edit_file/write_file. Do not produce a \"План исправлений\" of your own.\n")
+		b.WriteString("- PLAN mode is the place for descriptions. EDIT mode is for actions. Stay in your lane.\n\n")
 		b.WriteString("Available tools: " + strings.Join(a.reg.Names(), ", ") + "\n\n")
 		b.WriteString("Guidelines:\n")
 		b.WriteString("- Write idiomatic Go code\n")

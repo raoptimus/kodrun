@@ -27,15 +27,26 @@ type Plan struct {
 	Raw string `json:"-"`
 }
 
+// Example points to existing project code that demonstrates the correct
+// pattern for a step. The actual code is loaded lazily from disk at execution
+// time (see snippet.go) so the JSON plan stays compact and snippets are
+// always fresh even when earlier steps modify the referenced file.
+type Example struct {
+	File string `json:"file"`
+	Line int    `json:"line,omitempty"`
+	Note string `json:"note,omitempty"`
+}
+
 // Step is one actionable unit inside a Plan.
 type Step struct {
-	ID        int      `json:"id"`
-	Title     string   `json:"title"`
-	Files     []string `json:"files,omitempty"`
-	Action    string   `json:"action,omitempty"`
-	Rationale string   `json:"rationale,omitempty"`
-	RuleNames []string `json:"rule_names,omitempty"`
-	DependsOn []int    `json:"depends_on,omitempty"`
+	ID        int       `json:"id"`
+	Title     string    `json:"title"`
+	Files     []string  `json:"files,omitempty"`
+	Action    string    `json:"action,omitempty"`
+	Rationale string    `json:"rationale,omitempty"`
+	RuleNames []string  `json:"rule_names,omitempty"`
+	DependsOn []int     `json:"depends_on,omitempty"`
+	Examples  []Example `json:"examples,omitempty"`
 }
 
 // AffectedFiles returns the union of all Files referenced by every step,

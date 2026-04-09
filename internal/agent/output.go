@@ -26,10 +26,12 @@ func (p *PlainOutput) Handle(e Event) {
 			status = "✗"
 		}
 		if e.Tool != "" {
-			fmt.Fprintf(p.w, "%s(%s)\n", e.Tool, status)
-		}
-		if e.Message != "" && e.Message != "executing..." {
-			fmt.Fprintf(p.w, "        %s\n", e.Message)
+			displayName := ToolDisplayName(e.Tool)
+			if e.Message != "" && e.Message != "executing..." {
+				fmt.Fprintf(p.w, "%s %s(%s)\n", status, displayName, e.Message)
+			} else {
+				fmt.Fprintf(p.w, "%s %s\n", status, displayName)
+			}
 		}
 	case EventFix:
 		fmt.Fprintf(p.w, "[fix]   %s\n", e.Message)
@@ -39,6 +41,8 @@ func (p *PlainOutput) Handle(e Event) {
 		fmt.Fprintf(p.w, "[tokens] prompt: %d, eval: %d\n", e.PromptTokens, e.EvalTokens)
 	case EventCompact:
 		fmt.Fprintf(p.w, "[compact] %s\n", e.Message)
+	case EventGroupTitleUpdate:
+		fmt.Fprintf(p.w, "%s\n", e.Message)
 	case EventDone:
 		// Intentionally left blank for clean output
 	}

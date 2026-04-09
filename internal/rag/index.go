@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"math"
 	"os"
@@ -17,7 +18,11 @@ import (
 	"github.com/raoptimus/kodrun/internal/ollama"
 )
 
-const maxEmbedInputBytes = 2000 // ~500-650 tokens, safely under nomic-embed-text 2048 token context
+const (
+	maxEmbedInputBytes  = 2000 // ~500-650 tokens, safely under nomic-embed-text 2048 token context
+	maxEmbedRetries     = 3    // total attempts per batch before failing
+	embedRetryBaseDelay = 500 * time.Millisecond
+)
 
 func truncateInput(s string, maxBytes int) string {
 	if len(s) <= maxBytes {
@@ -56,8 +61,57 @@ func NewIndex(client *ollama.Client, model, indexPath string) *Index {
 	}
 }
 
-// Load reads the index from disk.
+// hasLegacyCodeChunks returns true if any loaded entry points at real
+// project source code rather than a conventions source. Legitimate
+// convention sources are:
+//
+//   - synthetic prefixes rules://, snippets://, embedded://
+//   - anything whose path contains .kodrun/ (rules, snippets, docs live
+//     there — ChunkRules stores the absolute file path, so prefix checks
+//     against "rules://" alone are not enough)
+//   - anything under a /docs/ directory (ref docs from the global config)
+//
+// Everything else is assumed to be stale code indexed by an older kodrun
+// build and triggers a one-shot Reset on startup.
+func (idx *Index) hasLegacyCodeChunks() bool {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	for _, e := range idx.entries {
+		p := e.Chunk.FilePath
+		if strings.HasPrefix(p, "rules://") ||
+			strings.HasPrefix(p, "snippets://") ||
+			strings.HasPrefix(p, "embedded://") ||
+			strings.HasPrefix(p, "godoc://") ||
+			strings.Contains(p, ".kodrun/") ||
+			strings.Contains(p, "/docs/") {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// Reset clears in-memory entries and removes the on-disk index file.
+// Used by /reindex to guarantee a fresh rebuild, so no stale entries from
+// earlier kodrun versions (e.g. indexed source code) can survive.
+func (idx *Index) Reset() error {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	idx.entries = nil
+	idx.updated = time.Time{}
+	if err := os.RemoveAll(idx.path); err != nil {
+		return errors.WithMessage(err, "remove index dir")
+	}
+	return nil
+}
+
+// Load reads the index from disk. If the index has no path (in-memory mode),
+// this is a no-op.
 func (idx *Index) Load() error {
+	if idx.path == "" {
+		return nil
+	}
+
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
@@ -79,8 +133,13 @@ func (idx *Index) Load() error {
 	return nil
 }
 
-// Save writes the index to disk.
+// Save writes the index to disk. If the index has no path (in-memory mode),
+// this is a no-op.
 func (idx *Index) Save() error {
+	if idx.path == "" {
+		return nil
+	}
+
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
@@ -167,13 +226,37 @@ func (idx *Index) BuildWithProgress(ctx context.Context, chunks []Chunk, progres
 			inputs[j] = truncateInput(fmt.Sprintf("File: %s\n%s", c.FilePath, c.Content), maxEmbedInputBytes)
 		}
 
-		resp, err := idx.client.Embed(ctx, ollama.EmbedRequest{
-			Model:    idx.model,
-			Input:    inputs,
-			Truncate: true,
-		})
-		if err != nil {
-			return len(newEntries), errors.WithMessagef(err, "embed batch %d", i/batchSize)
+		// Retry transient embedding failures with linear backoff so a single
+		// flaky network/timeout does not abort the whole Build, leaving the
+		// on-disk snapshot stale. maxEmbedRetries attempts is enough to ride
+		// out brief blips while still failing fast on hard errors.
+		var resp *ollama.EmbedResponse
+		var attemptErrs []error
+		for attempt := 1; attempt <= maxEmbedRetries; attempt++ {
+			var err error
+			resp, err = idx.client.Embed(ctx, ollama.EmbedRequest{
+				Model:    idx.model,
+				Input:    inputs,
+				Truncate: true,
+			})
+			if err == nil {
+				attemptErrs = nil
+				break
+			}
+			attemptErrs = append(attemptErrs, errors.WithMessagef(err, "attempt %d/%d", attempt, maxEmbedRetries))
+			if ctx.Err() != nil {
+				return len(newEntries), ctx.Err()
+			}
+			if attempt < maxEmbedRetries {
+				select {
+				case <-ctx.Done():
+					return len(newEntries), ctx.Err()
+				case <-time.After(time.Duration(attempt) * embedRetryBaseDelay):
+				}
+			}
+		}
+		if len(attemptErrs) > 0 {
+			return len(newEntries), errors.WithMessagef(stderrors.Join(attemptErrs...), "embed batch %d", i/batchSize)
 		}
 
 		if len(resp.Embeddings) != len(batch) {

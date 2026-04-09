@@ -12,8 +12,13 @@ type RuleInfo struct {
 	Path    string
 }
 
-// ChunkRules converts rules into RAG chunks.
-func ChunkRules(rules []RuleInfo) []Chunk {
+// ChunkRules converts rules into RAG chunks. chunkSize/chunkOverlap come
+// from cfg.RAG so rules use the same chunking parameters as project files —
+// otherwise hashes built with different sizes never align across reindexes.
+func ChunkRules(rules []RuleInfo, chunkSize, chunkOverlap int) []Chunk {
+	if chunkSize <= 0 {
+		chunkSize = 128
+	}
 	chunks := make([]Chunk, 0, len(rules))
 	for _, r := range rules {
 		body := fmt.Sprintf("Rule: %s\n\n%s", r.Name, r.Content)
@@ -21,7 +26,7 @@ func ChunkRules(rules []RuleInfo) []Chunk {
 		if relPath == "" {
 			relPath = "rules://" + r.Name
 		}
-		subChunks := splitIntoChunks(relPath, body, 512, 32)
+		subChunks := splitIntoChunks(relPath, body, chunkSize, chunkOverlap)
 		chunks = append(chunks, subChunks...)
 	}
 	return chunks
@@ -34,12 +39,15 @@ type RefDocInfo struct {
 }
 
 // ChunkRefDocs converts reference documents into RAG chunks.
-func ChunkRefDocs(docs []RefDocInfo) []Chunk {
+func ChunkRefDocs(docs []RefDocInfo, chunkSize, chunkOverlap int) []Chunk {
+	if chunkSize <= 0 {
+		chunkSize = 128
+	}
 	chunks := make([]Chunk, 0, len(docs))
 	for _, d := range docs {
 		name := filepath.Base(d.Path)
 		body := fmt.Sprintf("Documentation: %s\n\n%s", name, d.Content)
-		subChunks := splitIntoChunks(d.Path, body, 512, 32)
+		subChunks := splitIntoChunks(d.Path, body, chunkSize, chunkOverlap)
 		chunks = append(chunks, subChunks...)
 	}
 	return chunks

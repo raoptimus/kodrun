@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -95,6 +96,11 @@ func (c *Client) Chat(ctx context.Context, chatReq ChatRequest) (<-chan ChatChun
 
 		resp, err = c.httpClient.Do(req)
 		if err != nil {
+			// Connection refused / DNS failure — ollama is down, don't waste
+			// time retrying because it won't come back in 2 seconds.
+			if isDialError(err) {
+				return nil, errors.WithMessage(err, "chat request")
+			}
 			if attempt < c.maxRetries-1 {
 				select {
 				case <-ctx.Done():
@@ -327,4 +333,16 @@ func (c *Client) Embed(ctx context.Context, req EmbedRequest) (*EmbedResponse, e
 	}
 
 	return &result, nil
+}
+
+// isDialError returns true when the error is a TCP dial failure (connection
+// refused, DNS resolution error, etc.). These indicate that ollama is down
+// and retrying immediately is pointless.
+func isDialError(err error) bool {
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Op == "dial" {
+		return true
+	}
+	var dnsErr *net.DNSError
+	return errors.As(err, &dnsErr)
 }

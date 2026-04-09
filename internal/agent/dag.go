@@ -139,6 +139,15 @@ func (o *Orchestrator) runPlanDAG(ctx context.Context, plan *Plan, maxParallel i
 	dag := buildStepDAG(plan)
 	locks := newFileLockSet()
 
+	// Pre-compute per-step RAG bundles once. Each bundle is independent of
+	// scheduling order, so doing this up-front lets parallel sub-agents share
+	// the result instead of issuing duplicate embedding searches.
+	o.stepRAGBundles = make(map[int]string, len(plan.Steps))
+	for _, s := range plan.Steps {
+		o.stepRAGBundles[s.ID] = o.perStepRAG(ctx, s)
+	}
+	defer func() { o.stepRAGBundles = nil }()
+
 	type stepResult struct {
 		id    int
 		stats SessionStats

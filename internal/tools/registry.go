@@ -125,6 +125,7 @@ func (r *Registry) Execute(ctx context.Context, name string, params map[string]a
 				cacheKey = buildCacheKey(name, policy, params)
 				resolvedPaths = resolveParamPaths(t, policy, params)
 				if hit, found := cache.Get(cacheKey); found {
+					hit.Meta = cloneMetaWithCacheHit(hit.Meta)
 					return hit, nil
 				}
 			}
@@ -199,6 +200,17 @@ func writeToolPaths(t Tool, params map[string]any) []string {
 		return []string{s}
 	}
 	return nil
+}
+
+// cloneMetaWithCacheHit returns a shallow copy of meta with "cache_hit" set
+// to true. A new map is always returned to avoid mutating the cached entry.
+func cloneMetaWithCacheHit(meta map[string]any) map[string]any {
+	out := make(map[string]any, len(meta)+1)
+	for k, v := range meta {
+		out[k] = v
+	}
+	out["cache_hit"] = true
+	return out
 }
 
 // PathResolver is implemented by tools whose params reference filesystem

@@ -49,23 +49,52 @@ func (o *Orchestrator) runStep(ctx context.Context, step Step, confirmFn Confirm
 	}
 	b.WriteString("\nApply the change and stop. Do not touch any file outside the Files list.\n")
 
-	// Per-step RAG bundle: rule names declared on the step go through the
-	// rules loader if available, plus a focused RAG search on the step title.
-	if rag := o.perStepRAG(ctx, step); rag != "" {
+	// Resolve reference examples from disk and inject into the prompt.
+	if len(step.Examples) > 0 {
+		snippets := formatStepExamples(o.workDir, step.Examples, defaultBudgetLines)
+		if snippets != "" {
+			b.WriteString("\n## Examples\nCode from this project demonstrating the correct pattern:\n\n")
+			b.WriteString(snippets)
+		}
+	}
+
+	// Per-step RAG bundle: prefer the bundle pre-computed by runPlanDAG so
+	// parallel sub-agents share one set of embedding calls instead of N. The
+	// live fallback covers non-DAG callers.
+	var ragBundle string
+	if o.stepRAGBundles != nil {
+		ragBundle = o.stepRAGBundles[step.ID]
+	} else {
+		ragBundle = o.perStepRAG(ctx, step)
+	}
+	if ragBundle != "" {
 		b.WriteString("\n")
-		b.WriteString(rag)
+		b.WriteString(ragBundle)
 	}
 
 	if err := ag.Send(ctx, b.String()); err != nil && !errors.Is(err, ErrMaxIterations) {
 		return ag.Stats(), err
 	}
 
+	stats := ag.Stats()
+
 	// Surface REPLAN if the sub-agent asked for one.
-	if last := ag.LastAssistantMessage(); strings.Contains(last, "REPLAN:") {
+	last := ag.LastAssistantMessage()
+	if strings.Contains(last, "REPLAN:") {
 		o.emit(Event{Type: EventReplan, Message: extractReplanReason(last)})
+		return stats, nil
 	}
 
-	return ag.Stats(), nil
+	// A step that finished with zero tool calls and no REPLAN is a model
+	// failure: the executor wrote prose instead of applying the change.
+	// Surface it loudly so the orchestrator/CI does not treat the step as
+	// successful when nothing actually happened on disk.
+	if stats.ToolCalls == 0 {
+		o.emit(Event{Type: EventError, Message: fmt.Sprintf("Step %d (%s) finished with zero tool calls — model returned text instead of applying changes. Treating as failed.", step.ID, step.Title)})
+		return stats, errors.Errorf("step %d: no tool calls executed", step.ID)
+	}
+
+	return stats, nil
 }
 
 // perStepRAG builds a compact per-step RAG payload combining declared rule

@@ -10,7 +10,7 @@ import (
 
 // RegisterCoreTools registers language-neutral tools: file ops, grep/find,
 // git, and bash. These are always available regardless of project language.
-func RegisterCoreTools(reg *Registry, workDir string, forbidden []string, maxReadLines int) {
+func RegisterCoreTools(reg *Registry, workDir string, forbidden []string, maxReadLines int, langState *projectlang.State) {
 	reg.Register(NewReadFileTool(workDir, forbidden, maxReadLines))
 	reg.Register(NewWriteFileTool(workDir, forbidden))
 	reg.Register(NewEditFileTool(workDir, forbidden))
@@ -20,6 +20,7 @@ func RegisterCoreTools(reg *Registry, workDir string, forbidden []string, maxRea
 	reg.Register(NewDeleteFileTool(workDir, forbidden))
 	reg.Register(NewCreateDirTool(workDir))
 	reg.Register(NewMoveFileTool(workDir, forbidden))
+	reg.Register(NewReadChangedFilesTool(workDir, langState))
 	reg.Register(NewGitStatusTool(workDir))
 	reg.Register(NewGitDiffTool(workDir))
 	reg.Register(NewGitLogTool(workDir))
@@ -30,10 +31,11 @@ func RegisterCoreTools(reg *Registry, workDir string, forbidden []string, maxRea
 // RegisterLanguageTools registers tools specific to the given language.
 // It is safe to call multiple times: tools.Registry.Register is idempotent
 // (last write wins on the same name). Unknown languages are a no-op.
-func RegisterLanguageTools(reg *Registry, lang projectlang.Language, workDir string) {
+// The indexer is optional: when non-nil, Go tools index go doc output into RAG.
+func RegisterLanguageTools(reg *Registry, lang projectlang.Language, workDir string, indexer GoDocIndexer) {
 	switch lang {
 	case projectlang.LangGo:
-		RegisterGoTools(reg, workDir)
+		RegisterGoTools(reg, workDir, indexer)
 	case projectlang.LangPython:
 		RegisterPythonTools(reg, workDir)
 	case projectlang.LangJSTS:
@@ -46,10 +48,11 @@ func RegisterLanguageTools(reg *Registry, lang projectlang.Language, workDir str
 // optional rule/snippet tools when RAG is disabled.
 func RegisterAllTools(_ context.Context, reg *Registry, workDir string, forbidden []string,
 	maxReadLines int, loader *rules.Loader, snippetLoader *snippets.Loader, scope rules.Scope,
-	useRuleTool, useSnippetTool, ragEnabled bool, lang projectlang.Language,
+	useRuleTool, useSnippetTool, ragEnabled bool, lang projectlang.Language, indexer GoDocIndexer,
+	langState *projectlang.State,
 ) {
-	RegisterCoreTools(reg, workDir, forbidden, maxReadLines)
-	RegisterLanguageTools(reg, lang, workDir)
+	RegisterCoreTools(reg, workDir, forbidden, maxReadLines, langState)
+	RegisterLanguageTools(reg, lang, workDir, indexer)
 	if loader != nil && useRuleTool && !ragEnabled {
 		reg.Register(NewRuleTool(loader, scope))
 	}

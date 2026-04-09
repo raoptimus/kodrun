@@ -233,12 +233,12 @@ Two independent levels of parallelism:
 
 ```yaml
 agent:
-  max_workers: 4          # parallel read-only tool calls inside ONE sub-agent
+  max_tool_workers: 4   # parallel read-only tool calls inside ONE sub-agent
   max_parallel_tasks: 1   # parallel STEPS of an approved plan (DAG) — default sequential
   max_replans: 2          # hard cap on REPLAN cycles within one run
 ```
 
-- `max_workers` caps how many read-only tool calls run concurrently inside a single chat turn.
+- `max_tool_workers` caps how many read-only tool calls run concurrently inside a single chat turn.
 - `max_parallel_tasks` controls true plan parallelism: the approved plan is compiled into a DAG and independent steps are executed by separate sub-agents with per-file locking. Each parallel sub-agent gets a fresh history, its own read-path whitelist and its own per-step RAG bundle. Raise to 2–3 on a fast model/GPU to enable parallelism.
 
 ## Rules
@@ -397,6 +397,7 @@ Tools are **auto-registered based on the detected project language**. Read-only 
 | Tool | Description |
 |------|-------------|
 | `read_file` | Read file contents |
+| `read_changed_files` | Diff with context for all git-changed source files (filtered by project language) |
 | `write_file` | Write a file (creates directories) |
 | `edit_file` | Find & replace text in a file |
 | `list_dir` | List files in a directory |
@@ -406,6 +407,7 @@ Tools are **auto-registered based on the detected project language**. Read-only 
 | `create_dir` | Create a directory |
 | `move_file` | Move/rename a file |
 | `bash` | Execute a shell command |
+| `web_fetch` | Fetch a web page, convert HTML to markdown |
 
 ### Git
 
@@ -426,6 +428,7 @@ Tools are **auto-registered based on the detected project language**. Read-only 
 | `go_fmt` | `gofmt -w` |
 | `go_vet` | `go vet` |
 | `go_mod_tidy` | `go mod tidy` |
+| `go_doc` | `go doc` lookup by package/symbol, or semantic search over indexed godoc via `query` |
 
 ### Python (auto-registered for Python projects)
 

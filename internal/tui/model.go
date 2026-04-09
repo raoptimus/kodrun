@@ -29,6 +29,7 @@ var (
 	userStyle          = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("2"))
 	botStyle           = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("5"))
 	toolStyle          = lipgloss.NewStyle().Foreground(lipgloss.Color("4"))
+	toolBoldStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("4"))
 	fixStyle           = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
 	errorStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
 	confirmHeaderStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6"))
@@ -187,12 +188,19 @@ type Model struct {
 	planConfirmSt      confirmState
 	planConfirmIdx     int
 
-	// Group collapsing
+	// Group collapsing — legacy single active group (used by Analyze() in
+	// the planner path and any caller that doesn't set GroupID).
 	groupActive   bool
 	groupTitle    string
 	groupLogs     []string
 	groupStartIdx int
 	groupExpanded bool
+
+	// Multi-group state: used when events carry a non-empty GroupID
+	// (parallel specialist reviewers). Each group occupies a contiguous
+	// range in m.logs which is spliced in place as new events arrive.
+	groups            map[string]*groupState
+	groupsExpandedAll bool
 
 	// Timer and token tracking
 	taskStart      time.Time
@@ -220,8 +228,12 @@ type Model struct {
 	// System prompt tokens
 	systemPromptTokens int
 
-	// Context dump
+	// Context dump (legacy, unused)
 	contextFn ContextFunc
+
+	// Transcript viewer: full tool output + reasoning.
+	transcriptLogs []string
+	transcriptMode bool
 
 	focus focusTarget
 
@@ -747,16 +759,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case tea.KeyCtrlL:
 			m.logs = m.headerLines()
+			m.transcriptLogs = nil
 			m.updateViewport()
 		case tea.KeyCtrlO:
-			if len(m.groupLogs) > 0 {
-				m.groupExpanded = !m.groupExpanded
-				m.rebuildGroupView()
-			} else if m.contextFn != nil {
-				m.addLog(systemStyle.Render(m.locale.Get("status.context_dump")))
-				m.addLog(m.contextFn())
-				m.addLog(systemStyle.Render(m.locale.Get("status.context_end")))
-			}
+			m.transcriptMode = !m.transcriptMode
+			m.syncViewport()
 		}
 	case tea.MouseMsg:
 		if msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress {
@@ -805,7 +812,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.totalPrompt = e.SystemPromptTokens
 			}
 			if e.Message != "" {
-				if m.groupActive {
+				// Transcript gets agent messages too.
+				m.addTranscriptLog(agentStyle.Render(e.Message))
+
+				if e.GroupID != "" && m.groups[e.GroupID] != nil {
+					m.appendToGroup(e.GroupID, agentStyle.Render(e.Message))
+				} else if m.groupActive {
 					// Route intermediate agent text into the collapsed group.
 					m.groupLogs = append(m.groupLogs, agentStyle.Render(e.Message))
 					m.rebuildGroupView()
@@ -831,7 +843,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case agent.EventTool:
 			toolLine := m.formatToolEvent(e)
-			if m.groupActive {
+
+			// Transcript always gets the full tool output.
+			m.addTranscriptLog(toolLine)
+			if e.FullOutput != "" {
+				m.addTranscriptLog(toolStyle.Render("──────────────────────"))
+				m.addTranscriptLog(e.FullOutput)
+				m.addTranscriptLog(toolStyle.Render("──────────────────────"))
+			}
+
+			// Skip cache hits in group display to reduce visual noise
+			// (e.g. 6 specialists reading the same file during code review).
+			// The call is still visible in the transcript (ctrl+o).
+			if e.CacheHit && e.GroupID != "" {
+				break
+			}
+
+			if e.GroupID != "" && m.groups[e.GroupID] != nil {
+				m.appendToGroup(e.GroupID, toolLine)
+			} else if m.groupActive {
 				m.groupLogs = append(m.groupLogs, toolLine)
 				m.rebuildGroupView()
 			} else {
@@ -846,15 +876,30 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		case agent.EventGroupStart:
-			m.groupActive = true
-			m.groupTitle = e.Message
-			m.groupLogs = nil
-			m.groupExpanded = false
-			m.addLog(botStyle.Render(m.locale.Get("avatar.agent")) + " " + toolStyle.Render(e.Message))
-			m.groupStartIdx = len(m.logs)
+			if e.GroupID != "" {
+				m.openGroup(e.GroupID, e.Message)
+			} else {
+				m.groupActive = true
+				m.groupTitle = e.Message
+				m.groupLogs = nil
+				m.groupExpanded = false
+				m.addLog(botStyle.Render(m.locale.Get("avatar.agent")) + " " + toolStyle.Render(e.Message))
+				m.groupStartIdx = len(m.logs)
+			}
 		case agent.EventGroupEnd:
-			m.groupActive = false
-			m.rebuildGroupView()
+			if e.GroupID != "" {
+				m.closeGroup(e.GroupID)
+			} else {
+				m.groupActive = false
+				m.rebuildGroupView()
+			}
+		case agent.EventGroupTitleUpdate:
+			if e.GroupID != "" {
+				if g, ok := m.groups[e.GroupID]; ok {
+					g.title = e.Message
+					m.updateGroup(g)
+				}
+			}
 		case agent.EventFix:
 			m.addLog(fixStyle.Render(m.locale.Get("event.fix") + e.Message))
 		case agent.EventError:
@@ -1049,13 +1094,131 @@ func (m Model) formatToolEvent(e agent.Event) string {
 	if !e.Success {
 		status = "✗"
 	}
+	statusStr := toolStyle.Render(status)
+
 	if e.FileAction != "" {
-		return toolStyle.Render(fmt.Sprintf("%s %s(%s)", status, e.FileAction, e.Message))
+		name := toolBoldStyle.Render(e.FileAction)
+		args := toolStyle.Render(fmt.Sprintf("(%s)", e.Message))
+		return fmt.Sprintf("%s %s%s", statusStr, name, args)
 	}
+
+	displayName := toolBoldStyle.Render(agent.ToolDisplayName(e.Tool))
 	if e.Message == "" {
-		return toolStyle.Render(fmt.Sprintf("%s %s", status, e.Tool))
+		return fmt.Sprintf("%s %s", statusStr, displayName)
 	}
-	return toolStyle.Render(fmt.Sprintf("%s %s(%s)", status, e.Tool, e.Message))
+	args := toolStyle.Render(fmt.Sprintf("(%s)", e.Message))
+	return fmt.Sprintf("%s %s%s", statusStr, displayName, args)
+}
+
+
+// groupState tracks one collapsible group in the multi-group pipeline.
+// Each instance occupies a contiguous range of m.logs starting at
+// `startIdx` and spanning `rendered` lines (header + visible body). When a
+// new event arrives for the group, its range in m.logs is spliced in place
+// and every following group's startIdx is shifted by the line delta.
+//
+// Concurrency invariant: groupState values (and the Model.groups map) are
+// mutated ONLY from within Model.Update, which bubbletea serialises on its
+// own goroutine. Agent events arrive as tea.Msg values and are applied
+// there — never touch these fields from a background goroutine.
+type groupState struct {
+	id       string
+	title    string
+	logs     []string
+	expanded bool
+	startIdx int
+	rendered int
+	closed   bool
+}
+
+const groupMaxVisible = 5
+
+// renderGroupLines returns the lines a group currently occupies in m.logs
+// (header + body). The body is collapsed to the last groupMaxVisible
+// entries unless expanded is true.
+func (m *Model) renderGroupLines(g *groupState) []string {
+	lines := []string{
+		botStyle.Render(m.locale.Get("avatar.agent")) + " " + toolStyle.Render(g.title),
+	}
+	total := len(g.logs)
+	if total == 0 {
+		return lines
+	}
+	if g.expanded || total <= groupMaxVisible {
+		for _, line := range g.logs {
+			lines = append(lines, "  "+line)
+		}
+		return lines
+	}
+	hidden := total - groupMaxVisible
+	lines = append(lines, "  "+diffStatStyle.Render(fmt.Sprintf(m.locale.Get("group.more_tools"), hidden)))
+	for _, line := range g.logs[hidden:] {
+		lines = append(lines, "  "+line)
+	}
+	return lines
+}
+
+// updateGroup splices the new rendered lines of g back into m.logs at its
+// current startIdx and adjusts the startIdx of every following group.
+func (m *Model) updateGroup(g *groupState) {
+	newLines := m.renderGroupLines(g)
+	oldLen := g.rendered
+	end := g.startIdx + oldLen
+	// Splice: m.logs = before + newLines + after
+	after := append([]string(nil), m.logs[end:]...)
+	m.logs = append(m.logs[:g.startIdx], newLines...)
+	m.logs = append(m.logs, after...)
+	delta := len(newLines) - oldLen
+	g.rendered = len(newLines)
+	if delta != 0 {
+		for _, other := range m.groups {
+			if other == g {
+				continue
+			}
+			if other.startIdx >= end {
+				other.startIdx += delta
+			}
+		}
+	}
+	stickBottom := !m.ready || m.viewport.AtBottom() || (m.running && m.focus == focusInput)
+	m.updateViewportWithStickBottom(stickBottom)
+}
+
+// openGroup registers a new group and appends its header to m.logs.
+func (m *Model) openGroup(id, title string) {
+	if m.groups == nil {
+		m.groups = map[string]*groupState{}
+	}
+	g := &groupState{
+		id:       id,
+		title:    title,
+		startIdx: len(m.logs),
+		expanded: m.groupsExpandedAll,
+	}
+	m.groups[id] = g
+	lines := m.renderGroupLines(g)
+	m.logs = append(m.logs, lines...)
+	g.rendered = len(lines)
+	stickBottom := !m.ready || m.viewport.AtBottom() || (m.running && m.focus == focusInput)
+	m.updateViewportWithStickBottom(stickBottom)
+}
+
+// appendToGroup routes a rendered line into an existing group.
+func (m *Model) appendToGroup(id, line string) bool {
+	g, ok := m.groups[id]
+	if !ok {
+		return false
+	}
+	g.logs = append(g.logs, line)
+	m.updateGroup(g)
+	return true
+}
+
+// closeGroup marks a group as finished. Its lines remain in m.logs.
+func (m *Model) closeGroup(id string) {
+	if g, ok := m.groups[id]; ok {
+		g.closed = true
+	}
 }
 
 // rebuildGroupView updates the visible group section in logs.
@@ -1105,11 +1268,34 @@ func (m *Model) addLog(line string) {
 	stickBottom := !m.ready || m.viewport.AtBottom() || (m.running && m.focus == focusInput)
 	m.logs = append(m.logs, line)
 	if len(m.logs) > maxLogLines {
-		// Trim oldest 20% to avoid frequent trimming.
 		trim := maxLogLines / 5
 		m.logs = append([]string(nil), m.logs[trim:]...)
 	}
-	m.updateViewportWithStickBottom(stickBottom)
+	if !m.transcriptMode {
+		m.updateViewportWithStickBottom(stickBottom)
+	}
+}
+
+func (m *Model) addTranscriptLog(line string) {
+	stickBottom := !m.ready || m.viewport.AtBottom() || (m.running && m.focus == focusInput)
+	m.transcriptLogs = append(m.transcriptLogs, line)
+	if len(m.transcriptLogs) > maxLogLines {
+		trim := maxLogLines / 5
+		m.transcriptLogs = append([]string(nil), m.transcriptLogs[trim:]...)
+	}
+	if m.transcriptMode {
+		m.updateViewportWithStickBottom(stickBottom)
+	}
+}
+
+// syncViewport switches the viewport content between normal and transcript buffers.
+func (m *Model) syncViewport() {
+	if m.transcriptMode {
+		m.viewport.SetContent(strings.Join(m.transcriptLogs, "\n"))
+	} else {
+		m.viewport.SetContent(strings.Join(m.logs, "\n"))
+	}
+	m.viewport.GotoBottom()
 }
 
 // hasMarkdown detects whether text contains markdown formatting worth rendering.
@@ -1188,7 +1374,11 @@ func (m *Model) updateViewport() {
 }
 
 func (m *Model) updateViewportWithStickBottom(stickBottom bool) {
-	m.viewport.SetContent(strings.Join(m.logs, "\n"))
+	if m.transcriptMode {
+		m.viewport.SetContent(strings.Join(m.transcriptLogs, "\n"))
+	} else {
+		m.viewport.SetContent(strings.Join(m.logs, "\n"))
+	}
 	if stickBottom {
 		m.viewport.GotoBottom()
 	}
@@ -1223,7 +1413,7 @@ func (m Model) View() string {
 	var timeLine string
 	if m.running {
 		elapsed := m.elapsed()
-		timeLine = "\n" + toolbarStyle.Render(fmt.Sprintf("  %s ⏱ %s · %s tk", m.locale.Get("status.working"), elapsed, formatTokens(m.totalEval)))
+		timeLine = "\n" + toolbarStyle.Render(fmt.Sprintf("  %s ⏱ %s · %s tk", m.locale.Get("status.working"), elapsed, formatTokens(m.totalEval))) + "\n"
 	}
 	if m.ragProgressTotal > 0 {
 		pct := m.ragProgressDone * 100 / m.ragProgressTotal
@@ -1232,10 +1422,13 @@ func (m Model) View() string {
 			label = "indexing"
 		}
 		ragLine := toolbarStyle.Render(fmt.Sprintf("  RAG %s %d%% (%d/%d)", label, pct, m.ragProgressDone, m.ragProgressTotal))
+		// Trailing newline keeps a blank line between the RAG progress line
+		// and the input prompt below, matching the spacing of other status
+		// blocks.
 		if timeLine == "" {
-			timeLine = "\n" + ragLine
+			timeLine = "\n" + ragLine + "\n"
 		} else {
-			timeLine += "\n" + ragLine
+			timeLine += ragLine + "\n"
 		}
 	}
 
@@ -1291,6 +1484,9 @@ func (m Model) renderToolbar() string {
 		m.model,
 		fmt.Sprintf("%s %s", modeLabel, m.locale.Get("label.shift_tab")),
 		fmt.Sprintf("%s tk", formatTokens(m.totalPrompt+m.totalEval)),
+	}
+	if m.transcriptMode {
+		parts = append(parts, "[Transcript]")
 	}
 
 	if m.lastTkPerSec > 0 {

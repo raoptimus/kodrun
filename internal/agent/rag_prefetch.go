@@ -98,6 +98,8 @@ func entityTypesFromPaths(paths []string, ruleNames []string) []string {
 func chunkCategory(filePath string) string {
 	base := filepath.Base(filePath)
 	switch {
+	case strings.HasPrefix(filePath, "godoc://"):
+		return "godoc"
 	case strings.HasPrefix(filePath, "rules://"):
 		return "rule"
 	case strings.HasPrefix(filePath, "embedded://"):
@@ -123,8 +125,11 @@ func formatRAGResults(results []rag.SearchResult) string {
 		result   rag.SearchResult
 	}
 
-	var rules, standards, snippets, code []categorized
+	var rules, standards, snippets, godocs []categorized
 	for _, r := range results {
+		// Conservative in-place compression to squeeze more signal
+		// into the same injection budget.
+		r.Chunk.Content = rag.CompressChunk(r.Chunk.FilePath, r.Chunk.Content)
 		cat := chunkCategory(r.Chunk.FilePath)
 		c := categorized{category: cat, result: r}
 		switch cat {
@@ -134,8 +139,14 @@ func formatRAGResults(results []rag.SearchResult) string {
 			standards = append(standards, c)
 		case "snippet":
 			snippets = append(snippets, c)
+		case "godoc":
+			godocs = append(godocs, c)
 		default:
-			code = append(code, c)
+			// "code" chunks should no longer reach this formatter: RAG only
+			// indexes conventions (rules/snippets/docs/embedded). If a code
+			// chunk slips in (e.g. a stale leftover from an older index on
+			// disk), drop it — never inject project source code through RAG,
+			// reviewers must read it live via read_file.
 		}
 	}
 
@@ -173,11 +184,11 @@ func formatRAGResults(results []rag.SearchResult) string {
 		}
 	}
 
-	if len(code) > 0 {
-		b.WriteString("[PROJECT CODE — reference examples from the codebase]\n\n")
-		for _, c := range code {
+	if len(godocs) > 0 {
+		b.WriteString("[GO DOCUMENTATION — relevant Go package docs]\n\n")
+		for _, c := range godocs {
 			r := c.result
-			fmt.Fprintf(&b, "--- REF %d (%.2f) %s:%d-%d ---\n%s\n\n",
+			fmt.Fprintf(&b, "--- DOC %d (%.2f) %s:%d-%d ---\n%s\n\n",
 				idx, r.Score, r.Chunk.FilePath, r.Chunk.StartLine, r.Chunk.EndLine, r.Chunk.Content)
 			idx++
 		}

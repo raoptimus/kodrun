@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 
 	"github.com/raoptimus/kodrun/internal/ollama"
 )
@@ -183,8 +185,25 @@ func (t *MoveFileTool) Execute(ctx context.Context, params map[string]any) (Tool
 		return ToolResult{Error: "access to path is forbidden", Success: false}, nil
 	}
 
-	if err := os.Rename(resolvedFrom, resolvedTo); err != nil {
-		return ToolResult{Error: err.Error(), Success: false}, nil
+	// Ensure the destination directory exists.
+	if dir := filepath.Dir(resolvedTo); dir != "" {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return ToolResult{Error: fmt.Sprintf("create destination dir: %v", err), Success: false}, nil
+		}
+	}
+
+	// Use git mv when the project is a git repository to preserve file
+	// history. Fall back to os.Rename when git is not available.
+	if isGitRepo(t.workDir) {
+		cmd := exec.CommandContext(ctx, "git", "mv", resolvedFrom, resolvedTo)
+		cmd.Dir = t.workDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return ToolResult{Error: fmt.Sprintf("git mv: %s (%v)", string(out), err), Success: false}, nil
+		}
+	} else {
+		if err := os.Rename(resolvedFrom, resolvedTo); err != nil {
+			return ToolResult{Error: err.Error(), Success: false}, nil
+		}
 	}
 
 	return ToolResult{
@@ -192,4 +211,22 @@ func (t *MoveFileTool) Execute(ctx context.Context, params map[string]any) (Tool
 		Success: true,
 		Meta:    map[string]any{"action": "Rename"},
 	}, nil
+}
+
+// isGitRepo checks whether workDir is inside a git repository by looking for
+// a .git directory or file (submodule). Walks up to 10 parent directories.
+func isGitRepo(workDir string) bool {
+	dir := workDir
+	for range 10 {
+		if info, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+			_ = info
+			return true
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return false
 }
