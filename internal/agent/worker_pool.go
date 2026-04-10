@@ -25,12 +25,12 @@ func NewWorkerPool(maxWorkers int) *WorkerPool {
 }
 
 // TaskFunc is a function that executes a tool call and returns the result.
-type TaskFunc func(ctx context.Context) (tools.ToolResult, error)
+type TaskFunc func(ctx context.Context) (*tools.ToolResult, error)
 
 // TaskResult holds the outcome of a single task, preserving its original index.
 type TaskResult struct {
 	Index  int
-	Result tools.ToolResult
+	Result *tools.ToolResult
 	Err    error
 }
 

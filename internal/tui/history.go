@@ -7,7 +7,11 @@ import (
 	"strings"
 )
 
-const historyFile = ".kodrun/history"
+const (
+	historyFile    = ".kodrun/history"
+	dirPermission  = 0o755
+	filePermission = 0o644
+)
 
 // LoadHistory reads command history from .kodrun/history file.
 // Deduplicates entries keeping the last occurrence and limits to maxSize.
@@ -64,7 +68,7 @@ func dedup(lines []string) []string {
 var appendCount int
 
 // AppendHistory adds an entry to the history file.
-func AppendHistory(workDir string, entry string, maxSize int) {
+func AppendHistory(workDir, entry string, maxSize int) {
 	entry = strings.TrimSpace(entry)
 	if entry == "" {
 		return
@@ -74,15 +78,19 @@ func AppendHistory(workDir string, entry string, maxSize int) {
 
 	// Ensure .kodrun/ directory exists
 	dir := filepath.Dir(path)
-	_ = os.MkdirAll(dir, 0o755)
+	if err := os.MkdirAll(dir, dirPermission); err != nil {
+		return
+	}
 
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, filePermission)
 	if err != nil {
 		return
 	}
 	defer f.Close()
 
-	_, _ = f.WriteString(entry + "\n")
+	if _, err := f.WriteString(entry + "\n"); err != nil {
+		return
+	}
 
 	// Periodically trim and deduplicate the file.
 	appendCount++
@@ -107,6 +115,8 @@ func TrimHistory(workDir string, maxSize int) {
 	defer f.Close()
 
 	for _, line := range lines {
-		_, _ = f.WriteString(line + "\n")
+		if _, err := f.WriteString(line + "\n"); err != nil {
+			return
+		}
 	}
 }

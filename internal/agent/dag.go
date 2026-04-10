@@ -5,18 +5,21 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/pkg/errors"
 )
 
+const stepTitleMaxLen = 50 // max chars for step title in group messages
+
 // stepDAG is the dependency graph built from a structured Plan. It supports
 // streaming "ready" steps as their dependencies complete and tracks remaining
 // work for the parallel runner.
 type stepDAG struct {
-	steps     map[int]*Step
-	indegree  map[int]int     // step id -> number of unmet dependencies
-	dependents map[int][]int  // step id -> ids that depend on it
+	steps      map[int]*Step
+	indegree   map[int]int   // step id -> number of unmet dependencies
+	dependents map[int][]int // step id -> ids that depend on it
 }
 
 func buildStepDAG(plan *Plan) *stepDAG {
@@ -30,7 +33,8 @@ func buildStepDAG(plan *Plan) *stepDAG {
 		d.steps[s.ID] = s
 		d.indegree[s.ID] = 0
 	}
-	for _, s := range plan.Steps {
+	for i := range plan.Steps {
+		s := &plan.Steps[i]
 		for _, dep := range s.DependsOn {
 			if _, ok := d.steps[dep]; !ok {
 				continue // unknown dep, ignore
@@ -126,6 +130,23 @@ func (s *fileLockSet) acquire(paths []string) func() {
 	}
 }
 
+// formatStepDescription builds a human-readable description of a step for
+// the per-step confirmation dialog.
+func formatStepDescription(step *Step) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Step %d: %s\n", step.ID, step.Title)
+	if len(step.Files) > 0 {
+		fmt.Fprintf(&b, "Files: %s\n", strings.Join(step.Files, ", "))
+	}
+	if step.Action != "" {
+		fmt.Fprintf(&b, "Action: %s\n", step.Action)
+	}
+	if step.Rationale != "" {
+		fmt.Fprintf(&b, "Rationale: %s\n", step.Rationale)
+	}
+	return b.String()
+}
+
 // runPlanDAG executes a structured Plan using a topological scheduler with
 // bounded parallelism (`maxParallel`) and per-file locking. It returns the
 // merged SessionStats from all sub-agent runs.
@@ -143,7 +164,8 @@ func (o *Orchestrator) runPlanDAG(ctx context.Context, plan *Plan, maxParallel i
 	// scheduling order, so doing this up-front lets parallel sub-agents share
 	// the result instead of issuing duplicate embedding searches.
 	o.stepRAGBundles = make(map[int]string, len(plan.Steps))
-	for _, s := range plan.Steps {
+	for i := range plan.Steps {
+		s := &plan.Steps[i]
 		o.stepRAGBundles[s.ID] = o.perStepRAG(ctx, s)
 	}
 	defer func() { o.stepRAGBundles = nil }()
@@ -155,12 +177,13 @@ func (o *Orchestrator) runPlanDAG(ctx context.Context, plan *Plan, maxParallel i
 	}
 
 	var (
-		mu      sync.Mutex
-		done    = make(map[int]bool)
-		ready   = dag.readyRoots()
-		results = make(chan stepResult, len(plan.Steps))
-		active  int
-		merged  SessionStats
+		mu       sync.Mutex
+		done     = make(map[int]bool)
+		ready    = dag.readyRoots()
+		pending  []int
+		results  = make(chan stepResult, len(plan.Steps))
+		active   int
+		merged   SessionStats
 		firstErr error
 	)
 
@@ -170,24 +193,57 @@ func (o *Orchestrator) runPlanDAG(ctx context.Context, plan *Plan, maxParallel i
 
 	startStep := func(id int) {
 		active++
-		step := *dag.steps[id]
+		step := dag.steps[id]
 		go func() {
 			release := locks.acquire(step.Files)
 			defer release()
-			o.emit(Event{Type: EventAgent, Message: fmt.Sprintf("▸ Step %d: %s", step.ID, step.Title)})
+
+			groupID := fmt.Sprintf("step-%d", step.ID)
+			o.emit(&Event{
+				Type:    EventGroupStart,
+				GroupID: groupID,
+				Message: fmt.Sprintf("Executor(%s)", truncateTask(step.Title, stepTitleMaxLen)),
+			})
+			defer o.emit(&Event{Type: EventGroupEnd, GroupID: groupID})
+
 			stats, err := o.runStep(runCtx, step, confirmFn)
 			results <- stepResult{id: id, stats: stats, err: err}
 		}()
 	}
 
-	// Prime the first batch.
-	for _, id := range ready {
-		if active >= maxParallel {
-			break
+	// trySchedule runs step confirm (if configured) and either starts the
+	// step, skips it, or signals cancellation. Returns false when the user
+	// chose StepDenyAll.
+	trySchedule := func(id int) bool {
+		if o.stepConfirmFn != nil {
+			step := dag.steps[id]
+			desc := formatStepDescription(step)
+			switch o.stepConfirmFn(desc) {
+			case StepSkip:
+				done[id] = true
+				newly := dag.markDone(id)
+				pending = append(pending, newly...)
+				return true
+			case StepDenyAll:
+				firstErr = errors.New("execution cancelled by user")
+				cancel()
+				return false
+			}
 		}
 		startStep(id)
+		return true
 	}
-	pending := ready[min(len(ready), maxParallel):]
+
+	// Prime the first batch.
+	for _, id := range ready {
+		if active >= maxParallel || firstErr != nil {
+			break
+		}
+		if !trySchedule(id) {
+			break
+		}
+	}
+	pending = ready[min(len(ready), maxParallel):]
 
 	for active > 0 {
 		res := <-results
@@ -210,7 +266,9 @@ func (o *Orchestrator) runPlanDAG(ctx context.Context, plan *Plan, maxParallel i
 		for active < maxParallel && len(pending) > 0 && firstErr == nil {
 			next := pending[0]
 			pending = pending[1:]
-			startStep(next)
+			if !trySchedule(next) {
+				break
+			}
 		}
 	}
 

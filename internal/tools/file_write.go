@@ -9,6 +9,11 @@ import (
 	"github.com/raoptimus/kodrun/internal/ollama"
 )
 
+const (
+	writeDiffMaxLines = 30    // max lines in write tool diff output
+	newFilePermission = 0o600 // permissions for newly created files
+)
+
 // WriteFileTool writes content to a file.
 type WriteFileTool struct {
 	workDir           string
@@ -39,7 +44,7 @@ func (t *WriteFileTool) Schema() ollama.JSONSchema {
 // ResolvePaths returns the absolute path that this write affects, used by the
 // registry to invalidate dependent cache entries.
 func (t *WriteFileTool) ResolvePaths(params map[string]any) []string {
-	p, _ := params["path"].(string)
+	p := stringParam(params, "path")
 	if p == "" {
 		return nil
 	}
@@ -50,21 +55,21 @@ func (t *WriteFileTool) ResolvePaths(params map[string]any) []string {
 	return []string{resolved}
 }
 
-func (t *WriteFileTool) Execute(ctx context.Context, params map[string]any) (ToolResult, error) {
-	path, _ := params["path"].(string)
-	content, _ := params["content"].(string)
+func (t *WriteFileTool) Execute(ctx context.Context, params map[string]any) (*ToolResult, error) {
+	path := stringParam(params, "path")
+	content := stringParam(params, "content")
 
 	if path == "" {
-		return ToolResult{Error: "path is required", Success: false}, nil
+		return nil, &ToolError{Msg: "path is required"}
 	}
 
 	resolved, err := SafePath(ctx, t.workDir, path)
 	if err != nil {
-		return ToolResult{Error: err.Error(), Success: false}, nil
+		return nil, fmt.Errorf("resolve path: %w", err)
 	}
 
 	if IsForbidden(ctx, path, t.forbiddenPatterns) || IsForbidden(ctx, resolved, t.forbiddenPatterns) {
-		return ToolResult{Error: fmt.Sprintf("access to %s is forbidden", path), Success: false}, nil
+		return nil, &ToolError{Msg: fmt.Sprintf("access to %s is forbidden", path)}
 	}
 
 	// Read old content for diff
@@ -76,12 +81,12 @@ func (t *WriteFileTool) Execute(ctx context.Context, params map[string]any) (Too
 	}
 
 	dir := filepath.Dir(resolved)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return ToolResult{Error: fmt.Sprintf("create directory: %s", err), Success: false}, nil
+	if err := os.MkdirAll(dir, dirPermission); err != nil {
+		return nil, fmt.Errorf("create directory: %w", err)
 	}
 
-	if err := os.WriteFile(resolved, []byte(content), 0o644); err != nil {
-		return ToolResult{Error: err.Error(), Success: false}, nil
+	if err := os.WriteFile(resolved, []byte(content), newFilePermission); err != nil {
+		return nil, fmt.Errorf("write file: %w", err)
 	}
 
 	action := FileActionType(existed)
@@ -93,12 +98,11 @@ func (t *WriteFileTool) Execute(ctx context.Context, params map[string]any) (Too
 		"removed": removed,
 	}
 	if existed {
-		meta["diff"] = SimpleDiff(oldContent, content, path, 30)
+		meta["diff"] = SimpleDiff(oldContent, content, path, writeDiffMaxLines)
 	}
 
-	return ToolResult{
-		Output:  fmt.Sprintf("wrote %d bytes to %s", len(content), path),
-		Success: true,
-		Meta:    meta,
+	return &ToolResult{
+		Output: fmt.Sprintf("wrote %d bytes to %s", len(content), path),
+		Meta:   meta,
 	}, nil
 }

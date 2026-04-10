@@ -43,7 +43,7 @@ type Cacheable interface {
 // cacheEntry stores a tool result together with the mtimes of its dependency
 // paths so the registry can detect on-disk changes.
 type cacheEntry struct {
-	result    ToolResult
+	result    *ToolResult
 	paths     []string
 	mtimes    map[string]time.Time
 	createdAt time.Time
@@ -100,13 +100,13 @@ func (c *ResultCache) HitRate() float64 {
 // Get returns a cached result if present and still valid (paths unchanged).
 // Returns ok=false on miss or staleness; staleness causes the entry to be
 // dropped from the cache.
-func (c *ResultCache) Get(key string) (ToolResult, bool) {
+func (c *ResultCache) Get(key string) (*ToolResult, bool) {
 	c.mu.RLock()
 	entry, ok := c.entries[key]
 	c.mu.RUnlock()
 	if !ok {
 		c.misses.Add(1)
-		return ToolResult{}, false
+		return nil, false
 	}
 
 	// Re-stat all dependency paths.
@@ -117,7 +117,7 @@ func (c *ResultCache) Get(key string) (ToolResult, bool) {
 			// Stale: drop and report miss.
 			c.dropKey(key)
 			c.misses.Add(1)
-			return ToolResult{}, false
+			return nil, false
 		}
 	}
 
@@ -129,13 +129,7 @@ func (c *ResultCache) Get(key string) (ToolResult, bool) {
 // depends on so future lookups can validate freshness.
 //
 // Resolved paths are absolute filesystem paths.
-func (c *ResultCache) Put(key string, result ToolResult, resolvedPaths []string) {
-	if !result.Success {
-		// Never cache failures: they may be transient and we want fresh
-		// behaviour next time.
-		return
-	}
-
+func (c *ResultCache) Put(key string, result *ToolResult, resolvedPaths []string) {
 	mtimes := make(map[string]time.Time, len(resolvedPaths))
 	for _, p := range resolvedPaths {
 		info, err := os.Stat(p)

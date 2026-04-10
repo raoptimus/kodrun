@@ -12,6 +12,15 @@ import (
 	"github.com/raoptimus/kodrun/internal/rag"
 )
 
+const (
+	minGitStatusLineLen      = 4 // minimum git status --short line length
+	prefetchCategoryTests    = "tests"
+	prefetchCategoryGodoc    = "godoc"
+	prefetchCategoryRule     = "rule"
+	prefetchCategoryStandard = "standard"
+	prefetchCategorySnippet  = "snippet"
+)
+
 // detectEntityTypeFromPath returns the rule name (matching .kodrun/rules/<name>.md)
 // for a given Go file path, or "" if no rule name from ruleNames matches.
 // Detection is based on filename suffixes/substrings, not on file contents.
@@ -26,8 +35,8 @@ func detectEntityTypeFromPath(path string, ruleNames []string) string {
 	// _test.go always wins if "tests" rule exists.
 	if strings.HasSuffix(base, "_test") {
 		for _, n := range ruleNames {
-			if n == "tests" {
-				return "tests"
+			if n == prefetchCategoryTests {
+				return prefetchCategoryTests
 			}
 		}
 	}
@@ -38,7 +47,7 @@ func detectEntityTypeFromPath(path string, ruleNames []string) string {
 	sort.Slice(sorted, func(i, j int) bool { return len(sorted[i]) > len(sorted[j]) })
 
 	for _, name := range sorted {
-		if name == "" || name == "tests" {
+		if name == "" || name == prefetchCategoryTests {
 			continue
 		}
 		ln := strings.ToLower(name)
@@ -61,7 +70,7 @@ func gitChangedGoFiles(ctx context.Context, workDir string) []string {
 	}
 	var files []string
 	for line := range strings.SplitSeq(out.String(), "\n") {
-		if len(line) < 4 {
+		if len(line) < minGitStatusLineLen {
 			continue
 		}
 		path := strings.TrimSpace(line[3:])
@@ -78,9 +87,9 @@ func gitChangedGoFiles(ctx context.Context, workDir string) []string {
 
 // entityTypesFromPaths returns the unique set of rule names detected
 // across the given file paths, given a dynamic list of available rule names.
-func entityTypesFromPaths(paths []string, ruleNames []string) []string {
+func entityTypesFromPaths(paths, ruleNames []string) []string {
 	seen := make(map[string]bool)
-	var out []string
+	out := make([]string, 0, len(paths))
 	for _, p := range paths {
 		t := detectEntityTypeFromPath(p, ruleNames)
 		if t == "" || seen[t] {
@@ -99,17 +108,17 @@ func chunkCategory(filePath string) string {
 	base := filepath.Base(filePath)
 	switch {
 	case strings.HasPrefix(filePath, "godoc://"):
-		return "godoc"
+		return prefetchCategoryGodoc
 	case strings.HasPrefix(filePath, "rules://"):
-		return "rule"
+		return prefetchCategoryRule
 	case strings.HasPrefix(filePath, "embedded://"):
-		return "standard"
+		return prefetchCategoryStandard
 	case strings.HasPrefix(base, "example_"):
-		return "snippet"
+		return prefetchCategorySnippet
 	case strings.Contains(filePath, "/snippets/") || strings.HasSuffix(filePath, ".snippet"):
-		return "snippet"
+		return prefetchCategorySnippet
 	case strings.Contains(filePath, "/docs/") || strings.Contains(filePath, "/rules/"):
-		return "rule"
+		return prefetchCategoryRule
 	default:
 		return "code"
 	}
@@ -133,13 +142,13 @@ func formatRAGResults(results []rag.SearchResult) string {
 		cat := chunkCategory(r.Chunk.FilePath)
 		c := categorized{category: cat, result: r}
 		switch cat {
-		case "rule":
+		case prefetchCategoryRule:
 			rules = append(rules, c)
-		case "standard":
+		case prefetchCategoryStandard:
 			standards = append(standards, c)
-		case "snippet":
+		case prefetchCategorySnippet:
 			snippets = append(snippets, c)
-		case "godoc":
+		case prefetchCategoryGodoc:
 			godocs = append(godocs, c)
 		default:
 			// "code" chunks should no longer reach this formatter: RAG only

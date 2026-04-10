@@ -23,6 +23,11 @@ const (
 // prose. Prevents loops on models that refuse to call tools.
 const maxEditNudges = 2
 
+// maxPlanBlocked caps consecutive iterations in plan mode where every tool
+// call was blocked (model hallucinated write tools). After this many
+// iterations the agent stops early to avoid wasting the iteration budget.
+const maxPlanBlocked = 3
+
 // planMarkerWords are case-insensitive substrings that strongly indicate a
 // plan/analysis dump rather than executed work. Local models in RU/EN both
 // fall back to these headings when they refuse to call tools.

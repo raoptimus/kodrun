@@ -20,10 +20,7 @@ func TestReadFileTool(t *testing.T) {
 
 	result, err := tool.Execute(context.Background(), map[string]any{"path": "test.txt"})
 	if err != nil {
-		t.Fatal(err)
-	}
-	if !result.Success {
-		t.Fatalf("expected success, got error: %s", result.Error)
+		t.Fatalf("expected success, got error: %v", err)
 	}
 	expected := "   1 | hello world\n"
 	if result.Output != expected {
@@ -38,11 +35,8 @@ func TestReadFileTool_Forbidden(t *testing.T) {
 	}
 
 	tool := NewReadFileTool(dir, []string{"*.env"}, 500)
-	result, err := tool.Execute(context.Background(), map[string]any{"path": ".env"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Success {
+	_, err := tool.Execute(context.Background(), map[string]any{"path": ".env"})
+	if err == nil {
 		t.Error("expected forbidden access to fail")
 	}
 }
@@ -57,10 +51,7 @@ func TestReadFileTool_SmallFile(t *testing.T) {
 	tool := NewReadFileTool(dir, nil, 500)
 	result, err := tool.Execute(context.Background(), map[string]any{"path": "small.txt"})
 	if err != nil {
-		t.Fatal(err)
-	}
-	if !result.Success {
-		t.Fatalf("expected success, got error: %s", result.Error)
+		t.Fatalf("expected success, got error: %v", err)
 	}
 	if strings.Contains(result.Output, "[truncated]") {
 		t.Error("small file should not be truncated")
@@ -84,10 +75,7 @@ func TestReadFileTool_Truncation(t *testing.T) {
 	tool := NewReadFileTool(dir, nil, 5)
 	result, err := tool.Execute(context.Background(), map[string]any{"path": "big.txt"})
 	if err != nil {
-		t.Fatal(err)
-	}
-	if !result.Success {
-		t.Fatalf("expected success, got error: %s", result.Error)
+		t.Fatalf("expected success, got error: %v", err)
 	}
 	if !strings.Contains(result.Output, "[truncated]") {
 		t.Error("large file should be truncated")
@@ -117,10 +105,7 @@ func TestReadFileTool_OffsetLimit(t *testing.T) {
 		"limit":  float64(5),
 	})
 	if err != nil {
-		t.Fatal(err)
-	}
-	if !result.Success {
-		t.Fatalf("expected success, got error: %s", result.Error)
+		t.Fatalf("expected success, got error: %v", err)
 	}
 	if !strings.Contains(result.Output, "  11 | line 11") {
 		t.Errorf("expected line 11, got: %s", result.Output)
@@ -140,14 +125,11 @@ func TestReadFileTool_OffsetBeyondEnd(t *testing.T) {
 	}
 
 	tool := NewReadFileTool(dir, nil, 500)
-	result, err := tool.Execute(context.Background(), map[string]any{
+	_, err := tool.Execute(context.Background(), map[string]any{
 		"path":   "short.txt",
 		"offset": float64(100),
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Success {
+	if err == nil {
 		t.Error("expected failure for offset beyond file end")
 	}
 }
@@ -159,12 +141,9 @@ func TestReadFileTool_EmptyFile(t *testing.T) {
 	}
 
 	tool := NewReadFileTool(dir, nil, 500)
-	result, err := tool.Execute(context.Background(), map[string]any{"path": "empty.txt"})
+	_, err := tool.Execute(context.Background(), map[string]any{"path": "empty.txt"})
 	if err != nil {
-		t.Fatal(err)
-	}
-	if !result.Success {
-		t.Fatalf("expected success, got error: %s", result.Error)
+		t.Fatalf("expected success, got error: %v", err)
 	}
 }
 
@@ -172,15 +151,12 @@ func TestWriteFileTool(t *testing.T) {
 	dir := t.TempDir()
 	tool := NewWriteFileTool(dir, nil)
 
-	result, err := tool.Execute(context.Background(), map[string]any{
+	_, err := tool.Execute(context.Background(), map[string]any{
 		"path":    "sub/new.txt",
 		"content": "new content",
 	})
 	if err != nil {
-		t.Fatal(err)
-	}
-	if !result.Success {
-		t.Fatalf("expected success, got error: %s", result.Error)
+		t.Fatalf("expected success, got error: %v", err)
 	}
 
 	data, err := os.ReadFile(filepath.Join(dir, "sub", "new.txt"))
@@ -200,16 +176,13 @@ func TestEditFileTool(t *testing.T) {
 	}
 
 	tool := NewEditFileTool(dir, nil)
-	result, err := tool.Execute(context.Background(), map[string]any{
+	_, err := tool.Execute(context.Background(), map[string]any{
 		"path":    "main.go",
 		"old_str": "hello",
 		"new_str": "world",
 	})
 	if err != nil {
-		t.Fatal(err)
-	}
-	if !result.Success {
-		t.Fatalf("expected success, got error: %s", result.Error)
+		t.Fatalf("expected success, got error: %v", err)
 	}
 
 	data, err := os.ReadFile(filepath.Join(dir, "main.go"))
@@ -229,15 +202,12 @@ func TestEditFileTool_NotFound(t *testing.T) {
 	}
 
 	tool := NewEditFileTool(dir, nil)
-	result, err := tool.Execute(context.Background(), map[string]any{
+	_, err := tool.Execute(context.Background(), map[string]any{
 		"path":    "test.go",
 		"old_str": "xyz",
 		"new_str": "123",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Success {
+	if err == nil {
 		t.Error("expected failure when old_str not found")
 	}
 }
@@ -251,10 +221,7 @@ func TestListDirTool(t *testing.T) {
 	tool := NewListDirTool(dir, nil)
 	result, err := tool.Execute(context.Background(), map[string]any{"path": "."})
 	if err != nil {
-		t.Fatal(err)
-	}
-	if !result.Success {
-		t.Fatalf("expected success, got error: %s", result.Error)
+		t.Fatalf("expected success, got error: %v", err)
 	}
 	if result.Output == "" {
 		t.Error("expected non-empty output")
@@ -267,12 +234,9 @@ func TestDeleteFileTool(t *testing.T) {
 	os.WriteFile(filePath, []byte("bye"), 0o644)
 
 	tool := NewDeleteFileTool(dir, nil)
-	result, err := tool.Execute(context.Background(), map[string]any{"path": "delete-me.txt"})
+	_, err := tool.Execute(context.Background(), map[string]any{"path": "delete-me.txt"})
 	if err != nil {
-		t.Fatal(err)
-	}
-	if !result.Success {
-		t.Fatalf("expected success, got error: %s", result.Error)
+		t.Fatalf("expected success, got error: %v", err)
 	}
 	if _, err := os.Stat(filePath); !os.IsNotExist(err) {
 		t.Error("file should be deleted")

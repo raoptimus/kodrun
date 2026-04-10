@@ -31,6 +31,8 @@ const (
 	ScopeCoding Scope = "coding"
 	ScopeReview Scope = "review"
 	ScopeFix    Scope = "fix"
+
+	frontMatterDescription = "description"
 )
 
 // Rule represents a loaded rule file.
@@ -60,17 +62,17 @@ type CommandArg struct {
 
 // Fixed directories for rules, commands, and docs.
 var (
-	RulesDirs    = ".kodrun/rules"
-	CommandsDir  = ".kodrun/commands"
-	DocsDir      = ".kodrun/docs"
+	RulesDirs   = ".kodrun/rules"
+	CommandsDir = ".kodrun/commands"
+	DocsDir     = ".kodrun/docs"
 )
 
 // Loader loads and caches rules from directories.
 type Loader struct {
-	dirs       []string
-	workDir    string
-	rules      []*Rule
-	commands   map[string]*Command
+	dirs           []string
+	workDir        string
+	rules          []*Rule
+	commands       map[string]*Command
 	refDocs        map[string]string // path → resolved content (deduplicated)
 	refOrder       []string          // insertion order for deterministic output
 	maxRefSize     int               // max size of a single doc (0 = no limit)
@@ -83,6 +85,8 @@ type UnresolvedRef struct {
 	RulePath string // path to the rule file containing the broken reference
 	RefPath  string // the @-target as written in the rule (without the leading @)
 }
+
+const minKeyValueParts = 2 // expected parts when splitting "key: value"
 
 // refPattern matches @path references in rule content.
 // Matches: @.kodrun/docs/file.md, @.kodrun/docs/example.go, etc.
@@ -119,47 +123,17 @@ func (l *Loader) Load(ctx context.Context) error {
 			continue
 		}
 
-		err := filepath.WalkDir(absDir, func(path string, d fs.DirEntry, err error) error {
-			if err != nil || d.IsDir() {
-				return nil
+		err := filepath.WalkDir(absDir, func(path string, d fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return filepath.SkipDir
 			}
-			if filepath.Ext(path) != ".md" {
-				return nil
-			}
-
-			data, err := os.ReadFile(path)
-			if err != nil {
+			if d.IsDir() || filepath.Ext(path) != ".md" {
 				return nil
 			}
 
-			info, err := d.Info()
-			if err != nil {
-				return nil
+			if err := l.loadRule(ctx, dir, path, d); err != nil {
+				return err
 			}
-
-			content := string(data)
-			priority, scope, body, desc := parseFrontMatter(content)
-
-			// Collect @file references: deduplicate into refDocs, replace with labels
-			body, refPaths := l.collectReferences(ctx, path, body)
-
-			// Check if this is a command definition
-			if strings.Contains(dir, "commands") {
-				cmd := parseCommand(path, content)
-				if cmd != nil {
-					l.commands[cmd.Name] = cmd
-				}
-			}
-
-			l.rules = append(l.rules, &Rule{
-				Path:        path,
-				Content:     body,
-				Priority:    priority,
-				Scope:       scope,
-				ModTime:     info.ModTime(),
-				RefPaths:    refPaths,
-				description: desc,
-			})
 
 			return nil
 		})
@@ -175,13 +149,57 @@ func (l *Loader) Load(ctx context.Context) error {
 	return nil
 }
 
+// loadRule reads a single rule file and appends it to l.rules.
+func (l *Loader) loadRule(ctx context.Context, dir, path string, d fs.DirEntry) error {
+	data, readErr := os.ReadFile(path)
+	if readErr != nil {
+		return fmt.Errorf("read rule %s: %w", path, readErr)
+	}
+	if len(data) == 0 {
+		return nil
+	}
+
+	info, infoErr := d.Info()
+	if infoErr != nil {
+		return fmt.Errorf("stat rule %s: %w", path, infoErr)
+	}
+	if info == nil {
+		return nil
+	}
+
+	content := string(data)
+	priority, scope, body, desc := parseFrontMatter(content)
+
+	// Collect @file references: deduplicate into refDocs, replace with labels
+	body, refPaths := l.collectReferences(ctx, path, body)
+
+	// Check if this is a command definition
+	if strings.Contains(dir, "commands") {
+		cmd := parseCommand(path, content)
+		if cmd != nil {
+			l.commands[cmd.Name] = cmd
+		}
+	}
+
+	l.rules = append(l.rules, &Rule{
+		Path:        path,
+		Content:     body,
+		Priority:    priority,
+		Scope:       scope,
+		ModTime:     info.ModTime(),
+		RefPaths:    refPaths,
+		description: desc,
+	})
+
+	return nil
+}
+
 // collectReferences scans @path refs in text, resolves and deduplicates them into
 // refDocs, and replaces inline references with [see: filename] labels.
 // Returns the modified text and list of reference paths.
 // Any @-reference that fails to resolve is recorded in l.unresolvedRefs so the
 // caller can surface a warning instead of silently dropping the doc from RAG.
-func (l *Loader) collectReferences(ctx context.Context, rulePath, content string) (string, []string) {
-	var refPaths []string
+func (l *Loader) collectReferences(ctx context.Context, rulePath, content string) (resolvedContent string, refPaths []string) {
 	seen := make(map[string]bool)
 
 	result := refPattern.ReplaceAllStringFunc(content, func(match string) string {
@@ -219,8 +237,8 @@ func (l *Loader) collectReferences(ctx context.Context, rulePath, content string
 
 // resolveRef reads a referenced file. The @-syntax always resolves relative
 // to the project root (workDir); the path is used as-is without any rewriting.
-func (l *Loader) resolveRef(ctx context.Context, refPath string) (string, []byte, error) {
-	data, err := l.readRef(ctx, refPath)
+func (l *Loader) resolveRef(ctx context.Context, refPath string) (resolved string, data []byte, err error) {
+	data, err = l.readRef(ctx, refPath)
 	if err != nil {
 		return "", nil, err
 	}
@@ -228,7 +246,7 @@ func (l *Loader) resolveRef(ctx context.Context, refPath string) (string, []byte
 }
 
 // formatDoc formats and optionally truncates a doc for inclusion in ReferenceDocs.
-func (l *Loader) formatDoc(_ context.Context, path string, content string) string {
+func (l *Loader) formatDoc(_ context.Context, path, content string) string {
 	if l.maxRefSize > 0 && len(content) > l.maxRefSize {
 		content = content[:l.maxRefSize] + fmt.Sprintf(
 			"\n[truncated — use read_file(%q) for full content]", path,
@@ -508,27 +526,26 @@ func (l *Loader) Commands() map[string]*Command {
 	return l.commands
 }
 
-func parseFrontMatter(content string) (Priority, Scope, string, string) {
-	priority := PriorityNormal
-	scope := ScopeAll
-	description := ""
+func parseFrontMatter(content string) (outPriority Priority, outScope Scope, outBody, outDesc string) {
+	outPriority = PriorityNormal
+	outScope = ScopeAll
 
 	if !strings.HasPrefix(content, "---") {
-		return priority, scope, content, description
+		return outPriority, outScope, content, outDesc
 	}
 
 	end := strings.Index(content[3:], "---")
 	if end == -1 {
-		return priority, scope, content, description
+		return outPriority, outScope, content, outDesc
 	}
 
 	frontMatter := content[3 : end+3]
-	body := content[end+6:]
+	bodyText := content[end+6:]
 
 	for _, line := range strings.Split(frontMatter, "\n") {
 		line = strings.TrimSpace(line)
-		parts := strings.SplitN(line, ":", 2)
-		if len(parts) != 2 {
+		parts := strings.SplitN(line, ":", minKeyValueParts)
+		if len(parts) != minKeyValueParts {
 			continue
 		}
 		key := strings.TrimSpace(parts[0])
@@ -538,18 +555,18 @@ func parseFrontMatter(content string) (Priority, Scope, string, string) {
 		case "priority":
 			switch val {
 			case "high":
-				priority = PriorityHigh
+				outPriority = PriorityHigh
 			case "low":
-				priority = PriorityLow
+				outPriority = PriorityLow
 			}
 		case "scope":
-			scope = Scope(val)
-		case "description":
-			description = strings.Trim(val, "\"")
+			outScope = Scope(val)
+		case frontMatterDescription:
+			outDesc = strings.Trim(val, "\"")
 		}
 	}
 
-	return priority, scope, strings.TrimSpace(body), description
+	return outPriority, outScope, strings.TrimSpace(bodyText), outDesc
 }
 
 func parseCommand(path, content string) *Command {
@@ -571,8 +588,8 @@ func parseCommand(path, content string) *Command {
 
 	for _, line := range strings.Split(frontMatter, "\n") {
 		line = strings.TrimSpace(line)
-		parts := strings.SplitN(line, ":", 2)
-		if len(parts) != 2 {
+		parts := strings.SplitN(line, ":", minKeyValueParts)
+		if len(parts) != minKeyValueParts {
 			continue
 		}
 		key := strings.TrimSpace(parts[0])
@@ -582,7 +599,7 @@ func parseCommand(path, content string) *Command {
 		switch key {
 		case "command":
 			cmd.Name = strings.TrimPrefix(val, "/")
-		case "description":
+		case frontMatterDescription:
 			cmd.Description = val
 		}
 	}

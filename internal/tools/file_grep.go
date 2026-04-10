@@ -39,25 +39,31 @@ func (t *GrepTool) Schema() ollama.JSONSchema {
 	}
 }
 
-func (t *GrepTool) Execute(ctx context.Context, params map[string]any) (ToolResult, error) {
-	pattern, _ := params["pattern"].(string)
-	path, _ := params["path"].(string)
-	recursive, _ := params["recursive"].(string)
+func (t *GrepTool) Execute(ctx context.Context, params map[string]any) (*ToolResult, error) {
+	pattern, ok := params["pattern"].(string)
+	if !ok || pattern == "" {
+		return nil, &ToolError{Msg: "pattern is required"}
+	}
 
-	if pattern == "" {
-		return ToolResult{Error: "pattern is required", Success: false}, nil
+	var path string
+	if v, ok2 := params["path"].(string); ok2 {
+		path = v
+	}
+	var recursive string
+	if v, ok2 := params["recursive"].(string); ok2 {
+		recursive = v
 	}
 
 	re, err := regexp.Compile(pattern)
 	if err != nil {
-		return ToolResult{Error: fmt.Sprintf("invalid regex: %s", err), Success: false}, nil
+		return nil, &ToolError{Msg: fmt.Sprintf("invalid regex: %s", err)}
 	}
 
 	searchPath := t.workDir
 	if path != "" {
 		resolved, err := SafePath(ctx, t.workDir, path)
 		if err != nil {
-			return ToolResult{Error: err.Error(), Success: false}, nil
+			return nil, fmt.Errorf("resolve path: %w", err)
 		}
 		searchPath = resolved
 	}
@@ -75,7 +81,10 @@ func (t *GrepTool) Execute(ctx context.Context, params map[string]any) (ToolResu
 		}
 		defer f.Close()
 
-		rel, _ := filepath.Rel(t.workDir, filePath)
+		rel, relErr := filepath.Rel(t.workDir, filePath)
+		if relErr != nil {
+			rel = filePath
+		}
 		scanner := bufio.NewScanner(f)
 		lineNum := 0
 		for scanner.Scan() {
@@ -93,17 +102,24 @@ func (t *GrepTool) Execute(ctx context.Context, params map[string]any) (ToolResu
 
 	info, err := os.Stat(searchPath)
 	if err != nil {
-		return ToolResult{Error: err.Error(), Success: false}, nil
+		return nil, fmt.Errorf("stat path: %w", err)
 	}
 
-	if !info.IsDir() {
+	switch {
+	case !info.IsDir():
 		searchFile(searchPath)
-	} else if recursive == "true" {
-		_ = filepath.WalkDir(searchPath, func(p string, d fs.DirEntry, err error) error {
-			if err != nil || len(results) >= maxResults {
-				return nil
+	case recursive == boolTrue:
+		if walkErr := filepath.WalkDir(searchPath, func(p string, d fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return filepath.SkipDir
 			}
-			rel, _ := filepath.Rel(t.workDir, p)
+			if len(results) >= maxResults {
+				return filepath.SkipAll
+			}
+			rel, relErr := filepath.Rel(t.workDir, p)
+			if relErr != nil {
+				return filepath.SkipDir
+			}
 			if d.IsDir() {
 				if IsForbiddenDir(ctx, rel, t.forbidden) {
 					return filepath.SkipDir
@@ -115,9 +131,14 @@ func (t *GrepTool) Execute(ctx context.Context, params map[string]any) (ToolResu
 			}
 			searchFile(p)
 			return nil
-		})
-	} else {
-		entries, _ := os.ReadDir(searchPath)
+		}); walkErr != nil {
+			return nil, fmt.Errorf("walk dir: %w", walkErr)
+		}
+	default:
+		entries, readErr := os.ReadDir(searchPath)
+		if readErr != nil {
+			return nil, fmt.Errorf("read dir: %w", readErr)
+		}
 		for _, e := range entries {
 			if e.IsDir() || len(results) >= maxResults {
 				continue
@@ -131,8 +152,8 @@ func (t *GrepTool) Execute(ctx context.Context, params map[string]any) (ToolResu
 	}
 
 	if len(results) == 0 {
-		return ToolResult{Output: "no matches found", Success: true}, nil
+		return &ToolResult{Output: "no matches found"}, nil
 	}
 
-	return ToolResult{Output: strings.Join(results, "\n"), Success: true}, nil
+	return &ToolResult{Output: strings.Join(results, "\n")}, nil
 }

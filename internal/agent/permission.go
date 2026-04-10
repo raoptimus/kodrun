@@ -38,9 +38,9 @@ type ConfirmPayload struct {
 // fingerprint-friendly description and as a fallback for compact UIs.
 func (p ConfirmPayload) Detail() string {
 	switch p.Tool {
-	case "move_file":
+	case toolNameMoveFile:
 		return p.Args["from"] + " → " + p.Args["to"]
-	case "bash":
+	case toolNameBash:
 		return p.Args["command"]
 	}
 	if v, ok := p.Args["path"]; ok {
@@ -75,18 +75,31 @@ type PlanConfirmResult struct {
 // PlanConfirmFunc asks user to confirm plan execution.
 type PlanConfirmFunc func(plan string) PlanConfirmResult
 
+// StepConfirmAction represents the user's decision on a single step.
+type StepConfirmAction int
+
+const (
+	StepAllow   StepConfirmAction = iota // Execute this step
+	StepSkip                             // Skip this step, continue with next
+	StepDenyAll                          // Cancel all remaining steps
+)
+
+// StepConfirmFunc asks user to confirm execution of a single plan step.
+// The description contains step title, files, action, and rationale.
+type StepConfirmFunc func(description string) StepConfirmAction
+
 // Fingerprint computes a deterministic key for a tool call.
 func Fingerprint(tool string, args map[string]any) string {
 	switch tool {
-	case "bash":
-		cmd, _ := args["command"].(string)
-		if len(cmd) > 80 {
-			cmd = cmd[:80]
+	case toolNameBash:
+		cmd := stringFromMap(args, "command")
+		if len(cmd) > maxFingerprintLen {
+			cmd = cmd[:maxFingerprintLen]
 		}
 		return fmt.Sprintf("bash:%s", cmd)
-	case "move_file":
-		from, _ := args["from"].(string)
-		to, _ := args["to"].(string)
+	case toolNameMoveFile:
+		from := stringFromMap(args, "from")
+		to := stringFromMap(args, "to")
 		return fmt.Sprintf("move_file:%s->%s", from, to)
 	default:
 		// Per-tool fingerprint: ConfirmAllowSession должен покрывать команду

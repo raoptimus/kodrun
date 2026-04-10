@@ -8,6 +8,8 @@ import (
 	"strings"
 )
 
+const codeFenceLen = 3 // length of "```" code fence marker
+
 // Plan is the structured representation of an executable plan produced by the
 // extractor role. It is the contract between the planner/extractor pair and
 // the executor: each Step is a self-contained unit of work the executor
@@ -57,8 +59,8 @@ func (p *Plan) AffectedFiles() []string {
 		return nil
 	}
 	seen := make(map[string]struct{})
-	for _, s := range p.Steps {
-		for _, f := range s.Files {
+	for i := range p.Steps {
+		for _, f := range p.Steps[i].Files {
 			if f == "" {
 				continue
 			}
@@ -84,7 +86,7 @@ func parseStructuredPlan(raw string) (*Plan, error) {
 	}
 	// Strip markdown code fences if present.
 	if strings.HasPrefix(raw, "```") {
-		if end := strings.LastIndex(raw, "```"); end > 3 {
+		if end := strings.LastIndex(raw, "```"); end > codeFenceLen {
 			raw = raw[strings.Index(raw, "\n")+1 : end]
 		}
 	}
@@ -140,7 +142,7 @@ func RenderExtractorOutput(raw string) string {
 	}
 	// Strip markdown code fences if present.
 	if strings.HasPrefix(trimmed, "```") {
-		if end := strings.LastIndex(trimmed, "```"); end > 3 {
+		if end := strings.LastIndex(trimmed, "```"); end > codeFenceLen {
 			if nl := strings.Index(trimmed, "\n"); nl >= 0 && nl < end {
 				trimmed = strings.TrimSpace(trimmed[nl+1 : end])
 			}

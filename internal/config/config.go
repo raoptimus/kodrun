@@ -2,13 +2,17 @@ package config
 
 import (
 	"context"
+	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"time"
 
-	"github.com/pkg/errors"
+	pkgerrors "github.com/pkg/errors"
 	"github.com/spf13/viper"
 )
+
+const providerDefault = "default"
 
 // Config is the root configuration structure.
 type Config struct {
@@ -130,19 +134,23 @@ type AgentConfig struct {
 	MaxIterations     int    `mapstructure:"max_iterations"`
 	MaxParallelTasks  int    `mapstructure:"max_parallel_tasks"`
 	MaxReplans        int    `mapstructure:"max_replans"`
-	MaxToolWorkers int   `mapstructure:"max_tool_workers"`
-	AutoFix       bool   `mapstructure:"auto_fix"`
-	AutoCommit    bool   `mapstructure:"auto_commit"`
-	DefaultMode   string `mapstructure:"default_mode"`
-	Think         bool   `mapstructure:"think"`
-	Language      string `mapstructure:"language"`
-	AutoCompact   bool   `mapstructure:"auto_compact"`
-	Orchestrator  bool   `mapstructure:"orchestrator"`
-	Review        bool   `mapstructure:"review"`
-	PrefetchCode  bool   `mapstructure:"prefetch_code"`
+	MaxToolWorkers    int    `mapstructure:"max_tool_workers"`
+	AutoFix           bool   `mapstructure:"auto_fix"`
+	AutoCommit        bool   `mapstructure:"auto_commit"`
+	DefaultMode       string `mapstructure:"default_mode"`
+	Think             bool   `mapstructure:"think"`
+	Language          string `mapstructure:"language"`
+	AutoCompact       bool   `mapstructure:"auto_compact"`
+	Orchestrator      bool   `mapstructure:"orchestrator"`
+	Review            bool   `mapstructure:"review"`
+	PrefetchCode      bool   `mapstructure:"prefetch_code"`
 	// ProjectLanguage overrides automatic project-language detection.
 	// Valid values: "go", "python", "jsts". Empty enables auto-detection.
 	ProjectLanguage string `mapstructure:"project_language"`
+
+	// SpecialistTimeout caps wall time for a single review specialist.
+	// 0 means no per-specialist deadline (only the HTTP client timeout applies).
+	SpecialistTimeout time.Duration `mapstructure:"specialist_timeout"`
 }
 
 // ToolsConfig holds file tool restrictions.
@@ -197,39 +205,60 @@ type RAGConfig struct {
 	IndexPath         string `mapstructure:"index_path"`
 }
 
+// Default configuration values.
+const (
+	defaultOllamaTimeout   = 5 * time.Minute
+	defaultContextSize     = 32768
+	defaultMaxIterations   = 50
+	defaultMaxToolWorkers  = 4
+	defaultMaxReplans      = 2
+	defaultSpecTimeout     = 5 * time.Minute
+	defaultMaxReadLines    = 500
+	defaultMaxRefSize      = 4096
+	defaultRAGChunkSize    = 128
+	defaultRAGChunkOverlap = 16
+	defaultRAGMaxChunks    = 8
+	defaultRAGTopK         = 5
+	defaultRAGReviewBudget = 24 * 1024
+	defaultMaxHistory      = 100
+	minProviderContextSize = 1024
+	defaultProviderTimeout = 5 * time.Minute
+)
+
 // Defaults returns a Config with default values.
 func Defaults() Config {
 	return Config{
 		Ollama: OllamaConfig{
 			BaseURL:     "http://localhost:11434",
 			Model:       "qwen3-coder:30b",
-			Timeout:     5 * time.Minute,
-			ContextSize: 32768,
+			Timeout:     defaultOllamaTimeout,
+			ContextSize: defaultContextSize,
 		},
 		Agent: AgentConfig{
-			Provider:         "default",
-			MaxIterations:    50,
-			MaxToolWorkers:       4,
-			MaxParallelTasks: 1,
-			MaxReplans:       2,
-			AutoFix:       true,
-			AutoCommit:    false,
-			DefaultMode:   "plan",
-			Think:         true,
-			Language:      "en",
-			AutoCompact:   true,
+			Provider:          providerDefault,
+			MaxIterations:     defaultMaxIterations,
+			MaxToolWorkers:    defaultMaxToolWorkers,
+			MaxParallelTasks:  1,
+			MaxReplans:        defaultMaxReplans,
+			AutoFix:           true,
+			AutoCommit:        false,
+			DefaultMode:       "plan",
+			Think:             true,
+			Language:          "en",
+			AutoCompact:       true,
+			SpecialistTimeout: defaultSpecTimeout,
 		},
 		Tools: ToolsConfig{
-			AllowedDirs:       []string{"."},
+			AllowedDirs: []string{"."},
 			ForbiddenPatterns: []string{
 				"*.env", "*.pem", "*.key",
 				"node_modules/**", "vendor/**",
 				"*.exe", "*.bin", "*.o", "*.a", "*.so", "*.dylib",
 			},
-			MaxReadLines:      500,
+			MaxReadLines: defaultMaxReadLines,
 		},
 		Rules: RulesConfig{
-			MaxRefSize: 4096,
+			MaxRefSize: defaultMaxRefSize,
 			UseTool:    true,
 		},
 		Snippets: SnippetsConfig{
@@ -239,15 +268,15 @@ func Defaults() Config {
 			Enabled:           false,
 			IndexDirs:         []string{"."},
 			ExcludeDirs:       []string{".claude", ".git", "vendor", "node_modules", ".kodrun/rag_index"},
-			ChunkSize:         128,
-			ChunkOverlap:      16,
-			MaxChunksPerFile:  8,
-			TopK:              5,
-			ReviewBudgetBytes: 24 * 1024,
+			ChunkSize:         defaultRAGChunkSize,
+			ChunkOverlap:      defaultRAGChunkOverlap,
+			MaxChunksPerFile:  defaultRAGMaxChunks,
+			TopK:              defaultRAGTopK,
+			ReviewBudgetBytes: defaultRAGReviewBudget,
 			IndexPath:         ".kodrun/rag_index",
 		},
 		TUI: TUIConfig{
-			MaxHistory: 100,
+			MaxHistory: defaultMaxHistory,
 		},
 	}
 }
@@ -284,12 +313,18 @@ func Load(ctx context.Context, configPath, workDir string) (Config, error) {
 		}
 	} else {
 		// Global config
-		home, _ := os.UserHomeDir()
-		if home != "" {
+		home, homeErr := os.UserHomeDir()
+		if homeErr == nil && home != "" {
 			v.AddConfigPath(filepath.Join(home, ".config", "kodrun"))
 			v.SetConfigName("config")
 		}
-		_ = v.ReadInConfig()
+		if err := v.ReadInConfig(); err != nil {
+			// Global config is optional — ignore "not found" errors.
+			var notFound viper.ConfigFileNotFoundError
+			if !errors.As(err, &notFound) {
+				slog.Debug("failed to read global config", "error", err)
+			}
+		}
 
 		// Project-local config (higher priority)
 		localV := viper.New()
@@ -319,7 +354,7 @@ func Load(ctx context.Context, configPath, workDir string) (Config, error) {
 func (c *Config) migrate(_ context.Context) {
 	if len(c.Providers) == 0 {
 		c.Providers = map[string]ProviderConfig{
-			"default": {
+			providerDefault: {
 				BaseURL:     c.Ollama.BaseURL,
 				Model:       c.Ollama.Model,
 				Timeout:     c.Ollama.Timeout,
@@ -328,10 +363,10 @@ func (c *Config) migrate(_ context.Context) {
 		}
 	}
 	if c.Agent.Provider == "" {
-		c.Agent.Provider = "default"
+		c.Agent.Provider = providerDefault
 	}
 	if c.RAG.Provider == "" {
-		c.RAG.Provider = "default"
+		c.RAG.Provider = providerDefault
 	}
 }
 
@@ -339,46 +374,46 @@ func (c *Config) migrate(_ context.Context) {
 func (c *Config) Validate(_ context.Context) error {
 	// Validate provider references
 	if _, ok := c.Providers[c.Agent.Provider]; !ok {
-		return errors.Errorf("agent.provider %q not found in providers", c.Agent.Provider)
+		return pkgerrors.Errorf("agent.provider %q not found in providers", c.Agent.Provider)
 	}
 	if c.Agent.ThinkingProvider != "" {
 		if _, ok := c.Providers[c.Agent.ThinkingProvider]; !ok {
-			return errors.Errorf("agent.thinking_provider %q not found in providers", c.Agent.ThinkingProvider)
+			return pkgerrors.Errorf("agent.thinking_provider %q not found in providers", c.Agent.ThinkingProvider)
 		}
 	}
 	if c.Agent.ExecutorProvider != "" {
 		if _, ok := c.Providers[c.Agent.ExecutorProvider]; !ok {
-			return errors.Errorf("agent.executor_provider %q not found in providers", c.Agent.ExecutorProvider)
+			return pkgerrors.Errorf("agent.executor_provider %q not found in providers", c.Agent.ExecutorProvider)
 		}
 	}
 	if c.Agent.ExtractorProvider != "" {
 		if _, ok := c.Providers[c.Agent.ExtractorProvider]; !ok {
-			return errors.Errorf("agent.extractor_provider %q not found in providers", c.Agent.ExtractorProvider)
+			return pkgerrors.Errorf("agent.extractor_provider %q not found in providers", c.Agent.ExtractorProvider)
 		}
 	}
 	if c.RAG.Enabled {
 		ragProv, ok := c.Providers[c.RAG.Provider]
 		if !ok {
-			return errors.Errorf("rag.provider %q not found in providers", c.RAG.Provider)
+			return pkgerrors.Errorf("rag.provider %q not found in providers", c.RAG.Provider)
 		}
 		if ragProv.Model == "" {
-			return errors.Errorf("rag.provider %q has empty model — set providers.%s.model to your embedding model (e.g. nomic-embed-text)", c.RAG.Provider, c.RAG.Provider)
+			return pkgerrors.Errorf("rag.provider %q has empty model — set providers.%s.model to your embedding model (e.g. nomic-embed-text)", c.RAG.Provider, c.RAG.Provider)
 		}
 	}
 
 	// Apply defaults to each provider
 	for name, p := range c.Providers {
-		if p.ContextSize < 1024 {
-			p.ContextSize = 32768
+		if p.ContextSize < minProviderContextSize {
+			p.ContextSize = defaultContextSize
 		}
 		if p.Timeout <= 0 {
-			p.Timeout = 5 * time.Minute
+			p.Timeout = defaultProviderTimeout
 		}
 		c.Providers[name] = p
 	}
 
 	if c.Agent.MaxIterations <= 0 {
-		c.Agent.MaxIterations = 50
+		c.Agent.MaxIterations = defaultMaxIterations
 	}
 	if c.Agent.MaxToolWorkers <= 0 {
 		c.Agent.MaxToolWorkers = 1

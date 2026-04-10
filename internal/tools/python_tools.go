@@ -3,11 +3,12 @@ package tools
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"os/exec"
 	"strings"
 	"time"
 
-	"github.com/pkg/errors"
 	"github.com/raoptimus/kodrun/internal/ollama"
 )
 
@@ -25,9 +26,10 @@ func (t *pythonTool) Name() string              { return t.name }
 func (t *pythonTool) Description() string       { return t.description }
 func (t *pythonTool) Schema() ollama.JSONSchema { return t.schema }
 
-func (t *pythonTool) Execute(ctx context.Context, params map[string]any) (ToolResult, error) {
-	args := make([]string, len(t.defaultArgs))
-	copy(args, t.defaultArgs)
+func (t *pythonTool) Execute(ctx context.Context, params map[string]any) (*ToolResult, error) {
+	const extraArgsCap = 4
+	args := make([]string, 0, len(t.defaultArgs)+extraArgsCap)
+	args = append(args, t.defaultArgs...)
 
 	if extra, ok := params["args"].(string); ok && extra != "" {
 		args = append(args, strings.Fields(extra)...)
@@ -50,7 +52,7 @@ func (t *pythonTool) Execute(ctx context.Context, params map[string]any) (ToolRe
 		if errors.As(err, &exitErr) {
 			exitCode = exitErr.ExitCode()
 		} else {
-			return ToolResult{Error: err.Error(), Success: false}, nil
+			return nil, fmt.Errorf("run %s: %w", t.command, err)
 		}
 	}
 
@@ -62,9 +64,8 @@ func (t *pythonTool) Execute(ctx context.Context, params map[string]any) (ToolRe
 		output += stderr.String()
 	}
 
-	return ToolResult{
-		Output:  output,
-		Success: exitCode == 0,
+	return &ToolResult{
+		Output: output,
 		Meta: map[string]any{
 			"exit_code": exitCode,
 			"duration":  duration.String(),

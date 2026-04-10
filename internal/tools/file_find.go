@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"fmt"
 	"io/fs"
 	"path/filepath"
 	"strings"
@@ -34,29 +35,34 @@ func (t *FindFilesTool) Schema() ollama.JSONSchema {
 	}
 }
 
-func (t *FindFilesTool) Execute(ctx context.Context, params map[string]any) (ToolResult, error) {
-	pattern, _ := params["pattern"].(string)
-	root, _ := params["root"].(string)
-
-	if pattern == "" {
-		return ToolResult{Error: "pattern is required", Success: false}, nil
+func (t *FindFilesTool) Execute(ctx context.Context, params map[string]any) (*ToolResult, error) {
+	pattern, ok := params["pattern"].(string)
+	if !ok || pattern == "" {
+		return nil, &ToolError{Msg: "pattern is required"}
+	}
+	var root string
+	if v, ok := params["root"].(string); ok {
+		root = v
 	}
 
 	searchRoot := t.workDir
 	if root != "" {
 		resolved, err := SafePath(ctx, t.workDir, root)
 		if err != nil {
-			return ToolResult{Error: err.Error(), Success: false}, nil
+			return nil, fmt.Errorf("resolve path: %w", err)
 		}
 		searchRoot = resolved
 	}
 
 	var matches []string
-	err := filepath.WalkDir(searchRoot, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return nil
+	err := filepath.WalkDir(searchRoot, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return filepath.SkipDir
 		}
-		rel, _ := filepath.Rel(t.workDir, path)
+		rel, relErr := filepath.Rel(t.workDir, path)
+		if relErr != nil {
+			return filepath.SkipDir
+		}
 		if d.IsDir() {
 			if IsForbiddenDir(ctx, rel, t.forbidden) {
 				return filepath.SkipDir
@@ -66,18 +72,18 @@ func (t *FindFilesTool) Execute(ctx context.Context, params map[string]any) (Too
 		if IsForbidden(ctx, rel, t.forbidden) {
 			return nil
 		}
-		if matched, _ := filepath.Match(pattern, filepath.Base(path)); matched {
+		if matched, matchErr := filepath.Match(pattern, filepath.Base(path)); matchErr == nil && matched {
 			matches = append(matches, rel)
 		}
 		return nil
 	})
 	if err != nil {
-		return ToolResult{Error: err.Error(), Success: false}, nil
+		return nil, fmt.Errorf("walk dir: %w", err)
 	}
 
 	if len(matches) == 0 {
-		return ToolResult{Output: "no files found", Success: true}, nil
+		return &ToolResult{Output: "no files found"}, nil
 	}
 
-	return ToolResult{Output: strings.Join(matches, "\n"), Success: true}, nil
+	return &ToolResult{Output: strings.Join(matches, "\n")}, nil
 }

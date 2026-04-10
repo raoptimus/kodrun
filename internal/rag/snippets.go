@@ -5,6 +5,11 @@ import (
 	"strings"
 )
 
+const (
+	snippetChunkMaxBytes = 512 // max bytes per snippet chunk
+	snippetChunkOverlap  = 32  // overlap bytes between snippet chunks
+)
+
 // SnippetInfo holds the snippet metadata needed for chunking.
 type SnippetInfo struct {
 	Name        string
@@ -21,7 +26,7 @@ func ChunkSnippets(snippets []SnippetInfo) []Chunk {
 	for _, s := range snippets {
 		body := fmt.Sprintf("Snippet: %s\nDescription: %s\nTags: %s\n\n%s",
 			s.Name, s.Description, strings.Join(s.Tags, ", "), s.Content)
-		subChunks := splitIntoChunks(s.SourcePath, body, 512, 32)
+		subChunks := splitIntoChunks(s.SourcePath, body, snippetChunkMaxBytes, snippetChunkOverlap)
 		chunks = append(chunks, subChunks...)
 	}
 	return chunks

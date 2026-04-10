@@ -1,3 +1,11 @@
+/**
+ * This file is part of the raoptimus/kodrun library
+ *
+ * @copyright Copyright (c) Evgeniy Urvantsev
+ * @license https://github.com/raoptimus/kodrun/blob/master/LICENSE.md
+ * @link https://github.com/raoptimus/kodrun
+ */
+
 package ollama
 
 import (
@@ -17,6 +25,13 @@ import (
 // maxErrorBodyBytes limits how much error response body we read to prevent OOM.
 const maxErrorBodyBytes = 1024 * 1024 // 1MB
 
+const (
+	defaultMaxRetries     = 3  // total retry attempts for chat requests
+	streamChanBuffer      = 16 // buffered channel size for streaming responses
+	streamScannerInitSize = 256 * 1024
+	streamScannerMaxSize  = 1024 * 1024
+)
+
 // Client communicates with the Ollama API.
 type Client struct {
 	baseURL    string
@@ -31,13 +46,13 @@ func NewClient(baseURL string, timeout time.Duration) *Client {
 		httpClient: &http.Client{
 			Timeout: timeout,
 		},
-		maxRetries: 3,
+		maxRetries: defaultMaxRetries,
 	}
 }
 
 // Ping checks if Ollama is reachable.
 func (c *Client) Ping(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/tags", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/tags", http.NoBody)
 	if err != nil {
 		return errors.WithMessage(err, "create request")
 	}
@@ -57,7 +72,7 @@ func (c *Client) Ping(ctx context.Context) error {
 
 // Models returns available models.
 func (c *Client) Models(ctx context.Context) ([]Model, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/tags", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/tags", http.NoBody)
 	if err != nil {
 		return nil, err
 	}
@@ -77,7 +92,7 @@ func (c *Client) Models(ctx context.Context) ([]Model, error) {
 }
 
 // Chat sends a chat request and returns a channel of streaming chunks.
-func (c *Client) Chat(ctx context.Context, chatReq ChatRequest) (<-chan ChatChunk, error) {
+func (c *Client) Chat(ctx context.Context, chatReq *ChatRequest) (<-chan ChatChunk, error) {
 	chatReq.Stream = true
 
 	body, err := json.Marshal(chatReq)
@@ -126,8 +141,11 @@ func (c *Client) Chat(ctx context.Context, chatReq ChatRequest) (<-chan ChatChun
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
+			bodyBytes, readErr := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
 			resp.Body.Close()
+			if readErr != nil {
+				return nil, errors.Errorf("ollama returned %d and failed to read body: %v", resp.StatusCode, readErr)
+			}
 
 			// Ollama 500 with "XML syntax error" means the model produced
 			// a malformed tool call that Ollama couldn't parse. Retry once
@@ -149,7 +167,7 @@ func (c *Client) Chat(ctx context.Context, chatReq ChatRequest) (<-chan ChatChun
 		break
 	}
 
-	ch := make(chan ChatChunk, 16)
+	ch := make(chan ChatChunk, streamChanBuffer)
 	go c.streamResponse(ctx, resp, ch)
 
 	return ch, nil
@@ -160,7 +178,7 @@ func (c *Client) streamResponse(ctx context.Context, resp *http.Response, ch cha
 	defer resp.Body.Close()
 
 	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 0, 256*1024), 1024*1024)
+	scanner.Buffer(make([]byte, 0, streamScannerInitSize), streamScannerMaxSize)
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -209,7 +227,7 @@ func (c *Client) streamResponse(ctx context.Context, resp *http.Response, ch cha
 }
 
 // ChatSync sends a chat request and returns aggregated response.
-func (c *Client) ChatSync(ctx context.Context, chatReq ChatRequest) (ChatChunk, error) {
+func (c *Client) ChatSync(ctx context.Context, chatReq *ChatRequest) (ChatChunk, error) {
 	ch, err := c.Chat(ctx, chatReq)
 	if err != nil {
 		return ChatChunk{}, err
@@ -323,7 +341,10 @@ func (c *Client) Embed(ctx context.Context, req EmbedRequest) (*EmbedResponse, e
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
+		bodyBytes, readErr := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
+		if readErr != nil {
+			return nil, errors.Errorf("embed error %d (failed to read body: %v)", resp.StatusCode, readErr)
+		}
 		return nil, errors.Errorf("embed error %d: %s", resp.StatusCode, string(bodyBytes))
 	}
 

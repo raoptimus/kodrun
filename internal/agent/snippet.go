@@ -75,7 +75,7 @@ func formatStepExamples(workDir string, examples []Example, budgetLines int) str
 		budgetLines = defaultBudgetLines
 	}
 
-	var parts []string
+	parts := make([]string, 0, len(examples))
 	totalLines := 0
 	for _, ex := range examples {
 		remaining := budgetLines - totalLines

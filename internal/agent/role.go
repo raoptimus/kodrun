@@ -15,7 +15,6 @@ const (
 	RoleExtractor          Role = "extractor"
 	RoleStructurer         Role = "structurer"
 	RoleResponseClassifier Role = "response_classifier"
-	RoleStepExecutor       Role = "step_executor"
 
 	// Specialised reviewer sub-roles used by the parallel /code-review
 	// pipeline. Each focuses on a single review axis so that its system
@@ -38,8 +37,6 @@ func taskLabelForRole(role Role) string {
 		return "Planning..."
 	case RoleExecutor:
 		return "Executing plan..."
-	case RoleStepExecutor:
-		return "Executing step..."
 	case RoleReviewer:
 		return "Reviewing changes..."
 	case RoleExtractor:
@@ -83,7 +80,6 @@ var SpecialistReviewerRoles = []Role{
 	RoleReviewerArchitecture,
 }
 
-
 // systemPromptForRole generates a role-specific system prompt for a sub-agent.
 // Optional bool flags: hasSnippets, hasRAG.
 func systemPromptForRole(role Role, lang, ruleCatalog string, toolNames []string, flags ...bool) string {
@@ -93,7 +89,7 @@ func systemPromptForRole(role Role, lang, ruleCatalog string, toolNames []string
 
 	b.WriteString("You are KodRun, a Go programming assistant.\n")
 	ln := langName(lang)
-	if ln != "English" {
+	if ln != langEnglish {
 		fmt.Fprintf(&b, "IMPORTANT: ALL your responses MUST be in %s. This is mandatory.\n", ln)
 	}
 	b.WriteByte('\n')
@@ -118,7 +114,11 @@ func systemPromptForRole(role Role, lang, ruleCatalog string, toolNames []string
 	case RolePlanner:
 		b.WriteString("You are the PLANNER agent.\n")
 		b.WriteString("Your job is to analyze the task and create a detailed, actionable plan.\n\n")
+		b.WriteString("CRITICAL WORKFLOW:\n")
+		b.WriteString("- If the task text contains file paths (e.g. `path/to/file.go:42`), your VERY FIRST tool calls MUST be read_file on those exact files. Do NOT call list_dir, find_files, or any other tool before reading the referenced files.\n")
+		b.WriteString("- Only after reading the referenced files, read additional files if the code references imports or types you need to understand.\n\n")
 		b.WriteString("Guidelines:\n")
+		b.WriteString("- Use `go_structure(path)` to quickly see file/package outline (types, functions, constants with line numbers) before reading full files with read_file — this saves context\n")
 		b.WriteString("- Read and analyze the relevant code using read-only tools\n")
 		b.WriteString("- Identify all files that need changes\n")
 		b.WriteString("- Create a numbered step-by-step plan\n")
@@ -160,7 +160,7 @@ func systemPromptForRole(role Role, lang, ruleCatalog string, toolNames []string
 		b.WriteString("- Run go_build after changes to verify compilation\n")
 		b.WriteString("- Run go_lint to check style\n")
 		b.WriteString("- Run go_test to verify correctness\n")
-		b.WriteString("- Fix any errors before proceeding to next step\n")
+		b.WriteString("- When go_build fails, fix the COMPILATION ERROR (wrong import, typo, missing function) — do NOT revert your changes. Reverting the plan changes is NEVER acceptable. If you cannot fix the error after 3 attempts, output `REPLAN: <reason>`.\n")
 		fmt.Fprintf(&b, "- Always respond in %s\n", langName(lang))
 		if ragEnabled {
 			b.WriteString("\nIMPORTANT — Project rules and conventions (from RAG):\n")
@@ -220,6 +220,7 @@ func systemPromptForRole(role Role, lang, ruleCatalog string, toolNames []string
 		b.WriteString("- Describe WHAT must change and WHY (convention, bug, template mismatch, etc.). Not vague `check X` or `verify Y`.\n")
 		b.WriteString("- Do NOT add items not present in the original analysis. Do NOT invent issues.\n")
 		b.WriteString("- Deduplicate: if the same file:line appears in multiple reviewer sections with the same issue, emit it once.\n")
+		b.WriteString("- Group by file: if multiple issues affect the same file, emit ONE plan item per file with the lowest line number. Concatenate ALL findings for that file into the description — do NOT drop any details. Use semicolons to separate individual changes within the description.\n")
 		b.WriteString("- Sort `plan` by file path, then by line number.\n")
 		b.WriteString("- Do NOT include code blocks, patches, or diffs inside the strings.\n")
 		b.WriteString("- If the original analysis found no real issues, output exactly: {\"context\": \"LGTM — no issues found\", \"plan\": []}\n")
@@ -253,19 +254,6 @@ func systemPromptForRole(role Role, lang, ruleCatalog string, toolNames []string
 		b.WriteString("- `examples` is an optional array. Include when the original plan has EXAMPLE: lines. Each example points to existing code demonstrating the correct pattern. Do not fabricate examples.\n")
 		b.WriteString("- Preserve the order and intent of the original plan exactly. Do not invent new work.\n")
 		b.WriteString("- Output ONLY the JSON object. No comments, no markdown, no trailing text.\n")
-
-	case RoleStepExecutor:
-		b.WriteString("You are a STEP EXECUTOR sub-agent.\n")
-		b.WriteString("You implement EXACTLY ONE step of an approved plan and stop.\n\n")
-		b.WriteString("CRITICAL RULES:\n")
-		b.WriteString("- The full plan is NOT shown to you. You only see your single step.\n")
-		b.WriteString("- The files you may touch are listed in the step's `files` field. Reading or writing any other path is REFUSED by the harness.\n")
-		b.WriteString("- Start IMMEDIATELY with edit_file/write_file. No analysis, no exploration.\n")
-		b.WriteString("- Do NOT read other files for context unless they are in `files`. If you genuinely need more context, output a single line `REPLAN: <reason>` and stop.\n")
-		b.WriteString("- A response without ANY tool calls is a FAILURE. If you have nothing to apply, output `REPLAN: <reason>` instead of writing prose. Markdown plans are NEVER valid here.\n")
-		b.WriteString("- If an \"Examples\" section is provided, study those code snippets — they demonstrate the correct pattern in this project. Follow the same style, naming, and error handling.\n")
-		b.WriteString("- After finishing, run go_build (or the project's equivalent) to verify and stop.\n")
-		fmt.Fprintf(&b, "- Always respond in %s\n", langName(lang))
 
 	case RoleReviewerRules, RoleReviewerIdiomatic, RoleReviewerBestPractice,
 		RoleReviewerSecurity, RoleReviewerStructure, RoleReviewerArchitecture:
@@ -319,14 +307,18 @@ func specialistReviewerPrompt(role Role, lang string, ragEnabled, snippetsEnable
 	}
 	b.WriteByte('\n')
 
-	b.WriteString("TOOLS AVAILABLE TO YOU: `read_changed_files()` returns the unified diff with ±20 lines of context for all changed source files (preferred first action); `read_file(path)` reads a full file (use when you need more context beyond the diff); `list_dir(path)` lists a directory; `grep(pattern)` searches repository content; `search_docs(query)` searches the RAG knowledge base. You MUST use these tools — they are not optional.\n\n")
+	b.WriteString("TOOLS AVAILABLE TO YOU: `file_stat(path)` returns file metadata (size, line count) without reading contents; `read_file(path, offset, limit)` reads a file with optional pagination; `go_structure(path)` shows file/package outline (types, functions, constants with line numbers) without reading full bodies — use it to understand structure before read_file; `list_dir(path)` lists a directory; `grep(pattern)` searches repository content; `search_docs(query)` searches the RAG knowledge base; `read_changed_files()` returns the unified diff for all changed files (optional, use if you need diff context). You MUST use these tools — they are not optional.\n\n")
 
 	b.WriteString("MANDATORY WORKFLOW (no exceptions — follow in order):\n")
-	b.WriteString("1. READ FIRST. Your VERY FIRST action MUST be to call `read_changed_files()` — a single call that returns the diff with context for every changed source file. Do this before any analysis, before any reasoning, before any output.\n")
-	b.WriteString("2. Only after you have read the diff may you analyze and produce findings. Use `read_file(path)` only when you need additional context beyond what the diff provides (e.g. to see the full function signature, imports, or surrounding code).\n")
-	b.WriteString("3. You may ONLY output `LGTM` AFTER having successfully called `read_changed_files` and confirmed there are no issues in your focus area. Outputting `NO_ISSUES` without first calling `read_changed_files` is FORBIDDEN and counts as a failure.\n")
-	b.WriteString("4. If a file's diff is missing or errored, note it and continue with the remaining files; do not invent findings.\n")
-	b.WriteString("5. A finding on a file you did not see in the diff is a hallucination and MUST NOT appear in your output.\n\n")
+	b.WriteString("1. STAT FIRST. Your VERY FIRST action MUST be to call `file_stat(path)` on every file listed in the task. This tells you each file's size and line count without consuming context.\n")
+	b.WriteString("2. READ SMART. After stat results arrive, read each file:\n")
+	b.WriteString("   - Files with total_lines ≤ 200: call `read_file(path)` to read the entire file.\n")
+	b.WriteString("   - Files with total_lines > 200: call `read_file(path, offset, limit)` to read ONLY the changed regions (line numbers are in the diff). Use a margin of ±30 lines around each changed hunk for context.\n")
+	b.WriteString("3. Only after you have read ALL listed files (or relevant sections) may you analyze and produce findings.\n")
+	b.WriteString("4. If no files are listed in the task or all files are empty, output exactly `NO_ISSUES` and stop immediately. Do NOT call any other tools.\n")
+	b.WriteString("5. Outputting `NO_ISSUES` without first calling `file_stat` + `read_file` on every listed file is FORBIDDEN and counts as a failure.\n")
+	b.WriteString("6. If a file read fails or errors, note it and continue with the remaining files; do not invent findings.\n")
+	b.WriteString("7. A finding on a file you did not read is a hallucination and MUST NOT appear in your output.\n\n")
 
 	b.WriteString("Output format (STRICT):\n")
 	b.WriteString("- For every real issue, write one line: `path/to/file:LINE — SEVERITY — short description`.\n")
@@ -334,7 +326,7 @@ func specialistReviewerPrompt(role Role, lang string, ragEnabled, snippetsEnable
 	b.WriteString("- If you find nothing in your focus area, output exactly: `NO_ISSUES`.\n")
 	b.WriteString("- Be strict: flag only real issues in your focus, not style preferences or speculation.\n")
 	b.WriteString("- When a correct implementation of the flagged pattern exists elsewhere in the project, append on the next line: EXAMPLE: path/to/file.go:LINE — reason. This helps the executor see the correct pattern.\n")
-		b.WriteString("- Do NOT propose code fixes or diffs — another agent will consolidate findings.\n")
+	b.WriteString("- Do NOT propose code fixes or diffs — another agent will consolidate findings.\n")
 	b.WriteString("- Do NOT produce Summary / Verdict / Cross-cutting sections — those belong to the aggregator, not to you.\n")
 	fmt.Fprintf(&b, "- Write descriptions in %s.\n", langName(lang))
 
@@ -352,7 +344,7 @@ func specialistReviewerPrompt(role Role, lang string, ragEnabled, snippetsEnable
 // concrete, language-agnostic checks for a specialist reviewer role. The
 // wording intentionally avoids language-specific APIs; the idiomaticity
 // specialist is the only one that pivots on the detected project language.
-func specialistReviewerFocus(role Role, lang string) (string, []string) {
+func specialistReviewerFocus(role Role, lang string) (focus string, tools []string) {
 	ln := langName(lang)
 	switch role {
 	case RoleReviewerRules:

@@ -14,6 +14,20 @@ import (
 	"github.com/raoptimus/kodrun/internal/ollama"
 )
 
+const (
+	dirPermission   = 0o755
+	filePermission  = 0o644
+	maxReadmeBytes  = 2000 // max bytes to include from README.md
+	maxGoFileLines  = 100  // max lines per key Go file in project context
+	maxGoFilesCount = 101  // SplitN limit (maxGoFileLines + 1)
+	maxKeyGoFiles   = 10   // max number of key Go files to collect
+	maxGoFileDepth  = 2    // max directory depth for key Go files
+	dirGit          = ".git"
+	dirKodrun       = ".kodrun"
+	dirNodeModules  = "node_modules"
+	dirVendor       = "vendor"
+)
+
 //go:embed all:examples
 var examples embed.FS
 
@@ -44,7 +58,7 @@ func Run(ctx context.Context, workDir string, client *ollama.Client, model strin
 		if _, err := os.Stat(full); err == nil {
 			continue
 		}
-		if err := os.MkdirAll(full, 0o755); err != nil {
+		if err := os.MkdirAll(full, dirPermission); err != nil {
 			return nil, errors.WithMessagef(err, "create %s", d)
 		}
 		res.Created = append(res.Created, d+"/")
@@ -66,9 +80,9 @@ func Run(ctx context.Context, workDir string, client *ollama.Client, model strin
 	}
 
 	// .kodrun/.gitignore
-	gitignorePath := filepath.Join(workDir, ".kodrun/.gitignore")
+	gitignorePath := filepath.Join(workDir, dirKodrun, ".gitignore")
 	if _, err := os.Stat(gitignorePath); os.IsNotExist(err) {
-		if err := os.WriteFile(gitignorePath, []byte("# KodRun local state\n*.log\n"), 0o644); err != nil {
+		if err := os.WriteFile(gitignorePath, []byte("# KodRun local state\n*.log\n"), filePermission); err != nil {
 			return nil, errors.WithMessage(err, "write .kodrun/.gitignore")
 		}
 		res.Created = append(res.Created, ".kodrun/.gitignore")
@@ -79,7 +93,7 @@ func Run(ctx context.Context, workDir string, client *ollama.Client, model strin
 	if err != nil {
 		return nil, errors.WithMessage(err, "generate AGENTS.md")
 	}
-	if err := os.WriteFile(agentsPath, []byte(agentsContent), 0o644); err != nil {
+	if err := os.WriteFile(agentsPath, []byte(agentsContent), filePermission); err != nil {
 		return nil, errors.WithMessage(err, "write AGENTS.md")
 	}
 	res.Created = append(res.Created, "AGENTS.md")
@@ -107,7 +121,7 @@ Output ONLY the markdown content for AGENTS.md, starting with "# AGENTS.md". Be 
 Project information:
 ` + projectCtx
 
-	resp, err := client.ChatSync(ctx, ollama.ChatRequest{
+	resp, err := client.ChatSync(ctx, &ollama.ChatRequest{
 		Model: model,
 		Messages: []ollama.Message{
 			{Role: "user", Content: prompt},
@@ -146,9 +160,9 @@ func collectProjectContext(ctx context.Context, workDir string) string {
 	// README.md (if exists)
 	if data, err := os.ReadFile(filepath.Join(workDir, "README.md")); err == nil {
 		b.WriteString("=== README.md ===\n")
-		// Limit to first 2000 bytes
-		if len(data) > 2000 {
-			data = data[:2000]
+		// Limit to first maxReadmeBytes bytes
+		if len(data) > maxReadmeBytes {
+			data = data[:maxReadmeBytes]
 		}
 		b.Write(data)
 		b.WriteString("\n\n")
@@ -166,11 +180,11 @@ func collectProjectContext(ctx context.Context, workDir string) string {
 		if err != nil {
 			continue
 		}
-		lines := strings.SplitN(string(data), "\n", 101)
-		if len(lines) > 100 {
-			lines = lines[:100]
+		lines := strings.SplitN(string(data), "\n", maxGoFilesCount)
+		if len(lines) > maxGoFileLines {
+			lines = lines[:maxGoFileLines]
 		}
-		b.WriteString(fmt.Sprintf("=== %s (first 100 lines) ===\n", rel))
+		b.WriteString(fmt.Sprintf("=== %s (first %d lines) ===\n", rel, maxGoFileLines))
 		b.WriteString(strings.Join(lines, "\n"))
 		b.WriteString("\n\n")
 	}
@@ -183,13 +197,13 @@ func findKeyGoFiles(_ context.Context, workDir string) []string {
 	var files []string
 	maxFiles := 10
 
-	_ = filepath.WalkDir(workDir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return nil
+	if err := filepath.WalkDir(workDir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return filepath.SkipDir
 		}
 		if d.IsDir() {
 			base := filepath.Base(path)
-			if base == ".git" || base == "vendor" || base == "node_modules" || base == ".kodrun" {
+			if base == dirGit || base == dirVendor || base == dirNodeModules || base == dirKodrun {
 				return filepath.SkipDir
 			}
 			return nil
@@ -206,16 +220,21 @@ func findKeyGoFiles(_ context.Context, workDir string) []string {
 			return nil
 		}
 
-		rel, _ := filepath.Rel(workDir, path)
+		rel, relErr := filepath.Rel(workDir, path)
+		if relErr != nil {
+			return filepath.SkipDir
+		}
 		depth := strings.Count(rel, string(filepath.Separator))
 
 		// Prioritize: main.go, cmd/*, top-level, shallow files
-		if depth <= 2 {
+		if depth <= maxGoFileDepth {
 			files = append(files, rel)
 		}
 
 		return nil
-	})
+	}); err != nil {
+		return nil
+	}
 
 	return files
 }
@@ -224,11 +243,14 @@ func buildTree(_ context.Context, workDir string) string {
 	var lines []string
 	seen := make(map[string]bool)
 
-	_ = filepath.WalkDir(workDir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return nil
+	if err := filepath.WalkDir(workDir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return filepath.SkipDir
 		}
-		rel, _ := filepath.Rel(workDir, path)
+		rel, relErr := filepath.Rel(workDir, path)
+		if relErr != nil {
+			return filepath.SkipDir
+		}
 		if rel == "." {
 			return nil
 		}
@@ -236,9 +258,9 @@ func buildTree(_ context.Context, workDir string) string {
 		base := filepath.Base(rel)
 		if d.IsDir() {
 			switch {
-			case base == ".git" || base == "vendor" || base == "node_modules":
+			case base == dirGit || base == dirVendor || base == dirNodeModules:
 				return filepath.SkipDir
-			case strings.HasPrefix(base, ".") && base != ".kodrun":
+			case strings.HasPrefix(base, ".") && base != dirKodrun:
 				return filepath.SkipDir
 			}
 		}
@@ -246,7 +268,7 @@ func buildTree(_ context.Context, workDir string) string {
 		depth := strings.Count(rel, string(filepath.Separator))
 
 		if d.IsDir() {
-			if depth > 2 {
+			if depth > maxGoFileDepth {
 				return filepath.SkipDir
 			}
 			if !seen[rel] {
@@ -260,7 +282,9 @@ func buildTree(_ context.Context, workDir string) string {
 		}
 
 		return nil
-	})
+	}); err != nil {
+		return ""
+	}
 
 	if len(lines) == 0 {
 		return ""
@@ -272,11 +296,11 @@ func buildTree(_ context.Context, workDir string) string {
 // Existing files are not overwritten.
 func copyEmbeddedDir(efs embed.FS, srcDir, workDir, destDir string) ([]string, error) {
 	entries, err := fs.ReadDir(efs, srcDir)
-	if err != nil {
-		return nil, nil // directory not found in embed — skip silently
+	if err != nil || len(entries) == 0 {
+		return nil, err
 	}
 
-	var created []string
+	created := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".md" {
 			continue
@@ -289,7 +313,7 @@ func copyEmbeddedDir(efs embed.FS, srcDir, workDir, destDir string) ([]string, e
 		if err != nil {
 			continue
 		}
-		if err := os.WriteFile(destPath, data, 0o644); err != nil {
+		if err := os.WriteFile(destPath, data, filePermission); err != nil {
 			return created, errors.WithMessagef(err, "write %s/%s", destDir, entry.Name())
 		}
 		created = append(created, destDir+"/"+entry.Name())

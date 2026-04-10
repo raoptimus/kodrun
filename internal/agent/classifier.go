@@ -87,7 +87,7 @@ func ClassifyResponse(
 		},
 	}
 
-	chunk, err := client.ChatSync(ctx, req)
+	chunk, err := client.ChatSync(ctx, &req)
 	if err != nil {
 		return safeClassifyDefault(), errors.WithMessage(err, "classifier chat")
 	}

@@ -83,7 +83,7 @@ func parseXMLToolCalls(content string) []ToolCall {
 		return nil
 	}
 
-	var calls []ToolCall
+	calls := make([]ToolCall, 0, len(funcMatches))
 	for _, fm := range funcMatches {
 		name := fm[1]
 		body := fm[2]

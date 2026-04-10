@@ -107,6 +107,13 @@ agent:
   max_replans: 2
 
   # --------------------------------------------------------------------------
+  # Code review tuning
+  # --------------------------------------------------------------------------
+  # Wall-time cap for a single review specialist (default 5m).
+  # Prevents a slow specialist from blocking the entire review.
+  specialist_timeout: 5m
+
+  # --------------------------------------------------------------------------
   # Behaviour
   # --------------------------------------------------------------------------
   # Max iterations of the agent loop (infinite-loop protection).

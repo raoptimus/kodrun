@@ -14,12 +14,12 @@ import (
 )
 
 const (
-	webFetchTimeout     = 30 * time.Second
-	webFetchMaxBodySize = 10 << 20 // 10 MB
-	webFetchChunkSize   = 40       // lines per chunk
+	webFetchTimeout      = 30 * time.Second
+	webFetchMaxBodySize  = 10 << 20 // 10 MB
+	webFetchChunkSize    = 40       // lines per chunk
 	webFetchChunkOverlap = 5
-	webFetchMaxOutput   = 4000 // bytes, for truncated fallback
-	webFetchTopMatches  = 5    // text-match fallback results
+	webFetchMaxOutput    = 4000 // bytes, for truncated fallback
+	webFetchTopMatches   = 5    // text-match fallback results
 )
 
 // WebIndexer is the interface for indexing and searching web content via RAG.
@@ -64,20 +64,20 @@ func (t *WebFetchTool) Schema() ollama.JSONSchema {
 	}
 }
 
-func (t *WebFetchTool) Execute(ctx context.Context, params map[string]any) (ToolResult, error) {
-	rawURL, _ := params["url"].(string)
+func (t *WebFetchTool) Execute(ctx context.Context, params map[string]any) (*ToolResult, error) {
+	rawURL := stringParam(params, "url")
 	if rawURL == "" {
-		return ToolResult{Error: "url is required", Success: false}, nil
+		return nil, &ToolError{Msg: "url is required"}
 	}
-	query, _ := params["query"].(string)
+	query := stringParam(params, "query")
 
 	markdown, err := t.fetchAndConvert(ctx, rawURL)
 	if err != nil {
-		return ToolResult{Error: fmt.Sprintf("fetch: %s", err), Success: false}, nil
+		return nil, fmt.Errorf("fetch: %w", err)
 	}
 
 	if len(strings.TrimSpace(markdown)) == 0 {
-		return ToolResult{Output: "Page returned empty content.", Success: true}, nil
+		return &ToolResult{Output: "Page returned empty content."}, nil
 	}
 
 	source := "web://" + rawURL
@@ -91,7 +91,7 @@ func (t *WebFetchTool) Execute(ctx context.Context, params map[string]any) (Tool
 
 func (t *WebFetchTool) fetchAndConvert(ctx context.Context, rawURL string) (string, error) {
 	client := &http.Client{Timeout: webFetchTimeout}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, http.NoBody)
 	if err != nil {
 		return "", fmt.Errorf("create request: %w", err)
 	}
@@ -116,9 +116,9 @@ func (t *WebFetchTool) fetchAndConvert(ctx context.Context, rawURL string) (stri
 	return string(markdownBytes), nil
 }
 
-func (t *WebFetchTool) executeWithRAG(ctx context.Context, chunks []rag.Chunk, query string) (ToolResult, error) {
+func (t *WebFetchTool) executeWithRAG(ctx context.Context, chunks []rag.Chunk, query string) (*ToolResult, error) {
 	if _, err := t.indexer.Build(ctx, chunks); err != nil {
-		return ToolResult{Error: fmt.Sprintf("index: %s", err), Success: false}, nil
+		return nil, fmt.Errorf("index: %w", err)
 	}
 
 	if query == "" {
@@ -128,17 +128,17 @@ func (t *WebFetchTool) executeWithRAG(ctx context.Context, chunks []rag.Chunk, q
 
 	results, err := t.indexer.Search(ctx, query, t.topK)
 	if err != nil {
-		return ToolResult{Error: fmt.Sprintf("search: %s", err), Success: false}, nil
+		return nil, fmt.Errorf("search: %w", err)
 	}
 
 	if len(results) == 0 {
-		return ToolResult{Output: "No relevant results found for the query.", Success: true}, nil
+		return &ToolResult{Output: "No relevant results found for the query."}, nil
 	}
 
 	return t.formatSearchResults(results), nil
 }
 
-func (t *WebFetchTool) executeWithTextMatch(chunks []rag.Chunk, query string) ToolResult {
+func (t *WebFetchTool) executeWithTextMatch(chunks []rag.Chunk, query string) *ToolResult {
 	if query == "" {
 		return t.summarizeChunks(chunks)
 	}
@@ -156,7 +156,7 @@ func (t *WebFetchTool) executeWithTextMatch(chunks []rag.Chunk, query string) To
 	}
 
 	if len(matched) == 0 {
-		return ToolResult{Output: "No matching content found for the query.", Success: true}
+		return &ToolResult{Output: "No matching content found for the query."}
 	}
 
 	if len(matched) > webFetchTopMatches {
@@ -168,14 +168,13 @@ func (t *WebFetchTool) executeWithTextMatch(chunks []rag.Chunk, query string) To
 		fmt.Fprintf(&b, "--- Match %d (lines %d-%d) ---\n%s\n\n", i+1, c.StartLine, c.EndLine, c.Content)
 	}
 
-	return ToolResult{
-		Output:  b.String(),
-		Success: true,
-		Meta:    map[string]any{"matches": len(matched)},
+	return &ToolResult{
+		Output: b.String(),
+		Meta:   map[string]any{"matches": len(matched)},
 	}
 }
 
-func (t *WebFetchTool) summarizeChunks(chunks []rag.Chunk) ToolResult {
+func (t *WebFetchTool) summarizeChunks(chunks []rag.Chunk) *ToolResult {
 	var b strings.Builder
 	for _, c := range chunks {
 		if b.Len()+len(c.Content) > webFetchMaxOutput {
@@ -190,23 +189,21 @@ func (t *WebFetchTool) summarizeChunks(chunks []rag.Chunk) ToolResult {
 		b.WriteByte('\n')
 	}
 
-	return ToolResult{
-		Output:  b.String(),
-		Success: true,
-		Meta:    map[string]any{"truncated": b.Len() >= webFetchMaxOutput},
+	return &ToolResult{
+		Output: b.String(),
+		Meta:   map[string]any{"truncated": b.Len() >= webFetchMaxOutput},
 	}
 }
 
-func (t *WebFetchTool) formatSearchResults(results []rag.SearchResult) ToolResult {
+func (t *WebFetchTool) formatSearchResults(results []rag.SearchResult) *ToolResult {
 	var b strings.Builder
 	for i, r := range results {
 		fmt.Fprintf(&b, "--- Result %d (%.2f, lines %d-%d) ---\n%s\n\n",
 			i+1, r.Score, r.Chunk.StartLine, r.Chunk.EndLine, r.Chunk.Content)
 	}
 
-	return ToolResult{
-		Output:  b.String(),
-		Success: true,
-		Meta:    map[string]any{"results": len(results)},
+	return &ToolResult{
+		Output: b.String(),
+		Meta:   map[string]any{"results": len(results)},
 	}
 }

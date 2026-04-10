@@ -9,6 +9,8 @@ import (
 	"github.com/raoptimus/kodrun/internal/ollama"
 )
 
+const editDiffMaxLines = 30 // max lines in edit tool diff output
+
 // EditFileTool performs find-and-replace editing in a file.
 type EditFileTool struct {
 	workDir           string
@@ -38,8 +40,8 @@ func (t *EditFileTool) Schema() ollama.JSONSchema {
 // ResolvePaths returns the absolute path edited, used by the registry for
 // cache invalidation.
 func (t *EditFileTool) ResolvePaths(params map[string]any) []string {
-	p, _ := params["path"].(string)
-	if p == "" {
+	p, ok := params["path"].(string)
+	if !ok || p == "" {
 		return nil
 	}
 	resolved, err := SafePath(context.TODO(), t.workDir, p)
@@ -49,51 +51,64 @@ func (t *EditFileTool) ResolvePaths(params map[string]any) []string {
 	return []string{resolved}
 }
 
-func (t *EditFileTool) Execute(ctx context.Context, params map[string]any) (ToolResult, error) {
-	path, _ := params["path"].(string)
-	oldStr, _ := params["old_str"].(string)
-	newStr, _ := params["new_str"].(string)
+func (t *EditFileTool) Execute(ctx context.Context, params map[string]any) (*ToolResult, error) {
+	path, ok := params["path"].(string)
+	if !ok {
+		return nil, &ToolError{Msg: "path must be a string"}
+	}
+	oldStr, ok := params["old_str"].(string)
+	if !ok {
+		return nil, &ToolError{Msg: "old_str must be a string"}
+	}
+	newStr, ok := params["new_str"].(string)
+	if !ok {
+		return nil, &ToolError{Msg: "new_str must be a string"}
+	}
 
 	if path == "" || oldStr == "" {
-		return ToolResult{Error: "path and old_str are required", Success: false}, nil
+		return nil, &ToolError{Msg: "path and old_str are required"}
 	}
 
 	resolved, err := SafePath(ctx, t.workDir, path)
 	if err != nil {
-		return ToolResult{Error: err.Error(), Success: false}, nil
+		return nil, fmt.Errorf("resolve path: %w", err)
 	}
 
 	if IsForbidden(ctx, path, t.forbiddenPatterns) || IsForbidden(ctx, resolved, t.forbiddenPatterns) {
-		return ToolResult{Error: fmt.Sprintf("access to %s is forbidden", path), Success: false}, nil
+		return nil, &ToolError{Msg: fmt.Sprintf("access to %s is forbidden", path)}
+	}
+
+	fi, err := os.Stat(resolved)
+	if err != nil {
+		return nil, fmt.Errorf("stat file: %w", err)
 	}
 
 	data, err := os.ReadFile(resolved)
 	if err != nil {
-		return ToolResult{Error: err.Error(), Success: false}, nil
+		return nil, fmt.Errorf("read file: %w", err)
 	}
 
 	content := string(data)
 	count := strings.Count(content, oldStr)
 	if count == 0 {
-		return ToolResult{Error: "old_str not found in file", Success: false}, nil
+		return nil, &ToolError{Msg: "old_str not found in file"}
 	}
 
 	newContent := strings.Replace(content, oldStr, newStr, 1)
-	if err := os.WriteFile(resolved, []byte(newContent), 0o644); err != nil {
-		return ToolResult{Error: err.Error(), Success: false}, nil
+	if err := os.WriteFile(resolved, []byte(newContent), fi.Mode().Perm()); err != nil {
+		return nil, fmt.Errorf("write file: %w", err)
 	}
 
 	added, removed := LineStats(content, newContent)
-	diff := SimpleDiff(content, newContent, path, 30)
+	diff := SimpleDiff(content, newContent, path, editDiffMaxLines)
 
 	msg := fmt.Sprintf("replaced 1 occurrence in %s", path)
 	if count > 1 {
 		msg = fmt.Sprintf("replaced 1 of %d occurrences in %s (warning: %d more remain)", count, path, count-1)
 	}
 
-	return ToolResult{
-		Output:  msg,
-		Success: true,
+	return &ToolResult{
+		Output: msg,
 		Meta: map[string]any{
 			"action":  "Update",
 			"added":   added,

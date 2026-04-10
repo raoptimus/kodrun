@@ -14,10 +14,10 @@ const MaxChunkBytes = 2000
 
 // Chunk represents a text chunk with metadata.
 type Chunk struct {
-	FilePath string    `json:"file_path"`
-	Content  string    `json:"content"`
-	StartLine int     `json:"start_line"`
-	EndLine   int     `json:"end_line"`
+	FilePath  string `json:"file_path"`
+	Content   string `json:"content"`
+	StartLine int    `json:"start_line"`
+	EndLine   int    `json:"end_line"`
 }
 
 // ChunkFile reads a single file and splits it into chunks.
@@ -81,12 +81,12 @@ func ChunkFilesOpts(ctx context.Context, workDir string, dirs []string, chunkSiz
 			absDir = filepath.Join(workDir, dir)
 		}
 
-		err := filepath.WalkDir(absDir, func(path string, d fs.DirEntry, err error) error {
+		err := filepath.WalkDir(absDir, func(path string, d fs.DirEntry, walkErr error) error {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			if err != nil {
-				return nil // skip inaccessible
+			if walkErr != nil {
+				return filepath.SkipDir
 			}
 			if d.IsDir() {
 				base := filepath.Base(path)
@@ -97,7 +97,10 @@ func ChunkFilesOpts(ctx context.Context, workDir string, dirs []string, chunkSiz
 					return filepath.SkipDir
 				}
 				if len(excludeRel) > 0 {
-					rel, _ := filepath.Rel(workDir, path)
+					rel, relErr := filepath.Rel(workDir, path)
+					if relErr != nil {
+						return filepath.SkipDir
+					}
 					rel = filepath.Clean(rel)
 					for _, ex := range excludeRel {
 						if rel == ex || strings.HasPrefix(rel, ex+string(filepath.Separator)) {
@@ -110,8 +113,8 @@ func ChunkFilesOpts(ctx context.Context, workDir string, dirs []string, chunkSiz
 			if !isIndexableFile(path) {
 				return nil
 			}
-			relPath, _ := filepath.Rel(workDir, path)
-			if relPath == "" {
+			relPath, relErr := filepath.Rel(workDir, path)
+			if relErr != nil || relPath == "" {
 				relPath = path
 			}
 			if seen[relPath] {
@@ -119,20 +122,15 @@ func ChunkFilesOpts(ctx context.Context, workDir string, dirs []string, chunkSiz
 			}
 			seen[relPath] = true
 
-			data, err := os.ReadFile(path)
-			if err != nil {
-				return nil
+			data, readErr := os.ReadFile(path)
+			if readErr == nil && len(data) > 0 {
+				content := string(data)
+				fileChunks := splitIntoChunks(relPath, content, chunkSize, chunkOverlap)
+				if opts.MaxChunksPerFile > 0 && len(fileChunks) > opts.MaxChunksPerFile {
+					fileChunks = fileChunks[:opts.MaxChunksPerFile]
+				}
+				chunks = append(chunks, fileChunks...)
 			}
-			content := string(data)
-			if len(content) == 0 {
-				return nil
-			}
-
-			fileChunks := splitIntoChunks(relPath, content, chunkSize, chunkOverlap)
-			if opts.MaxChunksPerFile > 0 && len(fileChunks) > opts.MaxChunksPerFile {
-				fileChunks = fileChunks[:opts.MaxChunksPerFile]
-			}
-			chunks = append(chunks, fileChunks...)
 			return nil
 		})
 		if err != nil {

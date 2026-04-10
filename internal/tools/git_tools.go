@@ -3,13 +3,13 @@ package tools
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/pkg/errors"
 	"github.com/raoptimus/kodrun/internal/ollama"
 )
 
@@ -20,7 +20,7 @@ type gitStatusTool struct {
 	workDir string
 }
 
-func NewGitStatusTool(workDir string) Tool {
+func NewGitStatusTool(workDir string) *gitStatusTool {
 	return &gitStatusTool{workDir: workDir}
 }
 
@@ -34,12 +34,15 @@ func (t *gitStatusTool) Schema() ollama.JSONSchema {
 	}
 }
 
-func (t *gitStatusTool) Execute(ctx context.Context, _ map[string]any) (ToolResult, error) {
+func (t *gitStatusTool) Execute(ctx context.Context, _ map[string]any) (*ToolResult, error) {
 	branchCmd := exec.CommandContext(ctx, "git", "branch", "--show-current")
 	branchCmd.Dir = t.workDir
 	var branchOut bytes.Buffer
 	branchCmd.Stdout = &branchOut
-	_ = branchCmd.Run()
+	if err := branchCmd.Run(); err != nil {
+		// Not a git repo or other error — proceed without branch info.
+		branchOut.Reset()
+	}
 
 	statusCmd := exec.CommandContext(ctx, "git", "status", "--porcelain=v1")
 	statusCmd.Dir = t.workDir
@@ -54,21 +57,19 @@ func (t *gitStatusTool) Execute(ctx context.Context, _ map[string]any) (ToolResu
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
-			return ToolResult{
-				Output:  stderr.String(),
-				Success: false,
-				Meta:    map[string]any{"exit_code": exitErr.ExitCode(), "duration": duration.String()},
+			return &ToolResult{
+				Output: stderr.String(),
+				Meta:   map[string]any{"exit_code": exitErr.ExitCode(), "duration": duration.String()},
 			}, nil
 		}
-		return ToolResult{Error: errors.Wrap(err, "git status").Error(), Success: false}, nil
+		return nil, fmt.Errorf("git status: %w", err)
 	}
 
 	output := fmt.Sprintf("Branch: %s\n%s", strings.TrimSpace(branchOut.String()), stdout.String())
 
-	return ToolResult{
-		Output:  output,
-		Success: true,
-		Meta:    map[string]any{"exit_code": 0, "duration": duration.String()},
+	return &ToolResult{
+		Output: output,
+		Meta:   map[string]any{"exit_code": 0, "duration": duration.String()},
 	}, nil
 }
 
@@ -77,12 +78,14 @@ type gitDiffTool struct {
 	workDir string
 }
 
-func NewGitDiffTool(workDir string) Tool {
+func NewGitDiffTool(workDir string) *gitDiffTool {
 	return &gitDiffTool{workDir: workDir}
 }
 
-func (t *gitDiffTool) Name() string        { return "git_diff" }
-func (t *gitDiffTool) Description() string { return "Show git diff (optionally staged or against a ref)" }
+func (t *gitDiffTool) Name() string { return "git_diff" }
+func (t *gitDiffTool) Description() string {
+	return "Show git diff (optionally staged or against a ref)"
+}
 
 func (t *gitDiffTool) Schema() ollama.JSONSchema {
 	return ollama.JSONSchema{
@@ -94,14 +97,14 @@ func (t *gitDiffTool) Schema() ollama.JSONSchema {
 	}
 }
 
-func (t *gitDiffTool) Execute(ctx context.Context, params map[string]any) (ToolResult, error) {
+func (t *gitDiffTool) Execute(ctx context.Context, params map[string]any) (*ToolResult, error) {
 	args := []string{"diff"}
 
-	if staged, _ := params["staged"].(string); staged == "true" {
+	if staged := stringParam(params, "staged"); staged == boolTrue {
 		args = append(args, "--staged")
 	}
 
-	if ref, _ := params["ref"].(string); ref != "" {
+	if ref := stringParam(params, "ref"); ref != "" {
 		args = append(args, ref)
 	}
 
@@ -119,13 +122,12 @@ func (t *gitDiffTool) Execute(ctx context.Context, params map[string]any) (ToolR
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
-			return ToolResult{
-				Output:  stderr.String(),
-				Success: false,
-				Meta:    map[string]any{"exit_code": exitErr.ExitCode(), "duration": duration.String()},
+			return &ToolResult{
+				Output: stderr.String(),
+				Meta:   map[string]any{"exit_code": exitErr.ExitCode(), "duration": duration.String()},
 			}, nil
 		}
-		return ToolResult{Error: errors.Wrap(err, "git diff").Error(), Success: false}, nil
+		return nil, fmt.Errorf("git diff: %w", err)
 	}
 
 	output := stdout.String()
@@ -133,10 +135,9 @@ func (t *gitDiffTool) Execute(ctx context.Context, params map[string]any) (ToolR
 		output = output[:maxGitOutputBytes] + "\n... [truncated]"
 	}
 
-	return ToolResult{
-		Output:  output,
-		Success: true,
-		Meta:    map[string]any{"exit_code": 0, "duration": duration.String()},
+	return &ToolResult{
+		Output: output,
+		Meta:   map[string]any{"exit_code": 0, "duration": duration.String()},
 	}, nil
 }
 
@@ -145,7 +146,7 @@ type gitLogTool struct {
 	workDir string
 }
 
-func NewGitLogTool(workDir string) Tool {
+func NewGitLogTool(workDir string) *gitLogTool {
 	return &gitLogTool{workDir: workDir}
 }
 
@@ -162,9 +163,9 @@ func (t *gitLogTool) Schema() ollama.JSONSchema {
 	}
 }
 
-func (t *gitLogTool) Execute(ctx context.Context, params map[string]any) (ToolResult, error) {
+func (t *gitLogTool) Execute(ctx context.Context, params map[string]any) (*ToolResult, error) {
 	count := "10"
-	if c, _ := params["count"].(string); c != "" {
+	if c := stringParam(params, "count"); c != "" {
 		if _, err := strconv.Atoi(c); err == nil {
 			count = c
 		}
@@ -172,7 +173,7 @@ func (t *gitLogTool) Execute(ctx context.Context, params map[string]any) (ToolRe
 
 	args := []string{"log", "--oneline", "-n", count}
 
-	if path, _ := params["path"].(string); path != "" {
+	if path := stringParam(params, "path"); path != "" {
 		args = append(args, "--", path)
 	}
 
@@ -190,19 +191,17 @@ func (t *gitLogTool) Execute(ctx context.Context, params map[string]any) (ToolRe
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
-			return ToolResult{
-				Output:  stderr.String(),
-				Success: false,
-				Meta:    map[string]any{"exit_code": exitErr.ExitCode(), "duration": duration.String()},
+			return &ToolResult{
+				Output: stderr.String(),
+				Meta:   map[string]any{"exit_code": exitErr.ExitCode(), "duration": duration.String()},
 			}, nil
 		}
-		return ToolResult{Error: errors.Wrap(err, "git log").Error(), Success: false}, nil
+		return nil, fmt.Errorf("git log: %w", err)
 	}
 
-	return ToolResult{
-		Output:  stdout.String(),
-		Success: true,
-		Meta:    map[string]any{"exit_code": 0, "duration": duration.String()},
+	return &ToolResult{
+		Output: stdout.String(),
+		Meta:   map[string]any{"exit_code": 0, "duration": duration.String()},
 	}, nil
 }
 
@@ -211,7 +210,7 @@ type gitCommitTool struct {
 	workDir string
 }
 
-func NewGitCommitTool(workDir string) Tool {
+func NewGitCommitTool(workDir string) *gitCommitTool {
 	return &gitCommitTool{workDir: workDir}
 }
 
@@ -229,13 +228,13 @@ func (t *gitCommitTool) Schema() ollama.JSONSchema {
 	}
 }
 
-func (t *gitCommitTool) Execute(ctx context.Context, params map[string]any) (ToolResult, error) {
-	message, _ := params["message"].(string)
+func (t *gitCommitTool) Execute(ctx context.Context, params map[string]any) (*ToolResult, error) {
+	message := stringParam(params, "message")
 	if message == "" {
-		return ToolResult{Error: "message is required", Success: false}, nil
+		return nil, &ToolError{Msg: "message is required"}
 	}
 
-	files, _ := params["files"].(string)
+	files := stringParam(params, "files")
 	if files == "" {
 		files = "."
 	}
@@ -249,10 +248,7 @@ func (t *gitCommitTool) Execute(ctx context.Context, params map[string]any) (Too
 	addCmd.Stderr = &addStderr
 
 	if err := addCmd.Run(); err != nil {
-		return ToolResult{
-			Error:   fmt.Sprintf("git add failed: %s", addStderr.String()),
-			Success: false,
-		}, nil
+		return nil, &ToolError{Msg: fmt.Sprintf("git add failed: %s", addStderr.String())}
 	}
 
 	// Commit.
@@ -277,18 +273,16 @@ func (t *gitCommitTool) Execute(ctx context.Context, params map[string]any) (Too
 				}
 				output += stderr.String()
 			}
-			return ToolResult{
-				Output:  output,
-				Success: false,
-				Meta:    map[string]any{"exit_code": exitErr.ExitCode(), "duration": duration.String()},
+			return &ToolResult{
+				Output: output,
+				Meta:   map[string]any{"exit_code": exitErr.ExitCode(), "duration": duration.String()},
 			}, nil
 		}
-		return ToolResult{Error: errors.Wrap(err, "git commit").Error(), Success: false}, nil
+		return nil, fmt.Errorf("git commit: %w", err)
 	}
 
-	return ToolResult{
-		Output:  stdout.String(),
-		Success: true,
-		Meta:    map[string]any{"exit_code": 0, "duration": duration.String()},
+	return &ToolResult{
+		Output: stdout.String(),
+		Meta:   map[string]any{"exit_code": 0, "duration": duration.String()},
 	}, nil
 }

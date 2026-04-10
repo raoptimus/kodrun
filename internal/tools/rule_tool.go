@@ -34,19 +34,16 @@ func (t *RuleTool) Schema() ollama.JSONSchema {
 	}
 }
 
-func (t *RuleTool) Execute(ctx context.Context, params map[string]any) (ToolResult, error) {
-	name, _ := params["name"].(string)
+func (t *RuleTool) Execute(ctx context.Context, params map[string]any) (*ToolResult, error) {
+	name := stringParam(params, "name")
 	if name == "" {
-		return ToolResult{Error: "name is required", Success: false}, nil
+		return nil, &ToolError{Msg: "name is required"}
 	}
 
 	content, err := t.loader.GetRuleContent(ctx, name, t.scope)
 	if err != nil {
-		return ToolResult{
-			Error:   fmt.Sprintf("rule not found: %s", name),
-			Success: false,
-		}, nil
+		return nil, &ToolError{Msg: fmt.Sprintf("rule not found: %s", name)}
 	}
 
-	return ToolResult{Output: content, Success: true}, nil
+	return &ToolResult{Output: content}, nil
 }

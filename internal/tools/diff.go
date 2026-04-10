@@ -5,6 +5,11 @@ import (
 	"strings"
 )
 
+const (
+	maxDiffInputLines = 5000 // skip diff when combined line count exceeds this
+	diffLookahead     = 10   // lines to look ahead when finding common lines
+)
+
 // LineStats computes the number of added and removed lines between old and new content.
 func LineStats(oldContent, newContent string) (added, removed int) {
 	oldLines := splitLines(oldContent)
@@ -48,7 +53,7 @@ func SimpleDiff(oldContent, newContent, path string, maxLines int) string {
 	oldLines := splitLines(oldContent)
 	newLines := splitLines(newContent)
 
-	if len(oldLines)+len(newLines) > 5000 {
+	if len(oldLines)+len(newLines) > maxDiffInputLines {
 		return fmt.Sprintf("(diff too large: %d → %d lines)", len(oldLines), len(newLines))
 	}
 
@@ -134,7 +139,7 @@ func SimpleDiff(oldContent, newContent, path string, maxLines int) string {
 }
 
 func containsFrom(lines []string, start int, target string) bool {
-	end := start + 10 // look ahead up to 10 lines
+	end := start + diffLookahead
 	if end > len(lines) {
 		end = len(lines)
 	}

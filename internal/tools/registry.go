@@ -15,16 +15,23 @@ type Tool interface {
 	Name() string
 	Description() string
 	Schema() ollama.JSONSchema
-	Execute(ctx context.Context, params map[string]any) (ToolResult, error)
+	Execute(ctx context.Context, params map[string]any) (*ToolResult, error)
 }
 
-// ToolResult represents the outcome of a tool execution.
+// ToolResult represents the successful outcome of a tool execution.
 type ToolResult struct {
-	Output  string         `json:"output"`
-	Error   string         `json:"error,omitempty"`
-	Success bool           `json:"success"`
-	Meta    map[string]any `json:"meta,omitempty"`
+	Output string         `json:"output"`
+	Meta   map[string]any `json:"meta,omitempty"`
 }
+
+// ToolError is a tool-level execution failure (e.g. file not found,
+// invalid arguments). Callers use errors.As to distinguish it from
+// framework errors.
+type ToolError struct {
+	Msg string
+}
+
+func (e *ToolError) Error() string { return e.Msg }
 
 // Registry manages available tools.
 type Registry struct {
@@ -84,30 +91,19 @@ func (r *Registry) Register(t Tool) {
 	}
 }
 
-// Get returns a tool by name.
-func (r *Registry) Get(name string) (Tool, bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	t, ok := r.tools[name]
-	return t, ok
-}
-
 // Execute runs a tool by name with the given parameters.
 //
 // When a result cache is attached, Execute serves cacheable read-tool results
 // from the cache when fresh, stores new results, and invalidates dependent
 // entries on successful write-tool calls.
-func (r *Registry) Execute(ctx context.Context, name string, params map[string]any) (ToolResult, error) {
+func (r *Registry) Execute(ctx context.Context, name string, params map[string]any) (*ToolResult, error) {
 	r.mu.RLock()
 	t, ok := r.tools[name]
 	cache := r.cache
 	invalidates := r.invalidatedBy[name]
 	r.mu.RUnlock()
 	if !ok {
-		return ToolResult{
-			Error:   fmt.Sprintf("unknown tool: %s", name),
-			Success: false,
-		}, nil
+		return nil, &ToolError{Msg: fmt.Sprintf("unknown tool: %s", name)}
 	}
 
 	// Cache lookup for cacheable tools.
@@ -135,13 +131,13 @@ func (r *Registry) Execute(ctx context.Context, name string, params map[string]a
 	result, err := t.Execute(ctx, params)
 
 	// Store on success.
-	if cache != nil && cacheable && err == nil && result.Success {
+	if cache != nil && cacheable && err == nil {
 		cache.Put(cacheKey, result, resolvedPaths)
 	}
 
 	// Write-tool invalidation: if this tool is referenced as an invalidator by
 	// any cached read-tool, drop entries depending on the affected paths.
-	if cache != nil && len(invalidates) > 0 && err == nil && result.Success {
+	if cache != nil && len(invalidates) > 0 && err == nil {
 		for _, p := range writeToolPaths(t, params) {
 			cache.InvalidatePath(p)
 		}

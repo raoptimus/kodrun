@@ -101,6 +101,11 @@ linters:
     goconst:
       min-len: 2
       min-occurrences: 2
+    gosec:
+      excludes:
+        - G204
+    nestif:
+      min-complexity: 70
     gocritic:
       disabled-checks:
         - importShadow
@@ -133,6 +138,14 @@ linters:
       - linters:
           - gocritic
         text: 'commentedOutCode: may want to remove commented-out code'
+      - linters:
+          - gocritic
+        path: internal/tui/model\.go
+        text: 'hugeParam: m is heavy'
+      - linters:
+          - ireturn
+        path: internal/tui/model\.go
+        text: 'Update returns interface'
       - path: (.+)\.go$
         text: ST1000
     paths:

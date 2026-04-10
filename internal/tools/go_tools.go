@@ -3,12 +3,12 @@ package tools
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
 	"time"
 
-	"github.com/pkg/errors"
 	"github.com/raoptimus/kodrun/internal/ollama"
 	"github.com/raoptimus/kodrun/internal/rag"
 )
@@ -27,9 +27,10 @@ func (t *goTool) Name() string              { return t.name }
 func (t *goTool) Description() string       { return t.description }
 func (t *goTool) Schema() ollama.JSONSchema { return t.schema }
 
-func (t *goTool) Execute(ctx context.Context, params map[string]any) (ToolResult, error) {
-	args := make([]string, len(t.defaultArgs))
-	copy(args, t.defaultArgs)
+func (t *goTool) Execute(ctx context.Context, params map[string]any) (*ToolResult, error) {
+	const extraArgsCap = 4
+	args := make([]string, 0, len(t.defaultArgs)+extraArgsCap)
+	args = append(args, t.defaultArgs...)
 
 	if packages, ok := params["packages"].(string); ok && packages != "" {
 		args = append(args, packages)
@@ -40,7 +41,7 @@ func (t *goTool) Execute(ctx context.Context, params map[string]any) (ToolResult
 	if flags, ok := params["flags"].(string); ok && flags != "" {
 		for _, f := range strings.Fields(flags) {
 			if isForbiddenFlag(f) {
-				return ToolResult{Error: fmt.Sprintf("flag %q is not allowed", f), Success: false}, nil
+				return nil, &ToolError{Msg: fmt.Sprintf("flag %q is not allowed", f)}
 			}
 			args = append(args, f)
 		}
@@ -67,7 +68,7 @@ func (t *goTool) Execute(ctx context.Context, params map[string]any) (ToolResult
 		if errors.As(err, &exitErr) {
 			exitCode = exitErr.ExitCode()
 		} else {
-			return ToolResult{Error: err.Error(), Success: false}, nil
+			return nil, fmt.Errorf("run %s: %w", t.command, err)
 		}
 	}
 
@@ -79,9 +80,8 @@ func (t *goTool) Execute(ctx context.Context, params map[string]any) (ToolResult
 		output += stderr.String()
 	}
 
-	return ToolResult{
-		Output:  output,
-		Success: exitCode == 0,
+	return &ToolResult{
+		Output: output,
 		Meta: map[string]any{
 			"exit_code": exitCode,
 			"duration":  duration.String(),
@@ -137,7 +137,7 @@ func goToolSchema(extraProps map[string]ollama.JSONSchema) ollama.JSONSchema {
 }
 
 // NewGoBuildTool creates a go_build tool.
-func NewGoBuildTool(workDir string) Tool {
+func NewGoBuildTool(workDir string) *goTool {
 	return &goTool{
 		workDir:     workDir,
 		name:        "go_build",
@@ -149,7 +149,7 @@ func NewGoBuildTool(workDir string) Tool {
 }
 
 // NewGoTestTool creates a go_test tool.
-func NewGoTestTool(workDir string) Tool {
+func NewGoTestTool(workDir string) *goTool {
 	return &goTool{
 		workDir:     workDir,
 		name:        "go_test",
@@ -163,7 +163,7 @@ func NewGoTestTool(workDir string) Tool {
 }
 
 // NewGoVetTool creates a go_vet tool.
-func NewGoVetTool(workDir string) Tool {
+func NewGoVetTool(workDir string) *goTool {
 	return &goTool{
 		workDir:     workDir,
 		name:        "go_vet",
@@ -175,7 +175,7 @@ func NewGoVetTool(workDir string) Tool {
 }
 
 // NewGoFmtTool creates a go_fmt tool.
-func NewGoFmtTool(workDir string) Tool {
+func NewGoFmtTool(workDir string) *goTool {
 	return &goTool{
 		workDir:     workDir,
 		name:        "go_fmt",
@@ -192,7 +192,7 @@ func NewGoFmtTool(workDir string) Tool {
 }
 
 // NewGoLintTool creates a go_lint tool.
-func NewGoLintTool(workDir string) Tool {
+func NewGoLintTool(workDir string) *goTool {
 	return &goTool{
 		workDir:     workDir,
 		name:        "go_lint",
@@ -206,7 +206,7 @@ func NewGoLintTool(workDir string) Tool {
 }
 
 // NewGoModTidyTool creates a go_mod_tidy tool.
-func NewGoModTidyTool(workDir string) Tool {
+func NewGoModTidyTool(workDir string) *goTool {
 	return &goTool{
 		workDir:     workDir,
 		name:        "go_mod_tidy",
@@ -221,7 +221,7 @@ func NewGoModTidyTool(workDir string) Tool {
 }
 
 // NewGoGetTool creates a go_get tool.
-func NewGoGetTool(workDir string) Tool {
+func NewGoGetTool(workDir string) *goTool {
 	return &goTool{
 		workDir:     workDir,
 		name:        "go_get",
@@ -259,7 +259,7 @@ const godocSearchTopK = 5
 // NewGoDocTool creates a go_doc tool. If indexer is non-nil (RAG enabled),
 // the tool indexes go doc output into the godoc RAG sub-index and supports
 // semantic search over previously indexed documentation via the query parameter.
-func NewGoDocTool(workDir string, indexer GoDocIndexer) Tool {
+func NewGoDocTool(workDir string, indexer GoDocIndexer) *goDocTool {
 	return &goDocTool{
 		goTool: goTool{
 			workDir:     workDir,
@@ -282,9 +282,9 @@ func NewGoDocTool(workDir string, indexer GoDocIndexer) Tool {
 
 const goDocPreviewBytes = 500
 
-func (t *goDocTool) Execute(ctx context.Context, params map[string]any) (ToolResult, error) {
-	pkgPath, _ := params["packages"].(string)
-	query, _ := params["query"].(string)
+func (t *goDocTool) Execute(ctx context.Context, params map[string]any) (*ToolResult, error) {
+	pkgPath := stringParam(params, "packages")
+	query := stringParam(params, "query")
 
 	// Search mode: query without packages.
 	if query != "" && pkgPath == "" {
@@ -292,12 +292,12 @@ func (t *goDocTool) Execute(ctx context.Context, params map[string]any) (ToolRes
 	}
 
 	if pkgPath == "" {
-		return ToolResult{Error: "either packages or query is required", Success: false}, nil
+		return nil, &ToolError{Msg: "either packages or query is required"}
 	}
 
 	result, err := t.goTool.Execute(ctx, params)
-	if err != nil || !result.Success {
-		return result, err
+	if err != nil {
+		return nil, err
 	}
 
 	// No indexer — return full output as before.
@@ -310,12 +310,16 @@ func (t *goDocTool) Execute(ctx context.Context, params map[string]any) (ToolRes
 		return result, nil
 	}
 
-	n, buildErr := t.indexer.Build(ctx, chunks)
-	if buildErr != nil {
-		// Indexing failed — still return full output so the agent is not blocked.
+	n, err := t.indexer.Build(ctx, chunks)
+	if err != nil {
+		return nil, fmt.Errorf("index godoc: %w", err)
+	}
+	if n == 0 {
 		return result, nil
 	}
-	_ = t.indexer.Save()
+	if err := t.indexer.Save(); err != nil {
+		return nil, fmt.Errorf("save godoc index: %w", err)
+	}
 
 	// Return a short preview + instruction to search.
 	preview := result.Output
@@ -334,23 +338,21 @@ func (t *goDocTool) Execute(ctx context.Context, params map[string]any) (ToolRes
 }
 
 // searchGodoc performs semantic search over previously indexed Go documentation.
-func (t *goDocTool) searchGodoc(ctx context.Context, query string) (ToolResult, error) {
+func (t *goDocTool) searchGodoc(ctx context.Context, query string) (*ToolResult, error) {
 	if t.indexer == nil {
-		return ToolResult{
-			Output:  "RAG is disabled. Run go_doc with packages parameter to view documentation directly.",
-			Success: true,
+		return &ToolResult{
+			Output: "RAG is disabled. Run go_doc with packages parameter to view documentation directly.",
 		}, nil
 	}
 
 	results, err := t.indexer.Search(ctx, query, godocSearchTopK)
 	if err != nil {
-		return ToolResult{Error: fmt.Sprintf("doc search: %s", err), Success: false}, nil
+		return nil, fmt.Errorf("doc search: %w", err)
 	}
 
 	if len(results) == 0 {
-		return ToolResult{
-			Output:  "No Go documentation found. Use go_doc with packages parameter first to index a package, then search with query.",
-			Success: true,
+		return &ToolResult{
+			Output: "No Go documentation found. Use go_doc with packages parameter first to index a package, then search with query.",
 		}, nil
 	}
 
@@ -361,13 +363,21 @@ func (t *goDocTool) searchGodoc(ctx context.Context, query string) (ToolResult, 
 			i+1, r.Score, r.Chunk.FilePath, r.Chunk.StartLine, r.Chunk.EndLine, r.Chunk.Content)
 	}
 
-	return ToolResult{
-		Output:  b.String(),
-		Success: true,
+	return &ToolResult{
+		Output: b.String(),
 		Meta: map[string]any{
 			"results": len(results),
 		},
 	}, nil
+}
+
+// CachePolicy implements the Cacheable interface. go_doc results are
+// cacheable regardless of mode (package docs or search). The RAG indexing
+// side-effect is idempotent so caching the result is safe.
+func (t *goDocTool) CachePolicy() CachePolicy {
+	return CachePolicy{
+		Cacheable: true,
+	}
 }
 
 // RegisterGoTools registers Go-specific tools (build/test/vet/fmt/lint/etc.).
@@ -383,6 +393,7 @@ func RegisterGoTools(reg *Registry, workDir string, indexer GoDocIndexer) {
 	reg.Register(NewGoModTidyTool(workDir))
 	reg.Register(NewGoGetTool(workDir))
 	reg.Register(NewGoDocTool(workDir, indexer))
+	reg.Register(NewGoStructureTool(workDir))
 }
 
 // BashTool executes arbitrary shell commands.
@@ -390,7 +401,7 @@ type BashTool struct {
 	workDir string
 }
 
-func (t *BashTool) Name() string        { return "bash" }
+func (t *BashTool) Name() string        { return extBash }
 func (t *BashTool) Description() string { return "Execute a shell command" }
 
 func (t *BashTool) Schema() ollama.JSONSchema {
@@ -403,10 +414,10 @@ func (t *BashTool) Schema() ollama.JSONSchema {
 	}
 }
 
-func (t *BashTool) Execute(ctx context.Context, params map[string]any) (ToolResult, error) {
-	command, _ := params["command"].(string)
+func (t *BashTool) Execute(ctx context.Context, params map[string]any) (*ToolResult, error) {
+	command := stringParam(params, "command")
 	if command == "" {
-		return ToolResult{Error: "command is required", Success: false}, nil
+		return nil, &ToolError{Msg: "command is required"}
 	}
 
 	cmd := exec.CommandContext(ctx, "sh", "-c", command)
@@ -426,7 +437,7 @@ func (t *BashTool) Execute(ctx context.Context, params map[string]any) (ToolResu
 		if errors.As(err, &exitErr) {
 			exitCode = exitErr.ExitCode()
 		} else {
-			return ToolResult{Error: err.Error(), Success: false}, nil
+			return nil, fmt.Errorf("run bash: %w", err)
 		}
 	}
 
@@ -438,9 +449,8 @@ func (t *BashTool) Execute(ctx context.Context, params map[string]any) (ToolResu
 		output += stderr.String()
 	}
 
-	return ToolResult{
-		Output:  output,
-		Success: exitCode == 0,
+	return &ToolResult{
+		Output: output,
 		Meta: map[string]any{
 			"exit_code": exitCode,
 			"duration":  duration.String(),

@@ -10,8 +10,8 @@ type Message struct {
 
 // ToolCall represents a tool invocation from the model.
 type ToolCall struct {
-	ID       string         `json:"id,omitempty"`
-	Function ToolCallFunc   `json:"function"`
+	ID       string       `json:"id,omitempty"`
+	Function ToolCallFunc `json:"function"`
 }
 
 // ToolCallFunc holds the function name and arguments.
@@ -32,8 +32,8 @@ type ChatRequest struct {
 
 // ToolDef describes a tool for the Ollama API.
 type ToolDef struct {
-	Type     string       `json:"type"`
-	Function ToolFuncDef  `json:"function"`
+	Type     string      `json:"type"`
+	Function ToolFuncDef `json:"function"`
 }
 
 // ToolFuncDef describes a tool function.

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"regexp"
@@ -35,16 +36,16 @@ type StdioTransport struct {
 	cmd          *exec.Cmd
 	stdin        io.WriteCloser
 	stdout       *bufio.Reader
-	stdoutCloser io.Closer  // underlying stdout pipe, closed to unblock decode goroutines
-	closeStdout  sync.Once  // prevents double-close of stdoutCloser
+	stdoutCloser io.Closer // underlying stdout pipe, closed to unblock decode goroutines
+	closeStdout  sync.Once // prevents double-close of stdoutCloser
 	stderr       *ringBuffer
 	mu           sync.Mutex // protects stdin writes
 	closed       chan struct{}
 }
 
 // NewStdioTransport starts a subprocess and wires stdin/stdout for JSON-RPC communication.
-func NewStdioTransport(command string, args []string, env map[string]string, workDir string) (*StdioTransport, error) {
-	cmd := exec.Command(command, args...)
+func NewStdioTransport(ctx context.Context, command string, args []string, env map[string]string, workDir string) (*StdioTransport, error) {
+	cmd := exec.CommandContext(ctx, command, args...)
 	cmd.Dir = workDir
 
 	// Merge env vars with key validation.
@@ -135,14 +136,18 @@ func (t *StdioTransport) Close() error {
 
 	if t.cmd.Process != nil {
 		// Try SIGINT first, then force kill.
-		_ = t.cmd.Process.Signal(os.Interrupt)
+		if sigErr := t.cmd.Process.Signal(os.Interrupt); sigErr != nil {
+			slog.Debug("mcp: failed to send interrupt", "error", sigErr)
+		}
 		done := make(chan error, 1)
 		go func() { done <- t.cmd.Wait() }()
 
 		select {
 		case <-done:
 		case <-time.After(shutdownTimeout):
-			_ = t.cmd.Process.Kill()
+			if killErr := t.cmd.Process.Kill(); killErr != nil {
+				slog.Debug("mcp: failed to kill process", "error", killErr)
+			}
 			select {
 			case <-done:
 			case <-time.After(killTimeout):

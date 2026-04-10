@@ -8,6 +8,8 @@ import (
 	"github.com/charmbracelet/glamour/ansi"
 )
 
+const mdIndent = 2 // indent / margin for markdown rendering
+
 func boolPtr(b bool) *bool       { return &b }
 func stringPtr(s string) *string { return &s }
 func uintPtr(u uint) *uint       { return &u }
@@ -57,7 +59,7 @@ var kodrunStyle = ansi.StyleConfig{
 	},
 	CodeBlock: ansi.StyleCodeBlock{
 		StyleBlock: ansi.StyleBlock{
-			Margin: uintPtr(2),
+			Margin: uintPtr(mdIndent),
 		},
 		Chroma: &ansi.Chroma{},
 	},
@@ -68,7 +70,7 @@ var kodrunStyle = ansi.StyleConfig{
 		Italic: boolPtr(true),
 	},
 	List: ansi.StyleList{
-		LevelIndent: 2,
+		LevelIndent: mdIndent,
 		StyleBlock: ansi.StyleBlock{
 			Margin: uintPtr(0),
 		},
