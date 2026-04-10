@@ -41,19 +41,19 @@ func (t *RAGSearchTool) Schema() ollama.JSONSchema {
 	}
 }
 
-func (t *RAGSearchTool) Execute(ctx context.Context, params map[string]any) (ToolResult, error) {
-	query, _ := params["query"].(string)
+func (t *RAGSearchTool) Execute(ctx context.Context, params map[string]any) (*ToolResult, error) {
+	query := stringParam(params, "query")
 	if query == "" {
-		return ToolResult{Error: "query is required", Success: false}, nil
+		return nil, &ToolError{Msg: "query is required"}
 	}
 
 	results, err := t.index.Search(ctx, query, t.topK)
 	if err != nil {
-		return ToolResult{Error: fmt.Sprintf("search: %s", err), Success: false}, nil
+		return nil, fmt.Errorf("search: %w", err)
 	}
 
 	if len(results) == 0 {
-		return ToolResult{Output: "No relevant results found. Try a different query or run /reindex.", Success: true}, nil
+		return &ToolResult{Output: "No relevant results found. Try a different query or run /reindex."}, nil
 	}
 
 	var b strings.Builder
@@ -62,9 +62,8 @@ func (t *RAGSearchTool) Execute(ctx context.Context, params map[string]any) (Too
 			i+1, r.Score, r.Chunk.FilePath, r.Chunk.StartLine, r.Chunk.EndLine, r.Chunk.Content)
 	}
 
-	return ToolResult{
-		Output:  b.String(),
-		Success: true,
+	return &ToolResult{
+		Output: b.String(),
 		Meta: map[string]any{
 			"results": len(results),
 		},

@@ -14,6 +14,8 @@ import (
 	"github.com/raoptimus/kodrun/internal/ollama"
 )
 
+const sessionFilePermission = 0o600
+
 // Session represents a saved conversation session.
 type Session struct {
 	ID        string           `json:"id"`
@@ -37,10 +39,15 @@ type SessionSummary struct {
 	MessageCount int       `json:"message_count"`
 }
 
+const (
+	sessionIDRandomBytes = 3 // bytes of randomness in session ID
+	sessionDirPermission = 0o755
+)
+
 // NewSessionID generates a short unique ID like "20260404-abc123".
 func NewSessionID() string {
 	ts := time.Now().Format("20060102")
-	b := make([]byte, 3)
+	b := make([]byte, sessionIDRandomBytes)
 	if _, err := rand.Read(b); err != nil {
 		// Fallback to timestamp-based suffix if crypto/rand fails.
 		return ts + "-" + time.Now().Format("150405")
@@ -50,7 +57,7 @@ func NewSessionID() string {
 
 // SaveSession writes the session to sessionsDir/{id}.json.
 func SaveSession(sessionsDir string, session *Session) error {
-	if err := os.MkdirAll(sessionsDir, 0o755); err != nil {
+	if err := os.MkdirAll(sessionsDir, sessionDirPermission); err != nil {
 		return errors.WithMessage(err, "create sessions directory")
 	}
 
@@ -62,7 +69,7 @@ func SaveSession(sessionsDir string, session *Session) error {
 	}
 
 	path := filepath.Join(sessionsDir, session.ID+".json")
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	if err := os.WriteFile(path, data, sessionFilePermission); err != nil {
 		return errors.WithMessage(err, "write session file")
 	}
 
@@ -96,7 +103,7 @@ func ListSessions(sessionsDir string) ([]*SessionSummary, error) {
 		return nil, errors.WithMessage(err, "read sessions directory")
 	}
 
-	var summaries []*SessionSummary
+	summaries := make([]*SessionSummary, 0, len(entries))
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
 			continue

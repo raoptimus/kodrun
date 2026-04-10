@@ -21,6 +21,50 @@ var ErrMaxIterations = errors.New("max iterations reached")
 // maxToolResultBytes limits tool output stored in history to prevent unbounded memory growth.
 const maxToolResultBytes = 16 * 1024 // 16KB
 
+const (
+	maxFingerprintLen    = 80   // max chars for fingerprint/display truncation
+	ragTopK              = 5    // number of top RAG results to include
+	truncatePreviewLen   = 200  // max chars for tool result preview
+	diffPreviewMaxLines  = 30   // max lines in edit/write diff preview
+	previewNewFileLines  = 20   // max lines when previewing a new file
+	toolDetailTruncate   = 60   // max chars for tool detail truncation
+	planPrefixScanLen    = 5    // max chars to scan for list markers in plan detection
+	charsPerToken        = 4    // approximate chars per token for ASCII text
+	autoCompactThreshold = 0.99 // context fill ratio that triggers auto-compact
+	nanosPerSec          = 1e9  // nanoseconds in one second
+	pctMultiplier        = 100  // multiplier to convert ratio to percentage
+	fileListMaxLen       = 120  // max chars for file list in tool result
+	toolArgTruncateLen   = 80   // max chars for tool argument display
+
+	actionDelete       = "Delete"
+	toolNameReadFile   = "read_file"
+	toolNameWriteFile  = "write_file"
+	toolNameEditFile   = "edit_file"
+	toolNameDeleteFile = "delete_file"
+	toolNameMoveFile   = "move_file"
+	toolNameFindFiles  = "find_files"
+	toolNameListDir    = "list_dir"
+	toolNameCreateDir  = "create_dir"
+	toolNameGrep       = "grep"
+	toolNameBash       = "bash"
+	toolNameGoBuild    = "go_build"
+	toolNameGoTest     = "go_test"
+	toolNameGoLint     = "go_lint"
+	toolNameGoVet      = "go_vet"
+	toolNameGoDoc      = "go_doc"
+	toolNameSearchDocs = "search_docs"
+	toolNameSnippets   = "snippets"
+	toolNameGitStatus  = "git_status"
+	toolNameGitDiff    = "git_diff"
+	toolNameGitLog     = "git_log"
+	toolNameGitCommit  = "git_commit"
+	toolNameGetRule    = "get_rule"
+	toolNameWebFetch   = "web_fetch"
+	headerPLAN         = "PLAN"
+	headerPLANRu       = "ПЛАН"
+	langEnglish        = "English"
+)
+
 // Mode represents the agent operating mode.
 type Mode int
 
@@ -34,30 +78,32 @@ const (
 // String returns the mode name.
 func (m Mode) String() string {
 	if m == ModePlan {
-		return "plan"
+		return string(ClassifyKindPlan)
 	}
 	return "edit"
 }
 
 // readOnlyTools is the set of tools allowed in plan mode.
 var readOnlyTools = map[string]bool{
-	"read_file":          true,
+	"file_stat":          true,
+	toolNameReadFile:     true,
 	"read_changed_files": true,
-	"web_fetch":          true,
-	"list_dir":           true,
-	"find_files":         true,
-	"grep":               true,
-	"get_rule":           true,
-	"snippets":           true,
-	"search_docs":        true,
-	"go_doc":             true,
-	"git_status":         true,
-	"git_diff":           true,
-	"git_log":            true,
+	toolNameWebFetch:     true,
+	toolNameListDir:      true,
+	toolNameFindFiles:    true,
+	toolNameGrep:         true,
+	toolNameGetRule:      true,
+	toolNameSnippets:     true,
+	toolNameSearchDocs:   true,
+	toolNameGoDoc:        true,
+	"go_structure":       true,
+	toolNameGitStatus:    true,
+	toolNameGitDiff:      true,
+	toolNameGitLog:       true,
 }
 
 // EventHandler receives agent events for display.
-type EventHandler func(event Event)
+type EventHandler func(event *Event)
 
 // Event represents an agent lifecycle event.
 type Event struct {
@@ -118,6 +164,11 @@ type SessionStats struct {
 	ChangedFiles   []string // paths of files added/modified/deleted/renamed
 	tkPerSecSum    float64
 	tkPerSecCount  int
+
+	// Performance breakdown (populated per iteration).
+	Iterations    int
+	TotalLLMTime  time.Duration
+	TotalToolTime time.Duration
 }
 
 func (s *SessionStats) reset() {
@@ -130,7 +181,7 @@ func (s *SessionStats) recordFileAction(action, path string, added, removed int)
 		s.FilesAdded++
 	case "Update":
 		s.FilesModified++
-	case "Delete":
+	case actionDelete:
 		s.FilesDeleted++
 	case "Rename":
 		s.FilesRenamed++
@@ -225,6 +276,7 @@ type Agent struct {
 	pool                *WorkerPool
 	extraConfirmTools   map[string]bool
 	extraReadOnlyTools  map[string]bool
+	disabledTools       map[string]bool
 	toolsDisabled       bool
 	sessionDir          string
 	sessionID           string
@@ -247,6 +299,14 @@ type Agent struct {
 	// because the model returned a markdown plan instead of tool calls in
 	// EDIT mode. Reset at the start of every Send. See nudgeOrTerminate.
 	editNudges int
+
+	// planBlockedStreak counts consecutive iterations where ALL tool calls
+	// were blocked (write tools in plan mode). When the streak reaches
+	// maxPlanBlocked the agent stops early to avoid wasting iterations.
+	planBlockedStreak int
+
+	// verbose enables per-iteration timing diagnostics.
+	verbose bool
 }
 
 // New creates a new Agent.
@@ -309,6 +369,9 @@ func (a *Agent) SetTaskLabel(label string) {
 func (a *Agent) SetGroupID(id string) {
 	a.groupID = id
 }
+
+// SetVerbose enables per-iteration timing diagnostics.
+func (a *Agent) SetVerbose(v bool) { a.verbose = v }
 
 // SetHasSnippets marks that the snippets tool is available.
 func (a *Agent) SetHasSnippets(v bool) {
@@ -431,6 +494,17 @@ func (a *Agent) AddReadOnlyTools(names map[string]bool) {
 	maps.Copy(a.extraReadOnlyTools, names)
 }
 
+// DisableTools marks tool names that must never be offered to the model or
+// executed, regardless of mode. Used to honour config flags like auto_commit.
+func (a *Agent) DisableTools(names ...string) {
+	if a.disabledTools == nil {
+		a.disabledTools = make(map[string]bool, len(names))
+	}
+	for _, n := range names {
+		a.disabledTools[n] = true
+	}
+}
+
 // SetMode sets the agent operating mode.
 func (a *Agent) SetMode(mode Mode) {
 	a.mode = mode
@@ -506,7 +580,7 @@ func (a *Agent) LoadFromSession(s *Session) {
 	copy(a.history, s.Messages)
 
 	switch s.Mode {
-	case "plan":
+	case string(ClassifyKindPlan):
 		a.mode = ModePlan
 	default:
 		a.mode = ModeEdit
@@ -544,11 +618,11 @@ func (a *Agent) autoSave() {
 	}
 
 	if err := SaveSession(a.sessionDir, session); err != nil {
-		a.emit(Event{Type: EventError, Message: "session auto-save failed: " + err.Error()})
+		a.emit(&Event{Type: EventError, Message: "session auto-save failed: " + err.Error()})
 	}
 }
 
-func (a *Agent) emit(e Event) {
+func (a *Agent) emit(e *Event) {
 	if a.onEvent == nil {
 		return
 	}
@@ -572,9 +646,9 @@ func (a *Agent) Init(ruleCatalog string) {
 	}
 	a.ctxMgr = NewContextManager(a.contextSize, a.client, a.model)
 	a.ctxMgr.SetLanguage(a.language)
-	a.emit(Event{
+	a.emit(&Event{
 		Type:               EventAgent,
-		SystemPromptTokens: len(systemPrompt) / 4,
+		SystemPromptTokens: len(systemPrompt) / charsPerToken,
 	})
 }
 
@@ -617,7 +691,7 @@ func (a *Agent) Compact(ctx context.Context, instructions string) error {
 
 	after := a.ctxMgr.estimateTokens(a.history)
 
-	a.emit(Event{
+	a.emit(&Event{
 		Type:         EventCompact,
 		Message:      fmt.Sprintf("Context compacted: ~%d → ~%d tokens (freed ~%d)", before, after, before-after),
 		ContextUsed:  after,
@@ -659,15 +733,15 @@ func (a *Agent) ensureLanguageDetected() {
 		return
 	}
 	tools.RegisterLanguageTools(a.reg, lang, a.workDir, a.godocIndexer)
-	a.emit(Event{Type: EventAgent, Message: fmt.Sprintf("Project language detected: %s — language tools registered", lang)})
+	a.emit(&Event{Type: EventAgent, Message: fmt.Sprintf("Project language detected: %s — language tools registered", lang)})
 }
 
 // Send processes a single user message, preserving conversation history.
 func (a *Agent) Send(ctx context.Context, task string) error {
 	a.ensureLanguageDetected()
 	userContent := task
-	if a.ragIndex != nil {
-		if results, err := a.ragIndex.Search(ctx, task, 5); err == nil && len(results) > 0 {
+	if a.hasRAG && a.ragIndex != nil {
+		if results, err := a.ragIndex.Search(ctx, task, ragTopK); err == nil && len(results) > 0 {
 			userContent = formatRAGResults(results) + "\n" + userContent
 		}
 	}
@@ -679,24 +753,28 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 	a.stats.reset()
 	a.planBuf.Reset()
 	a.editNudges = 0
+	a.planBlockedStreak = 0
 
 	// Emit a start-of-task status line only when a label was set. Sub-agents
 	// that live inside a collapsible group (parallel specialist reviewers)
 	// set an empty label on purpose so their activity in the UI is limited
 	// to actual tool calls, keeping the group tail free for read_file/etc.
 	if a.taskLabel != "" {
-		a.emit(Event{Type: EventAgent, Message: a.taskLabel})
+		a.emit(&Event{Type: EventAgent, Message: a.taskLabel})
 	}
 
+	var iterCount int
 	for range a.maxIter {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		iterCount++
+		iterStart := time.Now()
 
 		// Auto-compact by real prompt_eval_count when context is >=99% full
 		if a.autoCompact && a.ctxMgr != nil && a.lastPromptEvalCount > 0 && a.contextSize > 0 {
 			ratio := float64(a.lastPromptEvalCount) / float64(a.contextSize)
-			if ratio >= 0.99 {
+			if ratio >= autoCompactThreshold {
 				if err := a.Compact(ctx, ""); err == nil {
 					a.lastPromptEvalCount = 0
 				}
@@ -710,7 +788,7 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 			if err == nil && a.ctxMgr.estimateTokens(trimmed) < before {
 				a.history = trimmed
 				after := a.ctxMgr.estimateTokens(a.history)
-				a.emit(Event{
+				a.emit(&Event{
 					Type:         EventCompact,
 					Message:      fmt.Sprintf("Auto-trimmed: ~%d → ~%d tokens", before, after),
 					ContextUsed:  after,
@@ -728,15 +806,16 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 		if a.hasTemperature {
 			opts["temperature"] = a.temperature
 		}
-		resp, err := a.client.ChatSync(ctx, ollama.ChatRequest{
+		resp, err := a.client.ChatSync(ctx, &ollama.ChatRequest{
 			Model:    a.model,
 			Messages: a.history,
 			Tools:    a.toolDefsForMode(),
 			Options:  opts,
 			Format:   a.format,
 		})
+		llmDuration := time.Since(iterStart)
 		if err != nil {
-			a.emit(Event{Type: EventError, Message: err.Error()})
+			a.emit(&Event{Type: EventError, Message: err.Error()})
 			return errors.WithMessage(err, "chat")
 		}
 
@@ -749,9 +828,9 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 		if resp.PromptEvalCount > 0 || resp.EvalCount > 0 {
 			var tkPerSec float64
 			if resp.EvalDuration > 0 {
-				tkPerSec = float64(resp.EvalCount) / float64(resp.EvalDuration) * 1e9
+				tkPerSec = float64(resp.EvalCount) / float64(resp.EvalDuration) * nanosPerSec
 			}
-			a.emit(Event{
+			a.emit(&Event{
 				Type:         EventTokens,
 				PromptTokens: resp.PromptEvalCount,
 				EvalTokens:   resp.EvalCount,
@@ -761,7 +840,7 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 			})
 			var ctxPct int
 			if a.contextSize > 0 {
-				ctxPct = resp.PromptEvalCount * 100 / a.contextSize
+				ctxPct = resp.PromptEvalCount * pctMultiplier / a.contextSize
 			}
 			a.stats.recordTokens(resp.PromptEvalCount, resp.EvalCount, tkPerSec, ctxPct)
 		}
@@ -783,9 +862,9 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 			// prompt — it does not fix the model, only the symptom.
 			if a.mode == ModeEdit && a.editNudges < maxEditNudges && looksLikeMarkdownPlan(resp.Content) {
 				a.editNudges++
-				a.emit(Event{Type: EventAgent, Message: fmt.Sprintf("Model responded with text instead of tool calls; nudging (%d/%d)...", a.editNudges, maxEditNudges)})
+				a.emit(&Event{Type: EventAgent, Message: fmt.Sprintf("Model responded with text instead of tool calls; nudging (%d/%d)...", a.editNudges, maxEditNudges)})
 				a.history = append(a.history, ollama.Message{
-					Role: "user",
+					Role:    "user",
 					Content: "Stop. You are in EDIT mode. Do NOT describe the changes — apply them now via write_file/edit_file/bash. Begin with the first tool call. Do not explain. Do not output another plan.",
 				})
 				continue
@@ -801,13 +880,13 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 					a.lastPlan = strings.TrimSpace(raw)
 				}
 			} else if resp.Content != "" {
-				a.emit(Event{Type: EventAgent, Message: resp.Content})
+				a.emit(&Event{Type: EventAgent, Message: resp.Content})
 				if a.editNudges >= maxEditNudges {
-					a.emit(Event{Type: EventAgent, Message: fmt.Sprintf("Model returned text-only response in EDIT mode after %d nudges — aborting without changes. Consider using a stronger model or lowering executor temperature (see executor_provider: precise).", maxEditNudges)})
+					a.emit(&Event{Type: EventAgent, Message: fmt.Sprintf("Model returned text-only response in EDIT mode after %d nudges — aborting without changes. Consider using a stronger model or lowering executor temperature (see executor_provider: precise).", maxEditNudges)})
 				}
 			}
 			a.stats.AvgTkPerSec = a.stats.avgTkPerSec()
-			a.emit(Event{Type: EventDone, Message: "Done", Stats: &a.stats})
+			a.emit(&Event{Type: EventDone, Message: "Done", Stats: &a.stats})
 			a.autoSave()
 			return nil
 		}
@@ -830,26 +909,29 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 
 		// Execute remaining tools sequentially (write ops, confirm, blocked).
 		augmented := false
+		allBlocked := len(sequentialCalls) > 0
 		for _, tc := range sequentialCalls {
-			detail := toolDetail(tc.Function.Name, tc.Function.Arguments)
-			a.emit(Event{Type: EventTool, Tool: tc.Function.Name, Message: detail})
-
-			// Block destructive tools in plan mode
+			// Block destructive tools in plan mode — check BEFORE emitting
+			// the tool event so the TUI never shows a write-tool attempt.
 			if a.isToolBlocked(tc.Function.Name) {
 				a.history = append(a.history, ollama.Message{
 					Role:       "tool",
-					Content:    fmt.Sprintf("Tool %q is not available in plan mode. Switch to edit mode to use it.", tc.Function.Name),
+					Content:    fmt.Sprintf("Tool %q is NOT available in analysis mode. Do NOT call write tools. Use ONLY: %s", tc.Function.Name, strings.Join(a.reg.NamesFiltered(readOnlyTools), ", ")),
 					ToolCallID: tc.ID,
 				})
-				a.emit(Event{Type: EventTool, Tool: tc.Function.Name, Message: "blocked in plan mode", Success: false})
+				a.emit(&Event{Type: EventTool, Tool: tc.Function.Name, Message: "blocked in plan mode", Success: false})
 				continue
 			}
+			allBlocked = false
+
+			detail := toolDetail(tc.Function.Name, tc.Function.Arguments)
+			a.emit(&Event{Type: EventTool, Tool: tc.Function.Name, Message: detail})
 
 			// Check confirmation for destructive operations
 			if a.needsConfirm(tc.Function.Name) && a.confirmFn != nil {
 				fp := Fingerprint(tc.Function.Name, tc.Function.Arguments)
 				if !a.permMgr.IsAllowed(fp) {
-					payload := a.buildConfirmPayload(tc.Function.Name, tc.Function.Arguments)
+					payload := a.buildConfirmPayload(ctx, tc.Function.Name, tc.Function.Arguments)
 					cr := a.confirmFn(payload)
 					switch cr.Action {
 					case ConfirmDeny:
@@ -858,7 +940,7 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 							Content:    "Operation denied by user",
 							ToolCallID: tc.ID,
 						})
-						a.emit(Event{Type: EventTool, Tool: tc.Function.Name, Message: "denied by user", Success: false})
+						a.emit(&Event{Type: EventTool, Tool: tc.Function.Name, Message: "denied by user", Success: false})
 						continue
 					case ConfirmAllowOnce:
 						// proceed to execute
@@ -870,7 +952,7 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 							Content:    fmt.Sprintf("User rejected this call and provided a constraint: %s\nPlease rebuild this %s call accordingly.", cr.Augment, tc.Function.Name),
 							ToolCallID: tc.ID,
 						})
-						a.emit(Event{Type: EventTool, Tool: tc.Function.Name, Message: "augmented: " + cr.Augment, Success: false})
+						a.emit(&Event{Type: EventTool, Tool: tc.Function.Name, Message: "augmented: " + cr.Augment, Success: false})
 						augmented = true
 					}
 					if augmented {
@@ -882,13 +964,52 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 			a.executeSingle(ctx, tc)
 		}
 
+		// Track consecutive iterations where every tool call was blocked.
+		// When parallel read-only calls succeeded, the iteration is useful
+		// regardless of sequential blocked calls.
+		if allBlocked && len(parallelCalls) == 0 {
+			a.planBlockedStreak++
+			if a.mode == ModePlan && a.planBlockedStreak >= maxPlanBlocked {
+				a.emit(&Event{Type: EventAgent, Message: fmt.Sprintf(
+					"Model called only blocked tools for %d iterations — stopping analysis early.", a.planBlockedStreak)})
+				raw := a.planBuf.String()
+				a.lastPlan = extractPlan(raw)
+				if a.lastPlan == "" && len(raw) > 0 {
+					a.lastPlan = strings.TrimSpace(raw)
+				}
+				a.stats.AvgTkPerSec = a.stats.avgTkPerSec()
+				a.emit(&Event{Type: EventDone, Message: "Done (blocked streak)", Stats: &a.stats})
+				a.autoSave()
+				return nil
+			}
+		} else {
+			a.planBlockedStreak = 0
+		}
+
+		toolDuration := time.Since(iterStart) - llmDuration
+		if a.verbose {
+			var ctxPct int
+			if a.contextSize > 0 && resp.PromptEvalCount > 0 {
+				ctxPct = resp.PromptEvalCount * pctMultiplier / a.contextSize
+			}
+			a.emit(&Event{
+				Type: EventAgent,
+				Message: fmt.Sprintf("[perf] iter=%d llm=%s tools=%s total=%s ctx=%d%% tools_called=%d",
+					iterCount, llmDuration.Truncate(time.Millisecond), toolDuration.Truncate(time.Millisecond),
+					time.Since(iterStart).Truncate(time.Millisecond), ctxPct, len(resp.ToolCalls)),
+			})
+		}
+		a.stats.Iterations++
+		a.stats.TotalLLMTime += llmDuration
+		a.stats.TotalToolTime += toolDuration
+
 		if augmented {
 			continue // re-send to LLM with constraint
 		}
 
 		// Emit intermediate text if any (skip for plan mode — only final response goes into planBuf)
 		if resp.Content != "" && a.mode != ModePlan {
-			a.emit(Event{Type: EventAgent, Message: resp.Content})
+			a.emit(&Event{Type: EventAgent, Message: resp.Content})
 		}
 	}
 
@@ -905,7 +1026,7 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 	}
 
 	a.stats.AvgTkPerSec = a.stats.avgTkPerSec()
-	a.emit(Event{Type: EventDone, Message: "Max iterations reached", Stats: &a.stats})
+	a.emit(&Event{Type: EventDone, Message: "Max iterations reached", Stats: &a.stats})
 	a.autoSave()
 	return errors.WithStack(ErrMaxIterations)
 }
@@ -920,10 +1041,22 @@ func (a *Agent) toolDefsForMode() []ollama.ToolDef {
 	if a.toolsDisabled {
 		return nil
 	}
+	var defs []ollama.ToolDef
 	if a.mode == ModeEdit {
-		return a.reg.ToolDefs()
+		defs = a.reg.ToolDefs()
+	} else {
+		defs = a.reg.ToolDefsFiltered(readOnlyTools)
 	}
-	return a.reg.ToolDefsFiltered(readOnlyTools)
+	if len(a.disabledTools) == 0 {
+		return defs
+	}
+	filtered := defs[:0]
+	for i := range defs {
+		if !a.disabledTools[defs[i].Function.Name] {
+			filtered = append(filtered, defs[i])
+		}
+	}
+	return filtered
 }
 
 // SetToolsDisabled forces the agent to advertise no tools to the model and
@@ -952,9 +1085,9 @@ func (a *Agent) executeParallel(ctx context.Context, calls []ollama.ToolCall) {
 		name := tc.Function.Name
 		args := tc.Function.Arguments
 		idx := i
-		tasks[i] = func(ctx context.Context) (tools.ToolResult, error) {
+		tasks[i] = func(ctx context.Context) (*tools.ToolResult, error) {
 			if guards[idx] != nil {
-				return *guards[idx], nil
+				return guards[idx], nil
 			}
 			return a.reg.Execute(ctx, name, args)
 		}
@@ -965,7 +1098,7 @@ func (a *Agent) executeParallel(ctx context.Context, calls []ollama.ToolCall) {
 	for i, tr := range results {
 		tc := calls[i]
 		if tr.Err != nil {
-			a.emit(Event{Type: EventError, Tool: tc.Function.Name, Message: tr.Err.Error()})
+			a.emit(&Event{Type: EventError, Tool: tc.Function.Name, Message: tr.Err.Error()})
 			a.history = append(a.history, ollama.Message{
 				Role:       "tool",
 				Content:    "Error: " + tr.Err.Error(),
@@ -973,7 +1106,7 @@ func (a *Agent) executeParallel(ctx context.Context, calls []ollama.ToolCall) {
 			})
 			continue
 		}
-		a.emitToolResult(tc, tr.Result)
+		a.emitToolResult(tc, tr.Result, nil)
 	}
 }
 
@@ -987,7 +1120,7 @@ func (a *Agent) guardReadWhitelist(tc ollama.ToolCall) *tools.ToolResult {
 	name := tc.Function.Name
 	// Only constrain path-bearing read tools.
 	switch name {
-	case "read_file", "list_dir", "find_files", "grep":
+	case toolNameReadFile, toolNameListDir, toolNameFindFiles, toolNameGrep:
 	default:
 		return nil
 	}
@@ -1010,19 +1143,19 @@ func (a *Agent) guardReadWhitelist(tc ollama.ToolCall) *tools.ToolResult {
 			"If you need additional context, output `REPLAN: <reason>` and stop.",
 		p,
 	)
-	return &tools.ToolResult{Error: msg, Success: false}
+	return &tools.ToolResult{Output: msg}
 }
 
 // executeSingle runs a single tool call and records the result.
 func (a *Agent) executeSingle(ctx context.Context, tc ollama.ToolCall) {
 	if guard := a.guardReadWhitelist(tc); guard != nil {
-		a.emit(Event{Type: EventTool, Tool: tc.Function.Name, Message: "blocked by whitelist", Success: false})
-		a.emitToolResult(tc, *guard)
+		a.emit(&Event{Type: EventTool, Tool: tc.Function.Name, Message: "blocked by whitelist", Success: false})
+		a.emitToolResult(tc, guard, nil)
 		return
 	}
 	result, err := a.reg.Execute(ctx, tc.Function.Name, tc.Function.Arguments)
 	if err != nil {
-		a.emit(Event{Type: EventError, Tool: tc.Function.Name, Message: err.Error()})
+		a.emit(&Event{Type: EventError, Tool: tc.Function.Name, Message: err.Error()})
 		// Still add error to history so the model gets feedback.
 		a.history = append(a.history, ollama.Message{
 			Role:       "tool",
@@ -1031,35 +1164,31 @@ func (a *Agent) executeSingle(ctx context.Context, tc ollama.ToolCall) {
 		})
 		return
 	}
-	a.emitToolResult(tc, result)
+	a.emitToolResult(tc, result, nil)
 }
 
 // emitToolResult emits an event and appends the tool result to history.
-func (a *Agent) emitToolResult(tc ollama.ToolCall, result tools.ToolResult) {
+func (a *Agent) emitToolResult(tc ollama.ToolCall, result *tools.ToolResult, toolErr error) {
+	success := toolErr == nil
 	// For read-only tools, show detail (path) instead of output content.
-	msg := truncate(result.Output, 200)
+	msg := truncate(result.Output, truncatePreviewLen)
 	if readOnlyTools[tc.Function.Name] {
 		detail := toolDetail(tc.Function.Name, tc.Function.Arguments)
 		if detail != "" {
 			msg = detail
-		} else if !result.Success && result.Error != "" {
-			msg = truncate(result.Error, 120)
 		}
 	}
 	// For batch-read tools, show file list from result meta.
 	if msg == "" && result.Meta != nil {
 		if fl, ok := result.Meta["file_list"].([]string); ok && len(fl) > 0 {
 			msg = strings.Join(fl, ", ")
-			if len(msg) > 120 {
-				msg = msg[:120] + "..."
+			if len(msg) > fileListMaxLen {
+				msg = msg[:fileListMaxLen] + "..."
 			}
 		}
 	}
 	// Build full output for transcript view (same truncation as LLM history).
 	fullOutput := result.Output
-	if !result.Success && result.Error != "" {
-		fullOutput = "Error: " + result.Error
-	}
 	if len(fullOutput) > maxToolResultBytes {
 		fullOutput = fullOutput[:maxToolResultBytes] + "\n... [truncated]"
 	}
@@ -1068,7 +1197,7 @@ func (a *Agent) emitToolResult(tc ollama.ToolCall, result tools.ToolResult) {
 		Type:       EventTool,
 		Tool:       tc.Function.Name,
 		Message:    msg,
-		Success:    result.Success,
+		Success:    success,
 		FullOutput: fullOutput,
 	}
 	if result.Meta != nil {
@@ -1088,18 +1217,15 @@ func (a *Agent) emitToolResult(tc ollama.ToolCall, result tools.ToolResult) {
 			ev.Diff = v
 		}
 	}
-	a.emit(ev)
+	a.emit(&ev)
 
 	a.stats.ToolCalls++
 	if ev.FileAction != "" {
-		filePath, _ := tc.Function.Arguments["path"].(string)
+		filePath := stringFromMap(tc.Function.Arguments, "path")
 		a.stats.recordFileAction(ev.FileAction, filePath, ev.LinesAdded, ev.LinesRemoved)
 	}
 
 	resultContent := result.Output
-	if !result.Success && result.Error != "" {
-		resultContent = "Error: " + result.Error
-	}
 	if len(resultContent) > maxToolResultBytes {
 		resultContent = resultContent[:maxToolResultBytes] + "\n... [truncated, total " + fmt.Sprintf("%d", len(result.Output)) + " bytes]"
 	}
@@ -1114,6 +1240,9 @@ func (a *Agent) isToolBlocked(tool string) bool {
 	if a.toolsDisabled {
 		return true
 	}
+	if a.disabledTools[tool] {
+		return true
+	}
 	if a.mode != ModePlan {
 		return false
 	}
@@ -1122,7 +1251,7 @@ func (a *Agent) isToolBlocked(tool string) bool {
 
 func (a *Agent) needsConfirm(tool string) bool {
 	switch tool {
-	case "write_file", "edit_file", "delete_file", "move_file", "bash", "git_commit":
+	case toolNameWriteFile, toolNameEditFile, toolNameDeleteFile, toolNameMoveFile, toolNameBash, toolNameGitCommit, toolNameWebFetch:
 		return true
 	}
 	return a.extraConfirmTools[tool]
@@ -1131,62 +1260,66 @@ func (a *Agent) needsConfirm(tool string) bool {
 // buildConfirmPayload builds a ConfirmPayload for a tool call. For edit/write
 // tools it tries to read the current file content and produce a unified diff
 // preview so the user can see the change before approving.
-func (a *Agent) buildConfirmPayload(name string, args map[string]any) ConfirmPayload {
+func (a *Agent) buildConfirmPayload(ctx context.Context, name string, args map[string]any) ConfirmPayload {
 	p := ConfirmPayload{Tool: name, Args: map[string]string{}}
 	put := func(k, v string) {
 		p.Args[k] = v
 		p.ArgKeys = append(p.ArgKeys, k)
 	}
 	switch name {
-	case "edit_file":
-		path, _ := args["path"].(string)
-		oldStr, _ := args["old_str"].(string)
-		newStr, _ := args["new_str"].(string)
+	case toolNameEditFile:
+		path := stringFromMap(args, "path")
+		oldStr := stringFromMap(args, "old_str")
+		newStr := stringFromMap(args, "new_str")
 		put("path", path)
-		if resolved, err := tools.SafePath(context.Background(), a.workDir, path); err == nil {
+		if resolved, err := tools.SafePath(ctx, a.workDir, path); err == nil {
 			if data, err := os.ReadFile(resolved); err == nil {
 				content := string(data)
 				if strings.Contains(content, oldStr) {
 					newContent := strings.Replace(content, oldStr, newStr, 1)
-					p.Preview = tools.SimpleDiff(content, newContent, path, 30)
+					p.Preview = tools.SimpleDiff(content, newContent, path, diffPreviewMaxLines)
 				}
 			}
 		}
 		if p.Preview == "" {
-			p.Preview = "- " + truncateOneLine(oldStr, 200) + "\n+ " + truncateOneLine(newStr, 200)
+			p.Preview = "- " + truncateOneLine(oldStr, truncatePreviewLen) + "\n+ " + truncateOneLine(newStr, truncatePreviewLen)
 		}
-	case "write_file":
-		path, _ := args["path"].(string)
-		content, _ := args["content"].(string)
+	case toolNameWriteFile:
+		path := stringFromMap(args, "path")
+		content := stringFromMap(args, "content")
 		put("path", path)
 		var oldContent string
 		existed := false
-		if resolved, err := tools.SafePath(context.Background(), a.workDir, path); err == nil {
+		if resolved, err := tools.SafePath(ctx, a.workDir, path); err == nil {
 			if data, err := os.ReadFile(resolved); err == nil {
 				oldContent = string(data)
 				existed = true
 			}
 		}
 		if existed {
-			p.Preview = tools.SimpleDiff(oldContent, content, path, 30)
+			p.Preview = tools.SimpleDiff(oldContent, content, path, diffPreviewMaxLines)
 		} else {
-			p.Preview = previewNewFile(content, 20)
+			p.Preview = previewNewFile(content, previewNewFileLines)
 		}
-	case "delete_file":
-		path, _ := args["path"].(string)
+	case toolNameDeleteFile:
+		path := stringFromMap(args, "path")
 		put("path", path)
-	case "move_file":
-		from, _ := args["from"].(string)
-		to, _ := args["to"].(string)
+	case toolNameMoveFile:
+		from := stringFromMap(args, "from")
+		to := stringFromMap(args, "to")
 		put("from", from)
 		put("to", to)
-	case "bash":
-		cmd, _ := args["command"].(string)
+	case toolNameBash:
+		cmd := stringFromMap(args, "command")
 		put("command", cmd)
 		p.Danger = tools.IsDangerousCommand(cmd)
-	case "git_commit":
+	case toolNameGitCommit:
 		if msg, ok := args["message"].(string); ok {
 			put("message", msg)
+		}
+	case toolNameWebFetch:
+		if u := stringFromMap(args, "url"); u != "" {
+			put("url", u)
 		}
 	default:
 		for k, v := range args {
@@ -1214,74 +1347,78 @@ func previewNewFile(content string, maxLines int) string {
 
 func toolDetail(name string, args map[string]any) string {
 	switch name {
-	case "read_file", "write_file", "edit_file", "delete_file", "list_dir", "find_files", "create_dir":
+	case toolNameReadFile, toolNameWriteFile, toolNameEditFile, toolNameDeleteFile, toolNameListDir, toolNameFindFiles, toolNameCreateDir:
 		if p, ok := args["path"].(string); ok {
 			return p
 		}
-	case "move_file":
-		from, _ := args["from"].(string)
-		to, _ := args["to"].(string)
+	case toolNameMoveFile:
+		from := stringFromMap(args, "from")
+		to := stringFromMap(args, "to")
 		return from + " → " + to
-	case "grep":
-		pattern, _ := args["pattern"].(string)
-		path, _ := args["path"].(string)
+	case toolNameGrep:
+		pattern := stringFromMap(args, "pattern")
+		path := stringFromMap(args, "path")
 		return fmt.Sprintf("%q in %s", pattern, path)
-	case "go_build", "go_test", "go_lint", "go_vet":
+	case toolNameGoBuild, toolNameGoTest, toolNameGoLint, toolNameGoVet:
 		if p, ok := args["packages"].(string); ok && p != "" {
 			return p
 		}
 		return "./..."
-	case "go_doc":
+	case toolNameGoDoc:
 		if p, ok := args["packages"].(string); ok && p != "" {
 			return p
 		}
 		if q, ok := args["query"].(string); ok && q != "" {
-			if len(q) > 80 {
-				q = q[:80] + "..."
+			if len(q) > toolArgTruncateLen {
+				q = q[:toolArgTruncateLen] + "..."
 			}
 			return q
 		}
-	case "search_docs":
+	case toolNameSearchDocs:
 		if q, ok := args["query"].(string); ok && q != "" {
-			if len(q) > 80 {
-				q = q[:80] + "..."
+			if len(q) > toolArgTruncateLen {
+				q = q[:toolArgTruncateLen] + "..."
 			}
 			return q
 		}
-	case "bash":
+	case toolNameBash:
 		if cmd, ok := args["command"].(string); ok {
-			if len(cmd) > 80 {
-				cmd = cmd[:80] + "..."
+			if len(cmd) > toolArgTruncateLen {
+				cmd = cmd[:toolArgTruncateLen] + "..."
 			}
 			return cmd
 		}
-	case "snippets":
+	case toolNameSnippets:
 		if action, ok := args["action"].(string); ok && action != "" {
 			return action
 		}
 		return "match"
-	case "git_status":
+	case toolNameGitStatus:
 		return ""
-	case "git_diff", "git_log":
+	case toolNameGitDiff, toolNameGitLog:
 		if p, ok := args["path"].(string); ok && p != "" {
 			return p
 		}
 		return ""
-	case "git_commit":
+	case toolNameGitCommit:
 		if msg, ok := args["message"].(string); ok && msg != "" {
-			return truncateOneLine(msg, 60)
+			return truncateOneLine(msg, toolDetailTruncate)
 		}
 		return ""
-	case "get_rule":
+	case toolNameWebFetch:
+		if u, ok := args["url"].(string); ok {
+			return u
+		}
+	case toolNameGetRule:
 		if n, ok := args["name"].(string); ok && n != "" {
 			return n
 		}
 	}
 	// Generic fallback: try common arg keys before giving up.
-	for _, key := range []string{"path", "file", "name", "query", "input", "command", "pattern"} {
+	for _, key := range []string{"path", "file", "name", "query", "url", "input", "command", "pattern"} {
 		if v, ok := args[key].(string); ok && v != "" {
-			if len(v) > 80 {
-				v = v[:80] + "..."
+			if len(v) > maxFingerprintLen {
+				v = v[:maxFingerprintLen] + "..."
 			}
 			return v
 		}
@@ -1294,7 +1431,7 @@ func langName(code string) string {
 	case "ru":
 		return "Russian"
 	case "en":
-		return "English"
+		return langEnglish
 	case "de":
 		return "German"
 	case "fr":
@@ -1306,7 +1443,7 @@ func langName(code string) string {
 	case "ja":
 		return "Japanese"
 	case "":
-		return "English"
+		return langEnglish
 	default:
 		return code
 	}
@@ -1400,7 +1537,7 @@ func (a *Agent) buildSystemPrompt() string {
 	}
 
 	// Repeat language directive at the end for reinforcement (important for local models).
-	if lang != "English" {
+	if lang != langEnglish {
 		fmt.Fprintf(&b, "\nREMINDER: You MUST respond in %s. Never switch to any other language.\n", lang)
 	}
 
@@ -1493,16 +1630,16 @@ func trimPlanGarbage(text string) string {
 		}
 		// Headers
 		if strings.HasPrefix(trimmed, "##") ||
-			trimmed == "PLAN" || trimmed == "ПЛАН" ||
+			trimmed == headerPLAN || trimmed == headerPLANRu ||
 			trimmed == "CONTEXT" || trimmed == "КОНТЕКСТ" {
 			lastPlanLine = i
 			inPlan = strings.HasPrefix(trimmed, "##") && (strings.Contains(trimmed, "Plan") || strings.Contains(trimmed, "План")) ||
-				trimmed == "PLAN" || trimmed == "ПЛАН"
+				trimmed == headerPLAN || trimmed == headerPLANRu
 			continue
 		}
 		// Numbered list items: "1. ..." or "1) ..."
 		if len(trimmed) > 2 && trimmed[0] >= '0' && trimmed[0] <= '9' &&
-			(strings.Contains(trimmed[:min(5, len(trimmed))], ".") || strings.Contains(trimmed[:min(5, len(trimmed))], ")")) {
+			(strings.Contains(trimmed[:min(planPrefixScanLen, len(trimmed))], ".") || strings.Contains(trimmed[:min(planPrefixScanLen, len(trimmed))], ")")) {
 			lastPlanLine = i
 			inPlan = true
 			continue
@@ -1521,4 +1658,12 @@ func trimPlanGarbage(text string) string {
 	}
 
 	return strings.TrimSpace(strings.Join(lines[:lastPlanLine+1], "\n"))
+}
+
+// stringFromMap safely extracts a string value from a map[string]any.
+func stringFromMap(m map[string]any, key string) string {
+	if v, ok := m[key].(string); ok {
+		return v
+	}
+	return ""
 }

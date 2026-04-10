@@ -8,6 +8,16 @@ import (
 	"github.com/raoptimus/kodrun/internal/ollama"
 )
 
+const (
+	summarizeTruncateLen  = 500 // max chars per message when building summarization input
+	keepFirstMessages     = 2   // system + first user message to preserve on trim
+	keepLastMessages      = 6   // recent messages to preserve on trim
+	maxASCIICodepoint     = 127 // highest ASCII code point
+	nonASCIIThresholdPct  = 30  // percentage of non-ASCII runes triggering non-ASCII ratio
+	charsPerTokenNonASCII = 2   // approximate chars per token for CJK/Cyrillic text
+	charsPerTokenASCII    = 4   // approximate chars per token for ASCII text
+)
+
 // ContextManager handles context window management.
 type ContextManager struct {
 	maxTokens int
@@ -27,8 +37,8 @@ func (cm *ContextManager) SetLanguage(lang string) {
 func NewContextManager(maxTokens int, client *ollama.Client, model string) *ContextManager {
 	return &ContextManager{
 		maxTokens: maxTokens,
-		keepFirst: 2, // system + first user message
-		keepLast:  6,
+		keepFirst: keepFirstMessages,
+		keepLast:  keepLastMessages,
 		client:    client,
 		model:     model,
 	}
@@ -61,33 +71,27 @@ func (cm *ContextManager) doTrim(ctx context.Context, messages []ollama.Message,
 
 	// Summarize middle
 	summary, err := cm.summarize(ctx, middle, instructions)
-	if err != nil {
-		// Fallback: just drop middle
-		result := make([]ollama.Message, 0, len(head)+1+len(tail))
-		result = append(result, head...)
-		result = append(result, ollama.Message{
-			Role:    "user",
-			Content: fmt.Sprintf("[Earlier conversation was trimmed to save context.]\nIMPORTANT REMINDER: ALL your responses MUST be in %s. This is mandatory.", langName(cm.language)),
-		})
-		result = append(result, tail...)
-		return result, nil
+
+	msg := fmt.Sprintf("[Earlier conversation was trimmed to save context.]\nIMPORTANT REMINDER: ALL your responses MUST be in %s. This is mandatory.", langName(cm.language))
+	if err == nil {
+		msg = fmt.Sprintf("[Summary of earlier conversation.]\n%s\n\nIMPORTANT REMINDER: ALL your responses MUST be in %s. This is mandatory.", summary, langName(cm.language))
 	}
 
+	return cm.buildTrimmed(head, tail, msg), nil
+}
+
+func (cm *ContextManager) buildTrimmed(head, tail []ollama.Message, summaryMsg string) []ollama.Message {
 	result := make([]ollama.Message, 0, len(head)+1+len(tail))
 	result = append(result, head...)
-	result = append(result, ollama.Message{
-		Role:    "user",
-		Content: fmt.Sprintf("[Summary of earlier conversation.]\n%s\n\nIMPORTANT REMINDER: ALL your responses MUST be in %s. This is mandatory.", summary, langName(cm.language)),
-	})
+	result = append(result, ollama.Message{Role: "user", Content: summaryMsg})
 	result = append(result, tail...)
-
-	return result, nil
+	return result
 }
 
 func (cm *ContextManager) summarize(ctx context.Context, messages []ollama.Message, instructions string) (string, error) {
 	var content strings.Builder
 	for _, m := range messages {
-		fmt.Fprintf(&content, "[%s]: %s\n", m.Role, truncate(m.Content, 500))
+		fmt.Fprintf(&content, "[%s]: %s\n", m.Role, truncate(m.Content, summarizeTruncateLen))
 	}
 
 	sysPrompt := "Summarize the following conversation concisely, preserving key decisions, file changes, and errors encountered."
@@ -98,7 +102,7 @@ func (cm *ContextManager) summarize(ctx context.Context, messages []ollama.Messa
 		sysPrompt += fmt.Sprintf(" Always respond in %s.", langName(cm.language))
 	}
 
-	resp, err := cm.client.ChatSync(ctx, ollama.ChatRequest{
+	resp, err := cm.client.ChatSync(ctx, &ollama.ChatRequest{
 		Model: cm.model,
 		Messages: []ollama.Message{
 			{Role: "system", Content: sysPrompt},
@@ -133,14 +137,14 @@ func estimateStringTokens(s string) int {
 	var nonASCII, totalRunes int
 	for _, r := range s {
 		totalRunes++
-		if r > 127 {
+		if r > maxASCIICodepoint {
 			nonASCII++
 		}
 	}
-	if totalRunes > 0 && nonASCII*100/totalRunes > 30 {
+	if totalRunes > 0 && nonASCII*pctMultiplier/totalRunes > nonASCIIThresholdPct {
 		// Non-ASCII heavy text (Cyrillic, CJK): ~2 chars per token
-		return totalRunes / 2
+		return totalRunes / charsPerTokenNonASCII
 	}
 	// ASCII-heavy text: ~4 chars per token
-	return len(s) / 4
+	return len(s) / charsPerTokenASCII
 }

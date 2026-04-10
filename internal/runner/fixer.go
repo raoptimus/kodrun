@@ -29,7 +29,7 @@ func NewFixer(_ context.Context, client *ollama.Client, model string, reg *tools
 }
 
 // Fix attempts to fix errors from a tool run.
-func (f *Fixer) Fix(ctx context.Context, toolName string, output string, onEvent func(string)) (bool, error) {
+func (f *Fixer) Fix(ctx context.Context, toolName, output string, onEvent func(string)) (bool, error) {
 	errs := ParseErrors(ctx, output)
 	if len(errs) == 0 {
 		return false, nil
@@ -40,7 +40,7 @@ func (f *Fixer) Fix(ctx context.Context, toolName string, output string, onEvent
 	var fileContents strings.Builder
 	for _, file := range files {
 		result, err := f.reg.Execute(ctx, "read_file", map[string]any{"path": file})
-		if err != nil || !result.Success {
+		if err != nil {
 			continue
 		}
 		fmt.Fprintf(&fileContents, "=== %s ===\n%s\n\n", file, result.Output)
@@ -64,7 +64,7 @@ Fix each error. Use edit_file with old_str/new_str for targeted changes.`,
 			onEvent(fmt.Sprintf("[fix] attempt %d/%d", iter+1, f.maxIter))
 		}
 
-		resp, err := f.client.ChatSync(ctx, ollama.ChatRequest{
+		resp, err := f.client.ChatSync(ctx, &ollama.ChatRequest{
 			Model: f.model,
 			Messages: []ollama.Message{
 				{Role: "system", Content: "You are a Go expert. Fix errors using available tools. Be precise and minimal in changes."},
@@ -81,13 +81,10 @@ Fix each error. Use edit_file with old_str/new_str for targeted changes.`,
 		}
 
 		for _, tc := range resp.ToolCalls {
-			result, err := f.reg.Execute(ctx, tc.Function.Name, tc.Function.Arguments)
-			if err != nil {
-				continue
-			}
+			_, err := f.reg.Execute(ctx, tc.Function.Name, tc.Function.Arguments)
 			if onEvent != nil {
 				status := "✓"
-				if !result.Success {
+				if err != nil {
 					status = "✗"
 				}
 				onEvent(fmt.Sprintf("[fix] %s %s", tc.Function.Name, status))
@@ -98,9 +95,6 @@ Fix each error. Use edit_file with old_str/new_str for targeted changes.`,
 		result, err := f.reg.Execute(ctx, toolName, map[string]any{})
 		if err != nil {
 			return false, err
-		}
-		if result.Success {
-			return true, nil
 		}
 
 		// Update prompt with remaining errors

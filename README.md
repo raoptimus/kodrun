@@ -1,5 +1,9 @@
 # KodRun
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/raoptimus/kodrun.svg)](https://pkg.go.dev/github.com/raoptimus/kodrun/v2)
+[![Go Report Card](https://goreportcard.com/badge/github.com/raoptimus/kodrun)](https://goreportcard.com/report/github.com/raoptimus/kodrun)
+[![License](https://img.shields.io/github/license/raoptimus/kodrun)](https://https://github.com/raoptimus/kodrun/blob/main/LICENSE)
+
 > **Beta** — this project is under active development. APIs and configuration may change.
 
 CLI agent for writing and maintaining code in **Go, Python and JavaScript/TypeScript**. Runs fully locally via [Ollama](https://ollama.com) API. Loads rules, snippets and documentation from the project working directory, executes tools (file operations, build/test/lint, git) and automatically fixes errors through the LLM.
@@ -478,4 +482,5 @@ make help           # List all targets
 
 ## License
 
-MIT
+BSD 3-Clause License
+[LICENSE](LICENSE)

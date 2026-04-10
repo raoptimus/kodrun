@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -35,61 +36,77 @@ func (t *ListDirTool) Schema() ollama.JSONSchema {
 	}
 }
 
-func (t *ListDirTool) Execute(ctx context.Context, params map[string]any) (ToolResult, error) {
-	path, _ := params["path"].(string)
-	if path == "" {
+func (t *ListDirTool) Execute(ctx context.Context, params map[string]any) (*ToolResult, error) {
+	path, ok := params["path"].(string)
+	if !ok || path == "" {
 		path = "."
 	}
-	recursive, _ := params["recursive"].(string)
+	var recursive string
+	if v, ok2 := params["recursive"].(string); ok2 {
+		recursive = v
+	}
 
 	resolved, err := SafePath(ctx, t.workDir, path)
 	if err != nil {
-		return ToolResult{Error: err.Error(), Success: false}, nil
+		return nil, fmt.Errorf("resolve path: %w", err)
 	}
 
 	var entries []string
 	if recursive == "true" {
-		err = filepath.WalkDir(resolved, func(p string, d fs.DirEntry, err error) error {
-			if err != nil {
-				return nil
-			}
-			rel, _ := filepath.Rel(t.workDir, p)
-			if d.IsDir() {
-				if IsForbiddenDir(ctx, rel, t.forbidden) {
-					return filepath.SkipDir
-				}
-				entries = append(entries, rel+"/")
-			} else {
-				if !IsForbidden(ctx, rel, t.forbidden) {
-					entries = append(entries, rel)
-				}
-			}
-			return nil
-		})
+		entries, err = t.walkRecursive(ctx, resolved)
 	} else {
-		dirEntries, readErr := os.ReadDir(resolved)
-		if readErr != nil {
-			return ToolResult{Error: readErr.Error(), Success: false}, nil
-		}
-		for _, e := range dirEntries {
-			name := e.Name()
-			if e.IsDir() {
-				if IsForbiddenDir(ctx, name, t.forbidden) {
-					continue
-				}
-				name += "/"
-			} else {
-				if IsForbidden(ctx, name, t.forbidden) {
-					continue
-				}
-			}
-			entries = append(entries, name)
-		}
+		entries, err = t.listFlat(ctx, resolved)
 	}
-
 	if err != nil {
-		return ToolResult{Error: err.Error(), Success: false}, nil
+		return nil, err
 	}
 
-	return ToolResult{Output: strings.Join(entries, "\n"), Success: true}, nil
+	return &ToolResult{Output: strings.Join(entries, "\n")}, nil
+}
+
+func (t *ListDirTool) walkRecursive(ctx context.Context, root string) ([]string, error) {
+	var entries []string
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return filepath.SkipDir
+		}
+		rel, relErr := filepath.Rel(t.workDir, p)
+		if relErr != nil {
+			return filepath.SkipDir
+		}
+		switch {
+		case d.IsDir() && IsForbiddenDir(ctx, rel, t.forbidden):
+			return filepath.SkipDir
+		case d.IsDir():
+			entries = append(entries, rel+"/")
+		case !IsForbidden(ctx, rel, t.forbidden):
+			entries = append(entries, rel)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("walk dir: %w", err)
+	}
+	return entries, nil
+}
+
+func (t *ListDirTool) listFlat(ctx context.Context, resolved string) ([]string, error) {
+	dirEntries, err := os.ReadDir(resolved)
+	if err != nil {
+		return nil, fmt.Errorf("read dir: %w", err)
+	}
+	entries := make([]string, 0, len(dirEntries))
+	for _, e := range dirEntries {
+		name := e.Name()
+		switch {
+		case e.IsDir() && IsForbiddenDir(ctx, name, t.forbidden):
+			continue
+		case e.IsDir():
+			name += "/"
+		case IsForbidden(ctx, name, t.forbidden):
+			continue
+		}
+		entries = append(entries, name)
+	}
+	return entries, nil
 }

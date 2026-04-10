@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -19,23 +20,36 @@ import (
 )
 
 const (
-	maxVisibleItems = 5
-	maxLogLines     = 10000 // trim logs to prevent unbounded memory growth
+	maxVisibleItems    = 5
+	maxLogLines        = 10000 // trim logs to prevent unbounded memory growth
+	inputPrompt        = " > "
+	paddingConfirmNorm = 4
+	paddingConfirmSel  = 2
+	halfPageDivisor    = 2
+	scrollStep         = 3
+	menuPadding        = 2    // extra lines around menu options
+	layoutExtraLines   = 5    // fixed layout lines (gaps, toolbar, etc.)
+	logTrimDivisor     = 5    // trim 1/5 of logs when exceeding max
+	percentMultiplier  = 100  // for percentage calculations
+	diffPreviewLines   = 20   // max lines in diff preview
+	kilo               = 1000 // 1K tokens
+	kibi               = 1024 // 1Ki context units
+	paddingLeftDefault = 4    // default PaddingLeft for styles
 )
 
 var (
 	titleStyle         = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
-	agentStyle = lipgloss.NewStyle()
+	agentStyle         = lipgloss.NewStyle()
 	userStyle          = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("2"))
 	botStyle           = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("5"))
 	toolStyle          = lipgloss.NewStyle().Foreground(lipgloss.Color("4"))
 	toolBoldStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("4"))
 	fixStyle           = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
 	errorStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
-	confirmHeaderStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6"))
-	confirmNormal      = lipgloss.NewStyle().PaddingLeft(4)
-	confirmSelected    = lipgloss.NewStyle().PaddingLeft(2).Bold(true).Foreground(lipgloss.Color("2"))
-	confirmHintStyle   = lipgloss.NewStyle().PaddingLeft(4).Foreground(lipgloss.Color("8"))
+	confirmHeaderStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("4"))
+	confirmNormal      = lipgloss.NewStyle().PaddingLeft(paddingConfirmNorm)
+	confirmSelected    = lipgloss.NewStyle().PaddingLeft(paddingConfirmSel).Bold(true).Foreground(lipgloss.Color("2"))
+	confirmHintStyle   = lipgloss.NewStyle().PaddingLeft(paddingLeftDefault).Foreground(lipgloss.Color("8"))
 	augmentStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
 	tokenStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("5"))
 	systemStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
@@ -127,6 +141,30 @@ type PlanConfirmMsg struct {
 	Request PlanConfirmRequest
 }
 
+// stepConfirmOption describes one item in the step confirm menu.
+type stepConfirmOption struct {
+	labelKey string
+	shortcut string
+	action   agent.StepConfirmAction
+}
+
+var stepConfirmMenuOptions = []stepConfirmOption{
+	{labelKey: "step_confirm.allow", shortcut: "1", action: agent.StepAllow},
+	{labelKey: "step_confirm.skip", shortcut: "2", action: agent.StepSkip},
+	{labelKey: "step_confirm.deny", shortcut: "3", action: agent.StepDenyAll},
+}
+
+// StepConfirmRequest represents a pending step confirmation from the orchestrator.
+type StepConfirmRequest struct {
+	Description string
+	Result      chan agent.StepConfirmAction
+}
+
+// StepConfirmMsg wraps a StepConfirmRequest as a tea.Msg.
+type StepConfirmMsg struct {
+	Request StepConfirmRequest
+}
+
 // EventMsg wraps an agent event as a tea.Msg.
 type EventMsg struct {
 	Event agent.Event
@@ -144,20 +182,20 @@ const (
 
 // Model is the bubbletea model for the KodRun TUI.
 type Model struct {
-	viewport  viewport.Model
-	textinput textarea.Model
-	logs      []string
+	viewport    viewport.Model
+	textinput   textarea.Model
+	logs        []string
 	model       string
 	version     string
 	contextSize int
 	taskFn      TaskFunc
-	cancelFn  CancelFunc
-	events    chan agent.Event
-	ready     bool
-	width     int
-	height    int
-	running   bool
-	workDir   string
+	cancelFn    CancelFunc
+	events      chan agent.Event
+	ready       bool
+	width       int
+	height      int
+	running     bool
+	workDir     string
 
 	// RAG indexing progress (background). When ragProgressTotal > 0 the status
 	// bar shows a percentage indicator. Reset to zero on completion.
@@ -187,6 +225,11 @@ type Model struct {
 	pendingPlanConfirm *PlanConfirmRequest
 	planConfirmSt      confirmState
 	planConfirmIdx     int
+
+	// Step confirmation (per-step in DAG execution)
+	stepConfirmCh      chan StepConfirmRequest
+	pendingStepConfirm *StepConfirmRequest
+	stepConfirmIdx     int
 
 	// Group collapsing — legacy single active group (used by Analyze() in
 	// the planner path and any caller that doesn't set GroupID).
@@ -247,7 +290,7 @@ type Model struct {
 	mdRenderer *markdownRenderer
 }
 
-func (m Model) defaultPlaceholder() string {
+func (m *Model) defaultPlaceholder() string {
 	if m.mode == agent.ModePlan {
 		return m.locale.Get("placeholder.plan")
 	}
@@ -255,7 +298,7 @@ func (m Model) defaultPlaceholder() string {
 }
 
 // NewModel creates a new TUI model.
-func NewModel(modelName string, version string, contextSize int, taskFn TaskFunc, cancelFn CancelFunc, events chan agent.Event, commands []CommandItem, confirmCh chan ConfirmRequest, planConfirmCh chan PlanConfirmRequest, workDir string, mode agent.Mode, think bool, setModeFn SetModeFn, contextFn ContextFunc, lang string, maxHistory int) Model {
+func NewModel(modelName, version string, contextSize int, taskFn TaskFunc, cancelFn CancelFunc, events chan agent.Event, commands []CommandItem, confirmCh chan ConfirmRequest, planConfirmCh chan PlanConfirmRequest, stepConfirmCh chan StepConfirmRequest, workDir string, mode agent.Mode, think bool, setModeFn SetModeFn, contextFn ContextFunc, lang string, maxHistory int) Model {
 	locale := NewLocale(lang)
 	ti := textarea.New()
 	if mode == agent.ModePlan {
@@ -263,7 +306,7 @@ func NewModel(modelName string, version string, contextSize int, taskFn TaskFunc
 	} else {
 		ti.Placeholder = locale.Get("placeholder.edit")
 	}
-	ti.Prompt = " > "
+	ti.Prompt = inputPrompt
 	ti.ShowLineNumbers = false
 	ti.EndOfBufferCharacter = ' '
 	inputBg := lipgloss.Color("255")
@@ -275,7 +318,7 @@ func NewModel(modelName string, version string, contextSize int, taskFn TaskFunc
 	ti.BlurredStyle = ti.FocusedStyle
 	ti.SetPromptFunc(1, func(line int) string {
 		if line == 0 {
-			return " > "
+			return inputPrompt
 		}
 		return "   "
 	})
@@ -291,15 +334,16 @@ func NewModel(modelName string, version string, contextSize int, taskFn TaskFunc
 
 	m := Model{
 		textinput:     ti,
-		model:       modelName,
-		version:     version,
-		contextSize: contextSize,
-		taskFn:      taskFn,
+		model:         modelName,
+		version:       version,
+		contextSize:   contextSize,
+		taskFn:        taskFn,
 		cancelFn:      cancelFn,
 		events:        events,
 		commands:      commands,
 		confirmCh:     confirmCh,
 		planConfirmCh: planConfirmCh,
+		stepConfirmCh: stepConfirmCh,
 		workDir:       workDir,
 		historyIdx:    -1,
 		inputHistory:  history,
@@ -327,10 +371,13 @@ func (m Model) Init() tea.Cmd {
 	if m.planConfirmCh != nil {
 		cmds = append(cmds, m.waitForPlanConfirm())
 	}
+	if m.stepConfirmCh != nil {
+		cmds = append(cmds, m.waitForStepConfirm())
+	}
 	return tea.Batch(cmds...)
 }
 
-func (m Model) waitForEvent() tea.Cmd {
+func (m *Model) waitForEvent() tea.Cmd {
 	return func() tea.Msg {
 		event, ok := <-m.events
 		if !ok {
@@ -424,6 +471,36 @@ func (m *Model) executePlanConfirmOption(opt planConfirmOption) tea.Cmd {
 	return m.executePlanConfirmAction(opt.action)
 }
 
+func (m Model) waitForStepConfirm() tea.Cmd {
+	return func() tea.Msg {
+		req, ok := <-m.stepConfirmCh
+		if !ok {
+			return nil
+		}
+		return StepConfirmMsg{Request: req}
+	}
+}
+
+// executeStepConfirmAction sends the given step confirm action and resets state.
+func (m *Model) executeStepConfirmAction(action agent.StepConfirmAction) tea.Cmd {
+	m.pendingStepConfirm.Result <- action
+	if !m.pauseStart.IsZero() {
+		m.pausedDuration += time.Since(m.pauseStart)
+		m.pauseStart = time.Time{}
+	}
+	for _, opt := range stepConfirmMenuOptions {
+		if opt.action == action {
+			m.addLog(confirmHeaderStyle.Render(fmt.Sprintf("  → %s", m.locale.Get(opt.labelKey))))
+			break
+		}
+	}
+	m.pendingStepConfirm = nil
+	m.focus = focusInput
+	m.textinput.Focus()
+	m.recalcViewport()
+	return m.waitForStepConfirm()
+}
+
 func tickEvery() tea.Cmd {
 	return tea.Tick(time.Second, func(t time.Time) tea.Msg {
 		return tickMsg(t)
@@ -461,19 +538,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 					return m, nil
 				case tea.KeyEnter:
-					return m, m.executeConfirmOption(confirmMenuOptions[m.confirmIdx])
+					cmd := m.executeConfirmOption(confirmMenuOptions[m.confirmIdx])
+					return m, cmd
 				case tea.KeyEsc:
-					return m, m.executeConfirmAction(agent.ConfirmDeny)
+					cmd := m.executeConfirmAction(agent.ConfirmDeny)
+					return m, cmd
 				default:
 					switch msg.String() {
 					case "1":
-						return m, m.executeConfirmAction(agent.ConfirmAllowOnce)
+						cmd := m.executeConfirmAction(agent.ConfirmAllowOnce)
+						return m, cmd
 					case "2":
-						return m, m.executeConfirmAction(agent.ConfirmAllowSession)
+						cmd := m.executeConfirmAction(agent.ConfirmAllowSession)
+						return m, cmd
 					case "3":
-						return m, m.executeConfirmOption(confirmMenuOptions[2])
+						cmd := m.executeConfirmOption(confirmMenuOptions[2])
+						return m, cmd
 					case "4":
-						return m, m.executeConfirmAction(agent.ConfirmDeny)
+						cmd := m.executeConfirmAction(agent.ConfirmDeny)
+						return m, cmd
 					}
 				}
 				return m, nil
@@ -527,17 +610,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 					return m, nil
 				case tea.KeyEnter:
-					return m, m.executePlanConfirmOption(planConfirmMenuOptions[m.planConfirmIdx])
+					cmd := m.executePlanConfirmOption(planConfirmMenuOptions[m.planConfirmIdx])
+					return m, cmd
 				case tea.KeyEsc:
-					return m, m.executePlanConfirmAction(agent.PlanDeny)
+					cmd := m.executePlanConfirmAction(agent.PlanDeny)
+					return m, cmd
 				default:
 					switch msg.String() {
 					case "1":
-						return m, m.executePlanConfirmAction(agent.PlanAutoAccept)
+						cmd := m.executePlanConfirmAction(agent.PlanAutoAccept)
+						return m, cmd
 					case "2":
-						return m, m.executePlanConfirmAction(agent.PlanManualApprove)
+						cmd := m.executePlanConfirmAction(agent.PlanManualApprove)
+						return m, cmd
 					case "3":
-						return m, m.executePlanConfirmOption(planConfirmMenuOptions[2])
+						cmd := m.executePlanConfirmOption(planConfirmMenuOptions[2])
+						return m, cmd
 					}
 				}
 				return m, nil
@@ -566,6 +654,44 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					var cmd tea.Cmd
 					m.textinput, cmd = m.textinput.Update(msg)
 					m.resizeInput()
+					return m, cmd
+				}
+			}
+			return m, nil
+		}
+
+		// Handle step confirmation prompt (3-option: execute/skip/cancel)
+		if m.pendingStepConfirm != nil {
+			if msg.Type == tea.KeyCtrlC {
+				return m, tea.Quit
+			}
+			switch msg.Type {
+			case tea.KeyUp:
+				if m.stepConfirmIdx > 0 {
+					m.stepConfirmIdx--
+				}
+				return m, nil
+			case tea.KeyDown:
+				if m.stepConfirmIdx < len(stepConfirmMenuOptions)-1 {
+					m.stepConfirmIdx++
+				}
+				return m, nil
+			case tea.KeyEnter:
+				cmd := m.executeStepConfirmAction(stepConfirmMenuOptions[m.stepConfirmIdx].action)
+				return m, cmd
+			case tea.KeyEsc:
+				cmd := m.executeStepConfirmAction(agent.StepDenyAll)
+				return m, cmd
+			default:
+				switch msg.String() {
+				case "1":
+					cmd := m.executeStepConfirmAction(agent.StepAllow)
+					return m, cmd
+				case "2":
+					cmd := m.executeStepConfirmAction(agent.StepSkip)
+					return m, cmd
+				case "3":
+					cmd := m.executeStepConfirmAction(agent.StepDenyAll)
 					return m, cmd
 				}
 			}
@@ -706,7 +832,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				defer func() {
 					if r := recover(); r != nil {
 						select {
-						case m.events <- agent.Event{Type: agent.EventError, Message: fmt.Sprintf("task panic: %v", r)}:
+						case m.events <- agent.Event{Type: agent.EventError, Message: fmt.Sprintf("task panic: %v\n%s", r, debug.Stack())}:
 						default:
 						}
 						select {
@@ -743,19 +869,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case tea.KeyPgUp:
 			m.focus = focusViewport
-			m.viewport.ScrollUp(m.viewport.Height / 2)
+			m.viewport.ScrollUp(m.viewport.Height / halfPageDivisor)
 			return m, nil
 		case tea.KeyPgDown:
 			m.focus = focusViewport
-			m.viewport.ScrollDown(m.viewport.Height / 2)
+			m.viewport.ScrollDown(m.viewport.Height / halfPageDivisor)
 			return m, nil
 		case tea.KeyCtrlU:
 			m.focus = focusViewport
-			m.viewport.ScrollUp(m.viewport.Height / 2)
+			m.viewport.ScrollUp(m.viewport.Height / halfPageDivisor)
 			return m, nil
 		case tea.KeyCtrlD:
 			m.focus = focusViewport
-			m.viewport.ScrollDown(m.viewport.Height / 2)
+			m.viewport.ScrollDown(m.viewport.Height / halfPageDivisor)
 			return m, nil
 		case tea.KeyCtrlL:
 			m.logs = m.headerLines()
@@ -779,14 +905,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.focus = focusViewport
-			m.viewport.ScrollUp(3)
+			m.viewport.ScrollUp(scrollStep)
 			return m, nil
 		case tea.MouseButtonWheelDown:
 			if !m.mouseInViewport(msg.Y) {
 				return m, nil
 			}
 			m.focus = focusViewport
-			m.viewport.ScrollDown(3)
+			m.viewport.ScrollDown(scrollStep)
 			return m, nil
 		}
 
@@ -815,16 +941,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Transcript gets agent messages too.
 				m.addTranscriptLog(agentStyle.Render(e.Message))
 
-				if e.GroupID != "" && m.groups[e.GroupID] != nil {
+				switch {
+				case e.GroupID != "" && m.groups[e.GroupID] != nil:
 					m.appendToGroup(e.GroupID, agentStyle.Render(e.Message))
-				} else if m.groupActive {
+				case m.groupActive:
 					// Route intermediate agent text into the collapsed group.
 					m.groupLogs = append(m.groupLogs, agentStyle.Render(e.Message))
 					m.rebuildGroupView()
-				} else {
+				default:
 					prefix := botStyle.Render(m.locale.Get("avatar.agent")) + " "
 					prefixW := ansi.StringWidth(prefix)
-					avail := max(m.width-prefixW-2, 20)
+					avail := max(m.width-prefixW-paddingConfirmSel, diffPreviewLines) // diffPreviewLines reused as minAvailWidth
 
 					// Render markdown if the message contains markdown markers.
 					rendered := m.renderAgentMessage(e.Message, avail)
@@ -842,7 +969,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		case agent.EventTool:
-			toolLine := m.formatToolEvent(e)
+			toolLine := m.formatToolEvent(&e)
 
 			// Transcript always gets the full tool output.
 			m.addTranscriptLog(toolLine)
@@ -859,12 +986,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				break
 			}
 
-			if e.GroupID != "" && m.groups[e.GroupID] != nil {
+			switch {
+			case e.GroupID != "" && m.groups[e.GroupID] != nil:
 				m.appendToGroup(e.GroupID, toolLine)
-			} else if m.groupActive {
+			case m.groupActive:
 				m.groupLogs = append(m.groupLogs, toolLine)
 				m.rebuildGroupView()
-			} else {
+			default:
 				m.addLog(toolLine)
 				if e.FileAction != "" {
 					if e.LinesAdded > 0 || e.LinesRemoved > 0 {
@@ -980,7 +1108,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.planConfirmSt = confirmChoose
 		m.planConfirmIdx = 0
 		m.addLog("")
-		m.addLog(confirmHeaderStyle.Render(m.locale.Get("plan_confirm.header")))
+		m.addLog("")
+		m.recalcViewport()
+		return m, nil
+	case StepConfirmMsg:
+		m.pendingStepConfirm = &msg.Request
+		m.pauseStart = time.Now()
+		m.focus = focusInput
+		m.stepConfirmIdx = 0
+		m.addLog("")
+		m.addLog(confirmHeaderStyle.Render(m.locale.Get("step_confirm.header")))
+		// Show step description lines
+		for _, line := range strings.Split(strings.TrimSpace(msg.Request.Description), "\n") {
+			m.addLog("  " + line)
+		}
 		m.addLog("")
 		m.recalcViewport()
 		return m, nil
@@ -1044,23 +1185,26 @@ func (m *Model) updateComplete() {
 // Base layout: header(3) + \n + viewport + \n + completePopup + timeLine + \n + inputLine + \n + \n + toolbar(1)
 func (m *Model) viewportHeight() int {
 	var inputH int
-	if m.pendingPlanConfirm != nil && m.planConfirmSt == confirmChoose {
+	switch {
+	case m.pendingStepConfirm != nil:
+		inputH = len(stepConfirmMenuOptions) + menuPadding
+	case m.pendingPlanConfirm != nil && m.planConfirmSt == confirmChoose:
 		// 3 options + blank line + hint line
-		inputH = len(planConfirmMenuOptions) + 2
-	} else if m.pendingConfirm != nil && m.confirmSt == confirmChoose {
+		inputH = len(planConfirmMenuOptions) + menuPadding
+	case m.pendingConfirm != nil && m.confirmSt == confirmChoose:
 		// 4 options + blank line + hint line
-		inputH = len(confirmMenuOptions) + 2
-	} else {
-		inputH = max(1, m.textinput.Height()) + 2 // input + 2 padding lines
+		inputH = len(confirmMenuOptions) + menuPadding
+	default:
+		inputH = max(1, m.textinput.Height()) + menuPadding // input + 2 padding lines
 	}
 	// viewport + \n + \n + inputH + \n + \n + toolbar(1)
-	extra := 5 + inputH
+	extra := layoutExtraLines + inputH
 	if m.running {
-		extra += 2 // timeLine: blank line + status line
+		extra += menuPadding // timeLine: blank line + status line
 	}
 	if m.showComplete && len(m.filtered) > 0 {
 		visible := min(len(m.filtered), maxVisibleItems)
-		extra += visible + 2 // items + top/bottom borders
+		extra += visible + menuPadding // items + top/bottom borders
 	}
 	return max(1, m.height-extra)
 }
@@ -1089,7 +1233,7 @@ func (m *Model) recalcViewport() {
 }
 
 // formatToolEvent formats a tool event as a single log line.
-func (m Model) formatToolEvent(e agent.Event) string {
+func (m Model) formatToolEvent(e *agent.Event) string {
 	status := "✓"
 	if !e.Success {
 		status = "✗"
@@ -1109,7 +1253,6 @@ func (m Model) formatToolEvent(e agent.Event) string {
 	args := toolStyle.Render(fmt.Sprintf("(%s)", e.Message))
 	return fmt.Sprintf("%s %s%s", statusStr, displayName, args)
 }
-
 
 // groupState tracks one collapsible group in the multi-group pipeline.
 // Each instance occupies a contiguous range of m.logs starting at
@@ -1204,14 +1347,13 @@ func (m *Model) openGroup(id, title string) {
 }
 
 // appendToGroup routes a rendered line into an existing group.
-func (m *Model) appendToGroup(id, line string) bool {
+func (m *Model) appendToGroup(id, line string) {
 	g, ok := m.groups[id]
 	if !ok {
-		return false
+		return
 	}
 	g.logs = append(g.logs, line)
 	m.updateGroup(g)
-	return true
 }
 
 // closeGroup marks a group as finished. Its lines remain in m.logs.
@@ -1268,7 +1410,7 @@ func (m *Model) addLog(line string) {
 	stickBottom := !m.ready || m.viewport.AtBottom() || (m.running && m.focus == focusInput)
 	m.logs = append(m.logs, line)
 	if len(m.logs) > maxLogLines {
-		trim := maxLogLines / 5
+		trim := maxLogLines / logTrimDivisor
 		m.logs = append([]string(nil), m.logs[trim:]...)
 	}
 	if !m.transcriptMode {
@@ -1280,7 +1422,7 @@ func (m *Model) addTranscriptLog(line string) {
 	stickBottom := !m.ready || m.viewport.AtBottom() || (m.running && m.focus == focusInput)
 	m.transcriptLogs = append(m.transcriptLogs, line)
 	if len(m.transcriptLogs) > maxLogLines {
-		trim := maxLogLines / 5
+		trim := maxLogLines / logTrimDivisor
 		m.transcriptLogs = append([]string(nil), m.transcriptLogs[trim:]...)
 	}
 	if m.transcriptMode {
@@ -1402,11 +1544,14 @@ func (m Model) View() string {
 	toolbar := "  " + m.renderToolbar()
 
 	var inputLine string
-	if m.pendingPlanConfirm != nil && m.planConfirmSt == confirmChoose {
+	switch {
+	case m.pendingStepConfirm != nil:
+		inputLine = m.renderStepConfirmMenu()
+	case m.pendingPlanConfirm != nil && m.planConfirmSt == confirmChoose:
 		inputLine = m.renderPlanConfirmMenu()
-	} else if m.pendingConfirm != nil && m.confirmSt == confirmChoose {
+	case m.pendingConfirm != nil && m.confirmSt == confirmChoose:
 		inputLine = m.renderConfirmMenu()
-	} else {
+	default:
 		inputLine = m.renderInput()
 	}
 
@@ -1416,7 +1561,7 @@ func (m Model) View() string {
 		timeLine = "\n" + toolbarStyle.Render(fmt.Sprintf("  %s ⏱ %s · %s tk", m.locale.Get("status.working"), elapsed, formatTokens(m.totalEval))) + "\n"
 	}
 	if m.ragProgressTotal > 0 {
-		pct := m.ragProgressDone * 100 / m.ragProgressTotal
+		pct := m.ragProgressDone * percentMultiplier / m.ragProgressTotal
 		label := m.ragProgressLabel
 		if label == "" {
 			label = "indexing"
@@ -1495,7 +1640,7 @@ func (m Model) renderToolbar() string {
 
 	var pct int
 	if m.contextTotal > 0 {
-		pct = 100 - (m.contextUsed * 100 / m.contextTotal)
+		pct = percentMultiplier - (m.contextUsed * percentMultiplier / m.contextTotal)
 	}
 	parts = append(parts, fmt.Sprintf(m.locale.Get("label.context_left"), pct))
 
@@ -1508,7 +1653,7 @@ func (m Model) renderComplete() string {
 		visible = visible[:maxVisibleItems]
 	}
 
-	var lines []string
+	lines := make([]string, 0, len(visible))
 	for i, item := range visible {
 		name := fmt.Sprintf("/%s", item.Name)
 		line := fmt.Sprintf("  %-16s %s", name, item.Description)
@@ -1528,7 +1673,7 @@ func (m Model) renderComplete() string {
 // tool name, full arguments and (when available) a colored diff/preview.
 func (m Model) renderConfirmCard() string {
 	p := m.pendingConfirm.Payload
-	var lines []string
+	lines := make([]string, 0, len(p.ArgKeys)+paddingConfirmNorm)
 
 	if p.Danger {
 		lines = append(lines, errorStyle.Bold(true).Render("⚠ "+m.locale.Get("confirm.card.danger")))
@@ -1544,7 +1689,7 @@ func (m Model) renderConfirmCard() string {
 
 	if p.Preview != "" {
 		lines = append(lines, diffStatStyle.Render("  "+m.locale.Get("confirm.card.preview")))
-		lines = append(lines, renderDiffPreviewLines(p.Preview, 20, m.locale)...)
+		lines = append(lines, renderDiffPreviewLines(p.Preview, diffPreviewLines, m.locale)...)
 	}
 	lines = append(lines, "")
 	return strings.Join(lines, "\n")
@@ -1594,8 +1739,7 @@ func (m Model) renderConfirmMenu() string {
 			lines = append(lines, confirmNormal.Render(label))
 		}
 	}
-	lines = append(lines, "")
-	lines = append(lines, confirmHintStyle.Render(m.locale.Get("confirm.hint")))
+	lines = append(lines, "", confirmHintStyle.Render(m.locale.Get("confirm.hint")))
 	return strings.Join(lines, "\n")
 }
 
@@ -1610,8 +1754,21 @@ func (m Model) renderPlanConfirmMenu() string {
 			lines = append(lines, confirmNormal.Render(label))
 		}
 	}
-	lines = append(lines, "")
-	lines = append(lines, confirmHintStyle.Render(m.locale.Get("plan_confirm.hint")))
+	lines = append(lines, "", confirmHintStyle.Render(m.locale.Get("plan_confirm.hint")))
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) renderStepConfirmMenu() string {
+	var lines []string
+	for i, opt := range stepConfirmMenuOptions {
+		label := fmt.Sprintf("%d. %s", i+1, m.locale.Get(opt.labelKey))
+		if i == m.stepConfirmIdx {
+			lines = append(lines, confirmSelected.Render("> "+label))
+		} else {
+			lines = append(lines, confirmNormal.Render(label))
+		}
+	}
+	lines = append(lines, "", confirmHintStyle.Render(m.locale.Get("step_confirm.hint")))
 	return strings.Join(lines, "\n")
 }
 
@@ -1657,6 +1814,20 @@ func (m Model) renderSummary(s *agent.SessionStats, elapsed time.Duration) strin
 		fmt.Fprintf(&b, "\n  %s", strings.Join(perfParts, " · "))
 	}
 
+	// Timing breakdown (populated when iterations > 0).
+	if s.Iterations > 0 && s.TotalLLMTime > 0 {
+		total := s.TotalLLMTime + s.TotalToolTime
+		var llmPct, toolPct int
+		if total > 0 {
+			llmPct = int(s.TotalLLMTime * 100 / total)
+			toolPct = int(s.TotalToolTime * 100 / total)
+		}
+		fmt.Fprintf(&b, "\n  Perf: LLM %s (%d%%) · Tools %s (%d%%) · %d iter",
+			s.TotalLLMTime.Truncate(time.Millisecond), llmPct,
+			s.TotalToolTime.Truncate(time.Millisecond), toolPct,
+			s.Iterations)
+	}
+
 	return b.String()
 }
 
@@ -1682,18 +1853,18 @@ func shortPath(dir string) string {
 }
 
 func formatContextSize(n int) string {
-	if n >= 1024 && n%1024 == 0 {
-		return fmt.Sprintf("%dk", n/1024)
+	if n >= kibi && n%kibi == 0 {
+		return fmt.Sprintf("%dk", n/kibi)
 	}
-	if n >= 1000 {
-		return fmt.Sprintf("%.1fk", float64(n)/1024)
+	if n >= kilo {
+		return fmt.Sprintf("%.1fk", float64(n)/kibi)
 	}
 	return fmt.Sprintf("%d", n)
 }
 
 func formatTokens(n int) string {
-	if n < 1000 {
+	if n < kilo {
 		return fmt.Sprintf("%d", n)
 	}
-	return fmt.Sprintf("%.1fK", float64(n)/1000)
+	return fmt.Sprintf("%.1fK", float64(n)/kilo)
 }

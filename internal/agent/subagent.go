@@ -21,9 +21,9 @@ import (
 // The returned error is non-nil only on a hard failure of the chat loop;
 // REPLAN responses from the sub-agent are surfaced via EventReplan and
 // reported as a normal completion to the DAG runner.
-func (o *Orchestrator) runStep(ctx context.Context, step Step, confirmFn ConfirmFunc) (SessionStats, error) {
-	ag := o.newAgent(RoleStepExecutor, o.maxExecIter)
-	prompt := systemPromptForRole(RoleStepExecutor, o.language, o.ruleCatalog, ag.reg.Names(), o.hasSnippets, o.hasRAG)
+func (o *Orchestrator) runStep(ctx context.Context, step *Step, confirmFn ConfirmFunc) (SessionStats, error) {
+	ag := o.newAgent(RoleExecutor, o.maxExecIter)
+	prompt := systemPromptForRole(RoleExecutor, o.language, o.ruleCatalog, ag.reg.Names(), o.hasSnippets, o.hasRAG)
 	ag.InitWithPrompt(prompt)
 	ag.SetConfirmFunc(confirmFn)
 
@@ -81,7 +81,7 @@ func (o *Orchestrator) runStep(ctx context.Context, step Step, confirmFn Confirm
 	// Surface REPLAN if the sub-agent asked for one.
 	last := ag.LastAssistantMessage()
 	if strings.Contains(last, "REPLAN:") {
-		o.emit(Event{Type: EventReplan, Message: extractReplanReason(last)})
+		o.emit(&Event{Type: EventReplan, Message: extractReplanReason(last)})
 		return stats, nil
 	}
 
@@ -90,7 +90,7 @@ func (o *Orchestrator) runStep(ctx context.Context, step Step, confirmFn Confirm
 	// Surface it loudly so the orchestrator/CI does not treat the step as
 	// successful when nothing actually happened on disk.
 	if stats.ToolCalls == 0 {
-		o.emit(Event{Type: EventError, Message: fmt.Sprintf("Step %d (%s) finished with zero tool calls — model returned text instead of applying changes. Treating as failed.", step.ID, step.Title)})
+		o.emit(&Event{Type: EventError, Message: fmt.Sprintf("Step %d (%s) finished with zero tool calls — model returned text instead of applying changes. Treating as failed.", step.ID, step.Title)})
 		return stats, errors.Errorf("step %d: no tool calls executed", step.ID)
 	}
 
@@ -100,7 +100,7 @@ func (o *Orchestrator) runStep(ctx context.Context, step Step, confirmFn Confirm
 // perStepRAG builds a compact per-step RAG payload combining declared rule
 // names and a focused search on the step title + rationale. Returns "" when
 // nothing relevant is available.
-func (o *Orchestrator) perStepRAG(ctx context.Context, step Step) string {
+func (o *Orchestrator) perStepRAG(ctx context.Context, step *Step) string {
 	var parts []string
 
 	if o.rulesLoader != nil {
@@ -111,10 +111,10 @@ func (o *Orchestrator) perStepRAG(ctx context.Context, step Step) string {
 		}
 	}
 
-	if o.ragIndex != nil {
+	if o.hasRAG && o.ragIndex != nil {
 		query := strings.TrimSpace(step.Title + " " + step.Rationale)
 		if query != "" {
-			results, err := o.ragIndex.Search(ctx, query, 3)
+			results, err := o.ragIndex.Search(ctx, query, perStepRAGTopK)
 			if err == nil && len(results) > 0 {
 				parts = append(parts, formatRAGResults(results))
 			}

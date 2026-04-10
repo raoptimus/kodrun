@@ -127,9 +127,6 @@ func TestToolAdapter_Execute(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
-	if !result.Success {
-		t.Error("expected success")
-	}
 	if result.Output != "Issue #1: Bug fix" {
 		t.Errorf("output: got %q", result.Output)
 	}
@@ -161,15 +158,12 @@ func TestToolAdapter_Execute_MCPError(t *testing.T) {
 		InputSchema: map[string]any{"type": "object"},
 	})
 
-	result, err := adapter.Execute(context.Background(), map[string]any{"number": json.Number("999")})
-	if err != nil {
-		t.Fatalf("Execute: %v", err)
-	}
-	if result.Success {
+	_, err := adapter.Execute(context.Background(), map[string]any{"number": json.Number("999")})
+	if err == nil {
 		t.Error("expected failure")
 	}
-	if result.Error != "not found" {
-		t.Errorf("error: got %q", result.Error)
+	if err.Error() != "not found" {
+		t.Errorf("error: got %q", err.Error())
 	}
 }
 

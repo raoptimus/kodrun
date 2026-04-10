@@ -24,8 +24,8 @@ func TestResultCache_HitMiss(t *testing.T) {
 
 	// First call: miss + store.
 	r1, err := reg.Execute(ctx, "read_file", map[string]any{"path": "a.txt"})
-	if err != nil || !r1.Success {
-		t.Fatalf("first call failed: %v %+v", err, r1)
+	if err != nil {
+		t.Fatalf("first call failed: %v", err)
 	}
 	if got := reg.Cache().Misses(); got != 1 {
 		t.Fatalf("misses=%d, want 1", got)
@@ -110,8 +110,8 @@ func TestResultCache_FailureNotCached(t *testing.T) {
 	reg.Register(NewReadFileTool(dir, nil, 100))
 
 	ctx := context.Background()
-	r, _ := reg.Execute(ctx, "read_file", map[string]any{"path": "missing.txt"})
-	if r.Success {
+	_, err := reg.Execute(ctx, "read_file", map[string]any{"path": "missing.txt"})
+	if err == nil {
 		t.Fatal("expected failure for missing file")
 	}
 	if reg.Cache().Stores() != 0 {

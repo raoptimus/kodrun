@@ -11,6 +11,7 @@ import (
 // RegisterCoreTools registers language-neutral tools: file ops, grep/find,
 // git, and bash. These are always available regardless of project language.
 func RegisterCoreTools(reg *Registry, workDir string, forbidden []string, maxReadLines int, langState *projectlang.State) {
+	reg.Register(NewFileStatTool(workDir, forbidden))
 	reg.Register(NewReadFileTool(workDir, forbidden, maxReadLines))
 	reg.Register(NewWriteFileTool(workDir, forbidden))
 	reg.Register(NewEditFileTool(workDir, forbidden))

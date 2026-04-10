@@ -41,24 +41,24 @@ func (t *ReadFileTool) Schema() ollama.JSONSchema {
 	}
 }
 
-func (t *ReadFileTool) Execute(ctx context.Context, params map[string]any) (ToolResult, error) {
-	path, _ := params["path"].(string)
+func (t *ReadFileTool) Execute(ctx context.Context, params map[string]any) (*ToolResult, error) {
+	path := stringParam(params, "path")
 	if path == "" {
-		return ToolResult{Error: "path is required", Success: false}, nil
+		return nil, &ToolError{Msg: "path is required"}
 	}
 
 	resolved, err := SafePath(ctx, t.workDir, path)
 	if err != nil {
-		return ToolResult{Error: err.Error(), Success: false}, nil
+		return nil, fmt.Errorf("resolve path: %w", err)
 	}
 
 	if IsForbidden(ctx, path, t.forbiddenPatterns) || IsForbidden(ctx, resolved, t.forbiddenPatterns) {
-		return ToolResult{Error: fmt.Sprintf("access to %s is forbidden", path), Success: false}, nil
+		return nil, &ToolError{Msg: fmt.Sprintf("access to %s is forbidden", path)}
 	}
 
 	data, err := os.ReadFile(resolved)
 	if err != nil {
-		return ToolResult{Error: err.Error(), Success: false}, nil
+		return nil, fmt.Errorf("read file: %w", err)
 	}
 
 	lines := strings.Split(string(data), "\n")
@@ -71,10 +71,7 @@ func (t *ReadFileTool) Execute(ctx context.Context, params map[string]any) (Tool
 		offset = 0
 	}
 	if offset >= totalLines {
-		return ToolResult{
-			Error:   fmt.Sprintf("offset %d beyond file end (%d lines)", offset, totalLines),
-			Success: false,
-		}, nil
+		return nil, &ToolError{Msg: fmt.Sprintf("offset %d beyond file end (%d lines)", offset, totalLines)}
 	}
 
 	end := offset + limit
@@ -101,9 +98,8 @@ func (t *ReadFileTool) Execute(ctx context.Context, params map[string]any) (Tool
 		)
 	}
 
-	return ToolResult{
-		Output:  output,
-		Success: true,
+	return &ToolResult{
+		Output: output,
 		Meta: map[string]any{
 			"total_lines": totalLines,
 			"offset":      offset,
@@ -125,7 +121,7 @@ func (t *ReadFileTool) CachePolicy() CachePolicy {
 
 // ResolvePaths returns the absolute filesystem path the call depends on.
 func (t *ReadFileTool) ResolvePaths(params map[string]any) []string {
-	path, _ := params["path"].(string)
+	path := stringParam(params, "path")
 	if path == "" {
 		return nil
 	}

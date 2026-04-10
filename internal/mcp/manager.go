@@ -50,7 +50,7 @@ func (m *Manager) Start(ctx context.Context, servers map[string]ServerConfig, wo
 			continue
 		}
 
-		transport, err := NewStdioTransport(cfg.Command, cfg.Args, cfg.Env, workDir)
+		transport, err := NewStdioTransport(ctx, cfg.Command, cfg.Args, cfg.Env, workDir)
 		if err != nil {
 			errs = append(errs, fmt.Sprintf("%s: %s", name, err))
 			continue
@@ -148,4 +148,3 @@ func (m *Manager) Close() error {
 	})
 	return m.closeErr
 }
-

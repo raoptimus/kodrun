@@ -7,7 +7,10 @@ import (
 	"unicode"
 )
 
-const minFilenameTagHits = 2
+const (
+	minFilenameTagHits = 2
+	minTokenLen        = 2 // minimum length for a token to be considered meaningful
+)
 
 type matchScore struct {
 	index int
@@ -279,7 +282,7 @@ func filenameTokens(path string) []string {
 	for _, part := range parts {
 		for _, token := range splitCamel(part) {
 			token = strings.ToLower(token)
-			if len(token) < 2 {
+			if len(token) < minTokenLen {
 				continue
 			}
 			if _, ok := seen[token]; ok {
@@ -363,7 +366,7 @@ func tokenizeForSearch(nameLower, descLower string, tags []string) []string {
 	for _, part := range parts {
 		for _, word := range splitCamel(part) {
 			word = strings.ToLower(word)
-			if len(word) < 2 {
+			if len(word) < minTokenLen {
 				continue
 			}
 			if _, ok := seen[word]; ok {
@@ -380,7 +383,7 @@ func tokenizeQuery(queryLower string) []string {
 	parts := strings.FieldsFunc(queryLower, isTokenSeparator)
 	var tokens []string
 	for _, part := range parts {
-		if len(part) >= 2 {
+		if len(part) >= minTokenLen {
 			tokens = append(tokens, part)
 		}
 	}
@@ -402,7 +405,10 @@ func matchesAnyCompiledGlob(globs []compiledGlob, path string, pathParts []strin
 
 func matchCompiledGlob(g *compiledGlob, path string, pathParts []string) bool {
 	if g.simple {
-		matched, _ := filepath.Match(g.raw, path)
+		matched, err := filepath.Match(g.raw, path)
+		if err != nil {
+			return false
+		}
 		return matched
 	}
 	if len(g.segParts) == 0 {
@@ -426,8 +432,8 @@ func matchSegments(pathParts []string, segParts [][]string, pi, si int) bool {
 
 func matchSequence(pathParts, segParts []string, offset int) bool {
 	for i, part := range segParts {
-		matched, _ := filepath.Match(part, pathParts[offset+i])
-		if !matched {
+		matched, err := filepath.Match(part, pathParts[offset+i])
+		if err != nil || !matched {
 			return false
 		}
 	}

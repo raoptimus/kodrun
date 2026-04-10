@@ -14,9 +14,9 @@ func TestWorkerPool_Execute_Parallel(t *testing.T) {
 	pool := NewWorkerPool(4)
 	tasks := make([]TaskFunc, 4)
 	for i := range tasks {
-		tasks[i] = func(ctx context.Context) (tools.ToolResult, error) {
+		tasks[i] = func(ctx context.Context) (*tools.ToolResult, error) {
 			time.Sleep(50 * time.Millisecond)
-			return tools.ToolResult{Output: "ok", Success: true}, nil
+			return &tools.ToolResult{Output: "ok"}, nil
 		}
 	}
 
@@ -34,9 +34,6 @@ func TestWorkerPool_Execute_Parallel(t *testing.T) {
 		if r.Err != nil {
 			t.Errorf("task %d: unexpected error: %v", i, r.Err)
 		}
-		if !r.Result.Success {
-			t.Errorf("task %d: expected success", i)
-		}
 	}
 }
 
@@ -45,8 +42,8 @@ func TestWorkerPool_Execute_PreservesOrder(t *testing.T) {
 	tasks := make([]TaskFunc, 8)
 	for i := range tasks {
 		val := fmt.Sprintf("result-%d", i)
-		tasks[i] = func(ctx context.Context) (tools.ToolResult, error) {
-			return tools.ToolResult{Output: val, Success: true}, nil
+		tasks[i] = func(ctx context.Context) (*tools.ToolResult, error) {
+			return &tools.ToolResult{Output: val}, nil
 		}
 	}
 
@@ -69,7 +66,7 @@ func TestWorkerPool_Execute_Sequential(t *testing.T) {
 
 	tasks := make([]TaskFunc, 4)
 	for i := range tasks {
-		tasks[i] = func(ctx context.Context) (tools.ToolResult, error) {
+		tasks[i] = func(ctx context.Context) (*tools.ToolResult, error) {
 			c := current.Add(1)
 			for {
 				old := maxConcurrent.Load()
@@ -79,7 +76,7 @@ func TestWorkerPool_Execute_Sequential(t *testing.T) {
 			}
 			time.Sleep(10 * time.Millisecond)
 			current.Add(-1)
-			return tools.ToolResult{Output: "ok", Success: true}, nil
+			return &tools.ToolResult{Output: "ok"}, nil
 		}
 	}
 
@@ -101,14 +98,14 @@ func TestWorkerPool_Execute_ContextCancel(t *testing.T) {
 	// First two tasks will acquire the semaphore and block long enough
 	// for the context to expire before tasks 2-3 can start.
 	for i := range 2 {
-		tasks[i] = func(ctx context.Context) (tools.ToolResult, error) {
+		tasks[i] = func(ctx context.Context) (*tools.ToolResult, error) {
 			time.Sleep(100 * time.Millisecond)
-			return tools.ToolResult{Output: "slow", Success: true}, nil
+			return &tools.ToolResult{Output: "slow"}, nil
 		}
 	}
 	for i := 2; i < 4; i++ {
-		tasks[i] = func(ctx context.Context) (tools.ToolResult, error) {
-			return tools.ToolResult{Output: "should-not-run", Success: true}, nil
+		tasks[i] = func(ctx context.Context) (*tools.ToolResult, error) {
+			return &tools.ToolResult{Output: "should-not-run"}, nil
 		}
 	}
 
@@ -128,14 +125,14 @@ func TestWorkerPool_Execute_ContextCancel(t *testing.T) {
 func TestWorkerPool_Execute_Error(t *testing.T) {
 	pool := NewWorkerPool(4)
 	tasks := []TaskFunc{
-		func(ctx context.Context) (tools.ToolResult, error) {
-			return tools.ToolResult{Output: "ok", Success: true}, nil
+		func(ctx context.Context) (*tools.ToolResult, error) {
+			return &tools.ToolResult{Output: "ok"}, nil
 		},
-		func(ctx context.Context) (tools.ToolResult, error) {
-			return tools.ToolResult{}, fmt.Errorf("task failed")
+		func(ctx context.Context) (*tools.ToolResult, error) {
+			return nil, fmt.Errorf("task failed")
 		},
-		func(ctx context.Context) (tools.ToolResult, error) {
-			return tools.ToolResult{Output: "ok", Success: true}, nil
+		func(ctx context.Context) (*tools.ToolResult, error) {
+			return &tools.ToolResult{Output: "ok"}, nil
 		},
 	}
 

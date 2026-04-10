@@ -23,8 +23,6 @@ var (
 	reTest = regexp.MustCompile(`^\s*(.+_test\.go):(\d+):\s*(.+)$`)
 	// golangci-lint: path/file.go:12:1: message (linter)
 	reLint = regexp.MustCompile(`^(.+\.go):(\d+):(\d+):\s*(.+)$`)
-	// test FAIL line
-	reTestFail = regexp.MustCompile(`^---\s*FAIL:\s*(\w+)\s*\(`)
 )
 
 // ParseErrors extracts structured errors from command output.
@@ -42,17 +40,17 @@ func ParseErrors(_ context.Context, output string) []ParsedError {
 
 		if m := reBuild.FindStringSubmatch(line); m != nil {
 			pe.File = m[1]
-			pe.Line, _ = strconv.Atoi(m[2])
-			pe.Col, _ = strconv.Atoi(m[3])
+			pe.Line = atoiOr0(m[2])
+			pe.Col = atoiOr0(m[3])
 			pe.Message = m[4]
 		} else if m := reLint.FindStringSubmatch(line); m != nil {
 			pe.File = m[1]
-			pe.Line, _ = strconv.Atoi(m[2])
-			pe.Col, _ = strconv.Atoi(m[3])
+			pe.Line = atoiOr0(m[2])
+			pe.Col = atoiOr0(m[3])
 			pe.Message = m[4]
 		} else if m := reTest.FindStringSubmatch(line); m != nil {
 			pe.File = m[1]
-			pe.Line, _ = strconv.Atoi(m[2])
+			pe.Line = atoiOr0(m[2])
 			pe.Message = m[3]
 		} else {
 			continue
@@ -96,4 +94,13 @@ func AffectedFiles(_ context.Context, errors []ParsedError) []string {
 		}
 	}
 	return files
+}
+
+// atoiOr0 parses s as int, returning 0 on failure.
+func atoiOr0(s string) int {
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0
+	}
+	return n
 }

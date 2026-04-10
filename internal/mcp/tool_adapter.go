@@ -36,28 +36,20 @@ func (a *ToolAdapter) Description() string       { return a.description }
 func (a *ToolAdapter) Schema() ollama.JSONSchema { return a.schema }
 
 // Execute calls the MCP tool and converts the result to ToolResult.
-func (a *ToolAdapter) Execute(ctx context.Context, params map[string]any) (tools.ToolResult, error) {
+func (a *ToolAdapter) Execute(ctx context.Context, params map[string]any) (*tools.ToolResult, error) {
 	result, err := a.client.CallTool(ctx, a.mcpName, params)
 	if err != nil {
-		return tools.ToolResult{
-			Error:   err.Error(),
-			Success: false,
-		}, nil
+		return nil, fmt.Errorf("mcp call %s: %w", a.mcpName, err)
 	}
 
 	output := formatContent(result.Content)
 
 	if result.IsError {
-		return tools.ToolResult{
-			Output:  output,
-			Error:   output,
-			Success: false,
-		}, nil
+		return nil, &tools.ToolError{Msg: output}
 	}
 
-	return tools.ToolResult{
-		Output:  output,
-		Success: true,
+	return &tools.ToolResult{
+		Output: output,
 	}, nil
 }
 

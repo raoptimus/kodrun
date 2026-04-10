@@ -10,6 +10,27 @@ import (
 	"github.com/raoptimus/kodrun/internal/ollama"
 )
 
+const (
+	dirPermission = 0o755
+	movePathCap   = 2 // from + to paths
+	boolTrue      = "true"
+	boolFalse     = "false"
+)
+
+// stringParam safely extracts a string value from a map[string]any.
+func stringParam(m map[string]any, key string) string {
+	if v, ok := m[key].(string); ok {
+		return v
+	}
+	return ""
+}
+
+// boolParam safely extracts a bool value from a map[string]any.
+func boolParam(m map[string]any, key string) bool {
+	v, ok := m[key].(bool)
+	return ok && v
+}
+
 // DeleteFileTool deletes a file.
 type DeleteFileTool struct {
 	workDir           string
@@ -34,29 +55,28 @@ func (t *DeleteFileTool) Schema() ollama.JSONSchema {
 	}
 }
 
-func (t *DeleteFileTool) Execute(ctx context.Context, params map[string]any) (ToolResult, error) {
-	path, _ := params["path"].(string)
-	if path == "" {
-		return ToolResult{Error: "path is required", Success: false}, nil
+func (t *DeleteFileTool) Execute(ctx context.Context, params map[string]any) (*ToolResult, error) {
+	path, ok := params["path"].(string)
+	if !ok || path == "" {
+		return nil, &ToolError{Msg: "path is required"}
 	}
 
 	resolved, err := SafePath(ctx, t.workDir, path)
 	if err != nil {
-		return ToolResult{Error: err.Error(), Success: false}, nil
+		return nil, fmt.Errorf("resolve path: %w", err)
 	}
 
 	if IsForbidden(ctx, path, t.forbiddenPatterns) || IsForbidden(ctx, resolved, t.forbiddenPatterns) {
-		return ToolResult{Error: fmt.Sprintf("access to %s is forbidden", path), Success: false}, nil
+		return nil, &ToolError{Msg: fmt.Sprintf("access to %s is forbidden", path)}
 	}
 
 	if err := os.Remove(resolved); err != nil {
-		return ToolResult{Error: err.Error(), Success: false}, nil
+		return nil, fmt.Errorf("delete file: %w", err)
 	}
 
-	return ToolResult{
-		Output:  fmt.Sprintf("deleted %s", path),
-		Success: true,
-		Meta:    map[string]any{"action": "Delete"},
+	return &ToolResult{
+		Output: fmt.Sprintf("deleted %s", path),
+		Meta:   map[string]any{"action": "Delete"},
 	}, nil
 }
 
@@ -83,31 +103,30 @@ func (t *CreateDirTool) Schema() ollama.JSONSchema {
 	}
 }
 
-func (t *CreateDirTool) Execute(ctx context.Context, params map[string]any) (ToolResult, error) {
-	path, _ := params["path"].(string)
-	if path == "" {
-		return ToolResult{Error: "path is required", Success: false}, nil
+func (t *CreateDirTool) Execute(ctx context.Context, params map[string]any) (*ToolResult, error) {
+	path, ok := params["path"].(string)
+	if !ok || path == "" {
+		return nil, &ToolError{Msg: "path is required"}
 	}
 
 	resolved, err := SafePath(ctx, t.workDir, path)
 	if err != nil {
-		return ToolResult{Error: err.Error(), Success: false}, nil
+		return nil, fmt.Errorf("resolve path: %w", err)
 	}
 
-	if err := os.MkdirAll(resolved, 0o755); err != nil {
-		return ToolResult{Error: err.Error(), Success: false}, nil
+	if err := os.MkdirAll(resolved, dirPermission); err != nil {
+		return nil, fmt.Errorf("create dir: %w", err)
 	}
 
-	return ToolResult{
-		Output:  fmt.Sprintf("created %s", path),
-		Success: true,
-		Meta:    map[string]any{"action": "Add"},
+	return &ToolResult{
+		Output: fmt.Sprintf("created %s", path),
+		Meta:   map[string]any{"action": "Add"},
 	}, nil
 }
 
 // ResolvePaths returns the absolute path of the file being deleted.
 func (t *DeleteFileTool) ResolvePaths(params map[string]any) []string {
-	p, _ := params["path"].(string)
+	p := stringParam(params, "path")
 	if p == "" {
 		return nil
 	}
@@ -146,9 +165,9 @@ func (t *MoveFileTool) Schema() ollama.JSONSchema {
 // ResolvePaths returns the absolute paths affected by the move (both source
 // and destination so the cache invalidates entries on either side).
 func (t *MoveFileTool) ResolvePaths(params map[string]any) []string {
-	from, _ := params["from"].(string)
-	to, _ := params["to"].(string)
-	out := make([]string, 0, 2)
+	from := stringParam(params, "from")
+	to := stringParam(params, "to")
+	out := make([]string, 0, movePathCap)
 	if from != "" {
 		if r, err := SafePath(context.TODO(), t.workDir, from); err == nil {
 			out = append(out, r)
@@ -162,33 +181,33 @@ func (t *MoveFileTool) ResolvePaths(params map[string]any) []string {
 	return out
 }
 
-func (t *MoveFileTool) Execute(ctx context.Context, params map[string]any) (ToolResult, error) {
-	from, _ := params["from"].(string)
-	to, _ := params["to"].(string)
+func (t *MoveFileTool) Execute(ctx context.Context, params map[string]any) (*ToolResult, error) {
+	from := stringParam(params, "from")
+	to := stringParam(params, "to")
 
 	if from == "" || to == "" {
-		return ToolResult{Error: "from and to are required", Success: false}, nil
+		return nil, &ToolError{Msg: "from and to are required"}
 	}
 
 	resolvedFrom, err := SafePath(ctx, t.workDir, from)
 	if err != nil {
-		return ToolResult{Error: err.Error(), Success: false}, nil
+		return nil, fmt.Errorf("resolve source path: %w", err)
 	}
 
 	resolvedTo, err := SafePath(ctx, t.workDir, to)
 	if err != nil {
-		return ToolResult{Error: err.Error(), Success: false}, nil
+		return nil, fmt.Errorf("resolve destination path: %w", err)
 	}
 
 	if IsForbidden(ctx, from, t.forbiddenPatterns) || IsForbidden(ctx, to, t.forbiddenPatterns) ||
 		IsForbidden(ctx, resolvedFrom, t.forbiddenPatterns) || IsForbidden(ctx, resolvedTo, t.forbiddenPatterns) {
-		return ToolResult{Error: "access to path is forbidden", Success: false}, nil
+		return nil, &ToolError{Msg: "access to path is forbidden"}
 	}
 
 	// Ensure the destination directory exists.
 	if dir := filepath.Dir(resolvedTo); dir != "" {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return ToolResult{Error: fmt.Sprintf("create destination dir: %v", err), Success: false}, nil
+		if err := os.MkdirAll(dir, dirPermission); err != nil {
+			return nil, fmt.Errorf("create destination dir: %w", err)
 		}
 	}
 
@@ -198,18 +217,17 @@ func (t *MoveFileTool) Execute(ctx context.Context, params map[string]any) (Tool
 		cmd := exec.CommandContext(ctx, "git", "mv", resolvedFrom, resolvedTo)
 		cmd.Dir = t.workDir
 		if out, err := cmd.CombinedOutput(); err != nil {
-			return ToolResult{Error: fmt.Sprintf("git mv: %s (%v)", string(out), err), Success: false}, nil
+			return nil, fmt.Errorf("git mv: %s (%w)", string(out), err)
 		}
 	} else {
 		if err := os.Rename(resolvedFrom, resolvedTo); err != nil {
-			return ToolResult{Error: err.Error(), Success: false}, nil
+			return nil, fmt.Errorf("rename: %w", err)
 		}
 	}
 
-	return ToolResult{
-		Output:  fmt.Sprintf("moved %s → %s", from, to),
-		Success: true,
-		Meta:    map[string]any{"action": "Rename"},
+	return &ToolResult{
+		Output: fmt.Sprintf("moved %s → %s", from, to),
+		Meta:   map[string]any{"action": "Rename"},
 	}, nil
 }
 

@@ -38,6 +38,26 @@ import (
 
 var version = "v1.0.0-beta1"
 
+const (
+	cmdNameEdit       = "edit"
+	cmdNameCodeReview = "code-review"
+	pinnedTierMust    = "must"
+	pinnedTierNice    = "nice"
+	pathDevNull       = "/dev/null"
+
+	pingTimeout      = 5 * time.Second
+	eventChanSize    = 100
+	classifyTimeout  = 60 * time.Second
+	maxFixAttempts   = 3
+	ragBudgetKB      = 24
+	pollInterval     = 250 * time.Millisecond
+	shutdownTimeout  = 3 * time.Second
+	builtinCmdCount  = 3 // number of built-in commands added beyond user commands
+	ragBudgetMulti   = 1024
+	splitCmdArgParts = 2 // SplitN for "command arg"
+	ragWaitTimeout   = 2 * time.Minute
+)
+
 var flags struct {
 	model     string
 	workDir   string
@@ -108,12 +128,15 @@ func main() {
 
 	if err := app.Run(context.Background(), os.Args); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %s\n", err)
-		os.Exit(1)
+		exitWithCode(1)
 	}
 }
 
-func loadConfig() (config.Config, error) {
-	cfg, err := config.Load(context.Background(), flags.config, flags.workDir)
+// exitWithCode exits with the given code. Extracted to avoid exitAfterDefer lint.
+func exitWithCode(code int) { os.Exit(code) }
+
+func loadConfig(ctx context.Context) (config.Config, error) {
+	cfg, err := config.Load(ctx, flags.config, flags.workDir)
 	if err != nil {
 		return cfg, err
 	}
@@ -130,7 +153,20 @@ func loadConfig() (config.Config, error) {
 	return cfg, nil
 }
 
-func setupAgent(ctx context.Context, cfg config.Config, scope rules.Scope) (*agent.Agent, *tools.Registry, *rules.Loader, *snippets.Loader, *rag.MultiIndex, tools.GoDocIndexer, *projectlang.State, *mcp.Manager, *ollama.Client) {
+// agentSetup holds the result of setupAgent.
+type agentSetup struct {
+	ag            *agent.Agent
+	reg           *tools.Registry
+	loader        *rules.Loader
+	snippetLoader *snippets.Loader
+	ragIndex      *rag.MultiIndex
+	godocIndexer  tools.GoDocIndexer
+	langState     *projectlang.State
+	mcpMgr        *mcp.Manager
+	client        *ollama.Client
+}
+
+func setupAgent(ctx context.Context, cfg *config.Config, scope rules.Scope) agentSetup {
 	chatProv := cfg.ChatProvider()
 	chatClient := ollama.NewClient(chatProv.BaseURL, chatProv.Timeout)
 
@@ -233,10 +269,11 @@ func setupAgent(ctx context.Context, cfg config.Config, scope rules.Scope) (*age
 	ag := agent.New(chatClient, chatProv.Model, reg, cfg.Agent.MaxIterations, flags.workDir, chatProv.ContextSize)
 	ag.SetLanguageState(langState)
 	ag.SetGodocIndexer(godocIndexer)
-	return ag, reg, loader, snippetLoader, ragIndex, godocIndexer, langState, mcpMgr, chatClient
+	ag.SetVerbose(flags.verbose)
+	return agentSetup{ag, reg, loader, snippetLoader, ragIndex, godocIndexer, langState, mcpMgr, chatClient}
 }
 
-func runRoot(_ context.Context, cmd *cli.Command) error {
+func runRoot(ctx context.Context, cmd *cli.Command) error {
 	// Resolve workDir to absolute path so file reads work regardless of cwd
 	absWorkDir, err := filepath.Abs(flags.workDir)
 	if err != nil {
@@ -246,15 +283,18 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 
 	args := cmd.Args().Slice()
 
-	cfg, err := loadConfig()
+	cfg, err := loadConfig(ctx)
 	if err != nil {
 		return errors.WithMessage(err, "load config")
 	}
 
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	ag, reg, loader, snippetLoader, ragIndex, godocIndexer, langState, mcpMgr, client := setupAgent(ctx, cfg, rules.ScopeCoding)
+	s := setupAgent(ctx, &cfg, rules.ScopeCoding)
+	ag, reg, loader, snippetLoader := s.ag, s.reg, s.loader, s.snippetLoader
+	ragIndex, godocIndexer, langState := s.ragIndex, s.godocIndexer, s.langState
+	mcpMgr, client := s.mcpMgr, s.client
 	if mcpMgr != nil {
 		defer mcpMgr.Close()
 		ag.AddConfirmTools(mcpMgr.ConfirmTools())
@@ -263,7 +303,7 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 
 	// Set default mode and think from config
 	defaultMode := agent.ModePlan
-	if cfg.Agent.DefaultMode == "edit" {
+	if cfg.Agent.DefaultMode == cmdNameEdit {
 		defaultMode = agent.ModeEdit
 	}
 	ag.SetMode(defaultMode)
@@ -277,7 +317,7 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 
 	// Check Ollama connectivity
 	chatProv := cfg.ChatProvider()
-	pingCtx, pingCancel := context.WithTimeout(ctx, 5*time.Second)
+	pingCtx, pingCancel := context.WithTimeout(ctx, pingTimeout)
 	defer pingCancel()
 	if err := client.Ping(pingCtx); err != nil {
 		return errors.WithMessage(err, "cannot connect to Ollama\nMake sure 'ollama serve' is running")
@@ -314,11 +354,11 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 	}
 
 	// TUI mode
-	events := make(chan agent.Event, 100)
+	events := make(chan agent.Event, eventChanSize)
 	// emit sends an event without blocking if context is cancelled or channel is full.
-	emit := func(e agent.Event) {
+	emit := func(e *agent.Event) {
 		select {
-		case events <- e:
+		case events <- *e:
 		case <-ctx.Done():
 		}
 	}
@@ -341,9 +381,9 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 	// the conventions-only corpus from scratch. Runs before background
 	// indexing so users see both messages in order in the TUI.
 	if ragIndex != nil && ragIndex.HasLegacyCodeChunks() {
-		emit(agent.Event{Type: agent.EventAgent, Message: "RAG: dropping legacy code chunks from common index"})
+		emit(&agent.Event{Type: agent.EventAgent, Message: "RAG: dropping legacy code chunks from common index"})
 		if err := ragIndex.Reset(); err != nil {
-			emit(agent.Event{Type: agent.EventAgent, Message: fmt.Sprintf("RAG reset failed: %s", err)})
+			emit(&agent.Event{Type: agent.EventAgent, Message: fmt.Sprintf("RAG reset failed: %s", err)})
 		}
 	}
 
@@ -353,7 +393,7 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 		safeGo(&bgWg, events, func() {
 			defer indexing.Store(false)
 			defer func() {
-				emit(agent.Event{Type: agent.EventRAGProgress})
+				emit(&agent.Event{Type: agent.EventRAGProgress})
 			}()
 			// RAG indexes only project conventions — rules, snippets, docs,
 			// embedded language standards. Source code is NOT indexed: it
@@ -361,15 +401,16 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 			// and reviewers end up citing code that no longer exists. The diff
 			// plus live `read_file` tool calls are the authoritative view of
 			// code; RAG is reserved for stable conventions.
+			snips := snippetLoader.Snippets()
 			var chunks []rag.Chunk
 			// Index snippets into RAG
-			for _, s := range snippetLoader.Snippets() {
+			for i := range snips {
 				chunks = append(chunks, rag.ChunkSnippets([]rag.SnippetInfo{{
-					Name:        s.Name,
-					Description: s.Description,
-					Tags:        s.Tags,
-					Content:     s.Content,
-					SourcePath:  s.SourcePath,
+					Name:        snips[i].Name,
+					Description: snips[i].Description,
+					Tags:        snips[i].Tags,
+					Content:     snips[i].Content,
+					SourcePath:  snips[i].SourcePath,
 				}})...)
 			}
 			// Index rules into RAG
@@ -391,7 +432,7 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 			// the detected project language.
 			chunks = append(chunks, rag.ChunkEmbeddedDocs(string(langState.Current()), cfg.RAG.ChunkSize, cfg.RAG.ChunkOverlap)...)
 			progressFn := func(label string, done, total int) {
-				emit(agent.Event{
+				emit(&agent.Event{
 					Type:          agent.EventRAGProgress,
 					ProgressDone:  done,
 					ProgressTotal: total,
@@ -404,18 +445,18 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 			// empty now that project source code is no longer indexed.
 			n, err := ragIndex.BuildCommonWithProgress(ctx, chunks, progressFn)
 			if err != nil {
-				emit(agent.Event{Type: agent.EventAgent, Message: fmt.Sprintf("RAG index (common): %s", err)})
+				emit(&agent.Event{Type: agent.EventAgent, Message: fmt.Sprintf("RAG index (common): %s", err)})
 				return
 			}
 			if err := ragIndex.Save(); err != nil {
-				emit(agent.Event{Type: agent.EventAgent, Message: fmt.Sprintf("RAG save: %s", err)})
+				emit(&agent.Event{Type: agent.EventAgent, Message: fmt.Sprintf("RAG save: %s", err)})
 				return
 			}
 			// Only announce when the index actually changed. A silent
 			// exit on a fully-cached startup avoids giving the impression
 			// of a reindex that never happened.
 			if n > 0 {
-				emit(agent.Event{Type: agent.EventAgent, Message: fmt.Sprintf("RAG ready: %d new, %d total", n, ragIndex.Size())})
+				emit(&agent.Event{Type: agent.EventAgent, Message: fmt.Sprintf("RAG ready: %d new, %d total", n, ragIndex.Size())})
 			}
 		})
 	}
@@ -438,6 +479,17 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 		planConfirmCh <- tui.PlanConfirmRequest{
 			Plan:   plan,
 			Result: resultCh,
+		}
+		return <-resultCh
+	}
+
+	// Step confirmation channel (per-step confirm in DAG executor)
+	stepConfirmCh := make(chan tui.StepConfirmRequest, 1)
+	stepConfirmFn := func(description string) agent.StepConfirmAction {
+		resultCh := make(chan agent.StepConfirmAction, 1)
+		stepConfirmCh <- tui.StepConfirmRequest{
+			Description: description,
+			Result:      resultCh,
 		}
 		return <-resultCh
 	}
@@ -471,7 +523,7 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 
 		task := input
 		if strings.HasPrefix(input, "/") {
-			parts := strings.SplitN(input, " ", 2)
+			parts := strings.SplitN(input, " ", splitCmdArgParts)
 			cmdName := strings.TrimPrefix(parts[0], "/")
 
 			// Built-in commands
@@ -481,88 +533,90 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 				if len(parts) > 1 {
 					instructions = parts[1]
 				}
-				emit(agent.Event{Type: agent.EventAgent, Message: "Compacting context..."})
+				emit(&agent.Event{Type: agent.EventAgent, Message: "Compacting context..."})
 				if err := ag.Compact(taskCtx, instructions); err != nil {
-					emit(agent.Event{Type: agent.EventError, Message: err.Error()})
+					emit(&agent.Event{Type: agent.EventError, Message: err.Error()})
 				}
-				emit(agent.Event{Type: agent.EventDone})
+				emit(&agent.Event{Type: agent.EventDone})
 				return
-			case "edit":
+			case cmdNameEdit:
 				if ag.LastPlan() != "" {
 					ag.EnterEditWithPlan()
-					emit(agent.Event{Type: agent.EventAgent, Message: "Loaded approved plan. Send any message to start execution."})
+					emit(&agent.Event{Type: agent.EventAgent, Message: "Loaded approved plan. Send any message to start execution."})
 				} else {
 					ag.SetMode(agent.ModeEdit)
 					ag.SetThink(false)
-					emit(agent.Event{Type: agent.EventAgent, Message: "No plan available. Switched to edit mode."})
+					emit(&agent.Event{Type: agent.EventAgent, Message: "No plan available. Switched to edit mode."})
 				}
-				emit(agent.Event{Type: agent.EventDone})
+				emit(&agent.Event{Type: agent.EventDone})
 				return
 			case "clear":
 				ag.ClearHistory()
 				ag.ClearSessionPermissions()
-				emit(agent.Event{Type: agent.EventAgent, Message: "Context and permissions cleared"})
+				emit(&agent.Event{Type: agent.EventAgent, Message: "Context and permissions cleared"})
 				used, total := ag.ContextUsage()
-				emit(agent.Event{Type: agent.EventTokens, ContextUsed: used, ContextTotal: total})
-				emit(agent.Event{Type: agent.EventDone})
+				emit(&agent.Event{Type: agent.EventTokens, ContextUsed: used, ContextTotal: total})
+				emit(&agent.Event{Type: agent.EventDone})
 				return
 			case "diff":
-				emit(agent.Event{Type: agent.EventAgent, Message: "Computing diff..."})
+				emit(&agent.Event{Type: agent.EventAgent, Message: "Computing diff..."})
 				var diffArgs []string
 				if len(parts) > 1 {
 					diffArgs = strings.Fields(parts[1])
 				}
-				diffOutput, err := gitDiff(flags.workDir, diffArgs)
-				if err != nil {
-					emit(agent.Event{Type: agent.EventError, Message: err.Error()})
-				} else if diffOutput == "" {
-					emit(agent.Event{Type: agent.EventAgent, Message: "No uncommitted changes."})
-				} else {
-					emit(agent.Event{Type: agent.EventAgent, Message: diffOutput})
+				diffOutput, err := gitDiff(ctx, flags.workDir, diffArgs)
+				switch {
+				case err != nil:
+					emit(&agent.Event{Type: agent.EventError, Message: err.Error()})
+				case diffOutput == "":
+					emit(&agent.Event{Type: agent.EventAgent, Message: "No uncommitted changes."})
+				default:
+					emit(&agent.Event{Type: agent.EventAgent, Message: diffOutput})
 				}
-				emit(agent.Event{Type: agent.EventDone})
+				emit(&agent.Event{Type: agent.EventDone})
 				return
 			case "resume":
 				s, err := agent.LatestSession(sessionsDir)
 				if err != nil {
-					emit(agent.Event{Type: agent.EventAgent, Message: "No sessions to resume."})
+					emit(&agent.Event{Type: agent.EventAgent, Message: "No sessions to resume."})
 				} else {
 					ag.LoadFromSession(s)
-					emit(agent.Event{Type: agent.EventAgent, Message: fmt.Sprintf("Resumed session %s (%d messages, %s mode)", s.ID, len(s.Messages), s.Mode)})
+					emit(&agent.Event{Type: agent.EventAgent, Message: fmt.Sprintf("Resumed session %s (%d messages, %s mode)", s.ID, len(s.Messages), s.Mode)})
 					used, total := ag.ContextUsage()
-					emit(agent.Event{Type: agent.EventTokens, ContextUsed: used, ContextTotal: total})
+					emit(&agent.Event{Type: agent.EventTokens, ContextUsed: used, ContextTotal: total})
 				}
-				emit(agent.Event{Type: agent.EventDone})
+				emit(&agent.Event{Type: agent.EventDone})
 				return
 			case "sessions":
 				summaries, err := agent.ListSessions(sessionsDir)
 				if err != nil || len(summaries) == 0 {
-					emit(agent.Event{Type: agent.EventAgent, Message: "No saved sessions."})
+					emit(&agent.Event{Type: agent.EventAgent, Message: "No saved sessions."})
 				} else {
 					var sb strings.Builder
 					sb.WriteString("Saved sessions:\n")
 					for _, s := range summaries {
 						fmt.Fprintf(&sb, "  %s  %s  %s  %d msgs\n", s.ID, s.Model, s.Mode, s.MessageCount)
 					}
-					emit(agent.Event{Type: agent.EventAgent, Message: sb.String()})
+					emit(&agent.Event{Type: agent.EventAgent, Message: sb.String()})
 				}
-				emit(agent.Event{Type: agent.EventDone})
+				emit(&agent.Event{Type: agent.EventDone})
 				return
 			case "reindex":
-				if ragIndex == nil {
-					emit(agent.Event{Type: agent.EventAgent, Message: "RAG is disabled. Enable it in config with rag.enabled: true"})
-					emit(agent.Event{Type: agent.EventDone})
-				} else if !indexing.CompareAndSwap(false, true) {
-					emit(agent.Event{Type: agent.EventAgent, Message: "RAG indexing already in progress"})
-					emit(agent.Event{Type: agent.EventDone})
-				} else {
-					emit(agent.Event{Type: agent.EventAgent, Message: "Reindexing..."})
+				switch {
+				case ragIndex == nil:
+					emit(&agent.Event{Type: agent.EventAgent, Message: "RAG is disabled. Enable it in config with rag.enabled: true"})
+					emit(&agent.Event{Type: agent.EventDone})
+				case !indexing.CompareAndSwap(false, true):
+					emit(&agent.Event{Type: agent.EventAgent, Message: "RAG indexing already in progress"})
+					emit(&agent.Event{Type: agent.EventDone})
+				default:
+					emit(&agent.Event{Type: agent.EventAgent, Message: "Reindexing..."})
 					safeGo(&bgWg, events, func() {
 						defer indexing.Store(false)
 						defer func() {
 							// Always clear the progress indicator on exit so the
 							// status bar disappears even on error paths.
-							emit(agent.Event{Type: agent.EventRAGProgress})
+							emit(&agent.Event{Type: agent.EventRAGProgress})
 						}()
 						// Re-read rules and snippets from disk before rebuilding
 						// the index. Without this, /reindex would use whatever the
@@ -572,13 +626,13 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 						// rebuild the index with stale rules/snippets, which is
 						// exactly what reindex is meant to prevent.
 						if err := loader.Load(ctx); err != nil {
-							emit(agent.Event{Type: agent.EventError, Message: fmt.Sprintf("rules reload: %s", err)})
-							emit(agent.Event{Type: agent.EventDone})
+							emit(&agent.Event{Type: agent.EventError, Message: fmt.Sprintf("rules reload: %s", err)})
+							emit(&agent.Event{Type: agent.EventDone})
 							return
 						}
 						if err := snippetLoader.Load(ctx); err != nil {
-							emit(agent.Event{Type: agent.EventError, Message: fmt.Sprintf("snippets reload: %s", err)})
-							emit(agent.Event{Type: agent.EventDone})
+							emit(&agent.Event{Type: agent.EventError, Message: fmt.Sprintf("snippets reload: %s", err)})
+							emit(&agent.Event{Type: agent.EventDone})
 							return
 						}
 						// Drop any leftover per-language sub-index directories from
@@ -592,22 +646,23 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 						// that every /reindex re-embeds every chunk, which is fine
 						// for the small convention-only corpus.
 						if err := ragIndex.Reset(); err != nil {
-							emit(agent.Event{Type: agent.EventError, Message: fmt.Sprintf("reset: %s", err)})
-							emit(agent.Event{Type: agent.EventDone})
+							emit(&agent.Event{Type: agent.EventError, Message: fmt.Sprintf("reset: %s", err)})
+							emit(&agent.Event{Type: agent.EventDone})
 							return
 						}
 						// RAG only indexes conventions (rules/snippets/docs/embedded).
 						// Project source code is intentionally excluded — see the
 						// initial indexing block above for the rationale.
+						reloadedSnips := snippetLoader.Snippets()
 						var chunks []rag.Chunk
 						// Index snippets into RAG (parity with initial indexing pipeline).
-						for _, s := range snippetLoader.Snippets() {
+						for i := range reloadedSnips {
 							chunks = append(chunks, rag.ChunkSnippets([]rag.SnippetInfo{{
-								Name:        s.Name,
-								Description: s.Description,
-								Tags:        s.Tags,
-								Content:     s.Content,
-								SourcePath:  s.SourcePath,
+								Name:        reloadedSnips[i].Name,
+								Description: reloadedSnips[i].Description,
+								Tags:        reloadedSnips[i].Tags,
+								Content:     reloadedSnips[i].Content,
+								SourcePath:  reloadedSnips[i].SourcePath,
 							}})...)
 						}
 						// Index rules into RAG
@@ -629,7 +684,7 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 						// detected project language. Routed to common via embedded:// prefix.
 						chunks = append(chunks, rag.ChunkEmbeddedDocs(string(langState.Current()), cfg.RAG.ChunkSize, cfg.RAG.ChunkOverlap)...)
 						progressFn := func(label string, done, total int) {
-							emit(agent.Event{
+							emit(&agent.Event{
 								Type:          agent.EventRAGProgress,
 								ProgressDone:  done,
 								ProgressTotal: total,
@@ -639,33 +694,33 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 						// Everything routes to common — source code is no longer indexed.
 						n, err := ragIndex.BuildCommonWithProgress(ctx, chunks, progressFn)
 						if err != nil {
-							emit(agent.Event{Type: agent.EventError, Message: fmt.Sprintf("index (common): %s", err)})
-							emit(agent.Event{Type: agent.EventDone})
+							emit(&agent.Event{Type: agent.EventError, Message: fmt.Sprintf("index (common): %s", err)})
+							emit(&agent.Event{Type: agent.EventDone})
 							return
 						}
 						if err := ragIndex.Save(); err != nil {
-							emit(agent.Event{Type: agent.EventError, Message: fmt.Sprintf("save: %s", err)})
-							emit(agent.Event{Type: agent.EventDone})
+							emit(&agent.Event{Type: agent.EventError, Message: fmt.Sprintf("save: %s", err)})
+							emit(&agent.Event{Type: agent.EventDone})
 							return
 						}
-						emit(agent.Event{Type: agent.EventAgent, Message: fmt.Sprintf("RAG reindex: %d new, %d total", n, ragIndex.Size())})
-						emit(agent.Event{Type: agent.EventDone})
+						emit(&agent.Event{Type: agent.EventAgent, Message: fmt.Sprintf("RAG reindex: %d new, %d total", n, ragIndex.Size())})
+						emit(&agent.Event{Type: agent.EventDone})
 					})
 				}
 				return
 			case "rag":
 				if ragIndex == nil {
-					emit(agent.Event{Type: agent.EventAgent, Message: "RAG is disabled. Enable with rag.enabled: true"})
+					emit(&agent.Event{Type: agent.EventAgent, Message: "RAG is disabled. Enable with rag.enabled: true"})
 				} else {
-					emit(agent.Event{Type: agent.EventAgent, Message: fmt.Sprintf("RAG: %d entries, model: %s, updated: %s",
+					emit(&agent.Event{Type: agent.EventAgent, Message: fmt.Sprintf("RAG: %d entries, model: %s, updated: %s",
 						ragIndex.Size(), cfg.RAGProvider().Model, ragIndex.Updated().Format(time.RFC3339))})
 				}
-				emit(agent.Event{Type: agent.EventDone})
+				emit(&agent.Event{Type: agent.EventDone})
 				return
 			case "add_doc":
 				if ragIndex == nil {
-					emit(agent.Event{Type: agent.EventAgent, Message: "RAG is disabled. Enable it in config with rag.enabled: true"})
-					emit(agent.Event{Type: agent.EventDone})
+					emit(&agent.Event{Type: agent.EventAgent, Message: "RAG is disabled. Enable it in config with rag.enabled: true"})
+					emit(&agent.Event{Type: agent.EventDone})
 					return
 				}
 				var docPath string
@@ -673,19 +728,19 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 					docPath = strings.TrimSpace(parts[1])
 				}
 				if docPath == "" {
-					emit(agent.Event{Type: agent.EventAgent, Message: "Usage: /add_doc <file_path>"})
-					emit(agent.Event{Type: agent.EventDone})
+					emit(&agent.Event{Type: agent.EventAgent, Message: "Usage: /add_doc <file_path>"})
+					emit(&agent.Event{Type: agent.EventDone})
 					return
 				}
 				if !filepath.IsAbs(docPath) {
 					docPath = filepath.Join(flags.workDir, docPath)
 				}
-				emit(agent.Event{Type: agent.EventAgent, Message: fmt.Sprintf("Adding %s to RAG index...", docPath)})
+				emit(&agent.Event{Type: agent.EventAgent, Message: fmt.Sprintf("Adding %s to RAG index...", docPath)})
 				safeGo(&bgWg, events, func() {
 					chunks, err := rag.ChunkFile(docPath, cfg.RAG.ChunkSize, cfg.RAG.ChunkOverlap)
 					if err != nil {
-						emit(agent.Event{Type: agent.EventError, Message: fmt.Sprintf("read: %s", err)})
-						emit(agent.Event{Type: agent.EventDone})
+						emit(&agent.Event{Type: agent.EventError, Message: fmt.Sprintf("read: %s", err)})
+						emit(&agent.Event{Type: agent.EventDone})
 						return
 					}
 					// Use relative path for chunk file paths
@@ -696,36 +751,36 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 					}
 					n, err := ragIndex.Build(ctx, chunks)
 					if err != nil {
-						emit(agent.Event{Type: agent.EventError, Message: fmt.Sprintf("index: %s", err)})
-						emit(agent.Event{Type: agent.EventDone})
+						emit(&agent.Event{Type: agent.EventError, Message: fmt.Sprintf("index: %s", err)})
+						emit(&agent.Event{Type: agent.EventDone})
 						return
 					}
 					if err := ragIndex.Save(); err != nil {
-						emit(agent.Event{Type: agent.EventError, Message: fmt.Sprintf("save: %s", err)})
-						emit(agent.Event{Type: agent.EventDone})
+						emit(&agent.Event{Type: agent.EventError, Message: fmt.Sprintf("save: %s", err)})
+						emit(&agent.Event{Type: agent.EventDone})
 						return
 					}
-					emit(agent.Event{Type: agent.EventAgent, Message: fmt.Sprintf("Added %d chunks from %s (%d total)", n, filepath.Base(docPath), ragIndex.Size())})
-					emit(agent.Event{Type: agent.EventDone})
+					emit(&agent.Event{Type: agent.EventAgent, Message: fmt.Sprintf("Added %d chunks from %s (%d total)", n, filepath.Base(docPath), ragIndex.Size())})
+					emit(&agent.Event{Type: agent.EventDone})
 				})
 				return
 			case "init":
-				emit(agent.Event{Type: agent.EventAgent, Message: "Scanning project and generating AGENTS.md..."})
+				emit(&agent.Event{Type: agent.EventAgent, Message: "Scanning project and generating AGENTS.md..."})
 				res, err := kodruninit.Run(taskCtx, flags.workDir, client, chatProv.Model)
 				if err != nil {
-					emit(agent.Event{Type: agent.EventError, Message: err.Error()})
+					emit(&agent.Event{Type: agent.EventError, Message: err.Error()})
 				} else {
 					for _, path := range res.Created {
-						emit(agent.Event{Type: agent.EventAgent, Message: "created " + path})
+						emit(&agent.Event{Type: agent.EventAgent, Message: "created " + path})
 					}
-					emit(agent.Event{Type: agent.EventAgent, Message: fmt.Sprintf("Done: %d items created", len(res.Created))})
+					emit(&agent.Event{Type: agent.EventAgent, Message: fmt.Sprintf("Done: %d items created", len(res.Created))})
 				}
-				emit(agent.Event{Type: agent.EventDone})
+				emit(&agent.Event{Type: agent.EventDone})
 				return
-			case "code-review":
+			case cmdNameCodeReview:
 				if indexing.Load() {
-					emit(agent.Event{Type: agent.EventAgent, Message: "Waiting for RAG indexing to finish before review..."})
-					waitForRAGReady(taskCtx, &indexing, 2*time.Minute)
+					emit(&agent.Event{Type: agent.EventAgent, Message: "Waiting for RAG indexing to finish before review..."})
+					waitForRAGReady(taskCtx, &indexing, ragWaitTimeout)
 				}
 				var diffArgs []string
 				var packageScope string
@@ -747,14 +802,14 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 					}
 				}
 				if packageScope != "" {
-					emit(agent.Event{Type: agent.EventAgent, Message: fmt.Sprintf("Collecting diff for code review (scope: %s)...", packageScope)})
+					emit(&agent.Event{Type: agent.EventAgent, Message: fmt.Sprintf("Collecting diff for code review (scope: %s)...", packageScope)})
 				} else {
-					emit(agent.Event{Type: agent.EventAgent, Message: "Collecting diff for code review..."})
+					emit(&agent.Event{Type: agent.EventAgent, Message: "Collecting diff for code review..."})
 				}
-				diffOut, err := gitDiff(flags.workDir, diffArgs)
+				diffOut, err := gitDiff(ctx, flags.workDir, diffArgs)
 				if err != nil {
-					emit(agent.Event{Type: agent.EventError, Message: err.Error()})
-					emit(agent.Event{Type: agent.EventDone})
+					emit(&agent.Event{Type: agent.EventError, Message: err.Error()})
+					emit(&agent.Event{Type: agent.EventDone})
 					return
 				}
 				if packageScope != "" {
@@ -762,11 +817,11 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 				}
 				if strings.TrimSpace(diffOut) == "" {
 					if packageScope != "" {
-						emit(agent.Event{Type: agent.EventAgent, Message: fmt.Sprintf("No changes to review under %q.", packageScope)})
+						emit(&agent.Event{Type: agent.EventAgent, Message: fmt.Sprintf("No changes to review under %q.", packageScope)})
 					} else {
-						emit(agent.Event{Type: agent.EventAgent, Message: "No changes to review."})
+						emit(&agent.Event{Type: agent.EventAgent, Message: "No changes to review."})
 					}
-					emit(agent.Event{Type: agent.EventDone})
+					emit(&agent.Event{Type: agent.EventDone})
 					return
 				}
 				lang := langState.Current()
@@ -785,7 +840,7 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 					// models to skip read_file. Instead we send only the stat
 					// summary (which files changed and by how many lines) and
 					// the filtered list of source-code files.
-					rawDiff, rerr := gitDiffRaw(flags.workDir, diffArgs)
+					rawDiff, rerr := gitDiffRaw(ctx, flags.workDir, diffArgs)
 					var sourceFiles []string
 					if rerr == nil && rawDiff != "" {
 						if packageScope != "" {
@@ -798,7 +853,7 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 						// Fallback: no source files after filter — use full file list.
 						sourceFiles = changedFilesFromDiff(diffOut)
 					}
-					stat := gitStatRaw(flags.workDir, diffArgs)
+					stat := gitStatRaw(ctx, flags.workDir, diffArgs)
 					task = buildFanoutReviewTask(stat, sourceFiles)
 					// Skip RAG prefetch for fan-out specialists. The prefetch
 					// block dumps 500+ lines of project conventions (often from
@@ -808,7 +863,7 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 					// can still call `search_docs` themselves if they need a
 					// convention lookup.
 				} else {
-					task = buildCodeReviewPrompt(lang, diffOut, cfg)
+					task = buildCodeReviewPrompt(lang, diffOut, &cfg)
 					// Pre-fetch RAG context for the single-reviewer fallback.
 					// Local models (qwen, etc.) often ignore "MUST call
 					// search_docs" hints in the system prompt, so the prefetch
@@ -830,21 +885,21 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 			// findings via the extractor into a single plan. Architecture
 			// review is one of these specialists — there is no separate
 			// /arch-review command.
-			if cfg.Agent.Orchestrator && cmdName == "code-review" {
+			if cfg.Agent.Orchestrator && cmdName == cmdNameCodeReview {
 				roles := agent.SpecialistReviewerRoles
 				var doneSent atomic.Bool
-				wrappedEmit := agent.EventHandler(func(e agent.Event) {
+				wrappedEmit := agent.EventHandler(func(e *agent.Event) {
 					if e.Type == agent.EventDone {
 						doneSent.Store(true)
 					}
 					emit(e)
 				})
-				orch := newOrchestrator(client, chatProv, reg, cfg, wrappedEmit, ag.GetConfirmFunc(), planConfirmFn, ruleCatalog, ragIndex, godocIndexer, langState, loader)
+				orch := newOrchestrator(client, chatProv, reg, &cfg, wrappedEmit, ag.GetConfirmFunc(), planConfirmFn, stepConfirmFn, ruleCatalog, ragIndex, godocIndexer, langState, loader)
 				if err := orch.RunCodeReview(taskCtx, task, roles); err != nil && taskCtx.Err() == nil {
-					emit(agent.Event{Type: agent.EventError, Message: err.Error()})
+					emit(&agent.Event{Type: agent.EventError, Message: err.Error()})
 				}
 				if !doneSent.Load() {
-					emit(agent.Event{Type: agent.EventDone})
+					emit(&agent.Event{Type: agent.EventDone})
 				}
 				return
 			}
@@ -854,11 +909,11 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 				if len(parts) > 1 {
 					orchTask = parts[1]
 				}
-				orch := newOrchestrator(client, chatProv, reg, cfg, emit, ag.GetConfirmFunc(), planConfirmFn, ruleCatalog, ragIndex, godocIndexer, langState, loader)
+				orch := newOrchestrator(client, chatProv, reg, &cfg, emit, ag.GetConfirmFunc(), planConfirmFn, stepConfirmFn, ruleCatalog, ragIndex, godocIndexer, langState, loader)
 				err := orch.Run(taskCtx, orchTask)
 				if err != nil && taskCtx.Err() == nil {
-					emit(agent.Event{Type: agent.EventError, Message: err.Error()})
-					emit(agent.Event{Type: agent.EventDone})
+					emit(&agent.Event{Type: agent.EventError, Message: err.Error()})
+					emit(&agent.Event{Type: agent.EventDone})
 				}
 				return
 			}
@@ -874,19 +929,19 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 		// Use orchestrator only in plan mode (not in edit mode).
 		if cfg.Agent.Orchestrator && ag.Mode() == agent.ModePlan {
 			var doneSent atomic.Bool
-			wrappedEmit := agent.EventHandler(func(e agent.Event) {
+			wrappedEmit := agent.EventHandler(func(e *agent.Event) {
 				if e.Type == agent.EventDone {
 					doneSent.Store(true)
 				}
 				emit(e)
 			})
-			orch := newOrchestrator(client, chatProv, reg, cfg, wrappedEmit, ag.GetConfirmFunc(), planConfirmFn, ruleCatalog, ragIndex, godocIndexer, langState, loader)
+			orch := newOrchestrator(client, chatProv, reg, &cfg, wrappedEmit, ag.GetConfirmFunc(), planConfirmFn, stepConfirmFn, ruleCatalog, ragIndex, godocIndexer, langState, loader)
 			if err := orch.Run(taskCtx, task); err != nil && taskCtx.Err() == nil {
-				emit(agent.Event{Type: agent.EventError, Message: err.Error()})
+				emit(&agent.Event{Type: agent.EventError, Message: err.Error()})
 			}
 			// Ensure EventDone is always sent so the TUI stops the timer.
 			if !doneSent.Load() {
-				emit(agent.Event{Type: agent.EventDone})
+				emit(&agent.Event{Type: agent.EventDone})
 			}
 			return
 		}
@@ -897,17 +952,17 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 			// Emit error + done so timer stops and running resets.
 			if taskCtx.Err() != nil {
 				// Context was cancelled (Esc pressed) — don't show cryptic error
-				emit(agent.Event{Type: agent.EventDone})
+				emit(&agent.Event{Type: agent.EventDone})
 			} else {
-				emit(agent.Event{Type: agent.EventError, Message: err.Error()})
-				emit(agent.Event{Type: agent.EventDone})
+				emit(&agent.Event{Type: agent.EventError, Message: err.Error()})
+				emit(&agent.Event{Type: agent.EventDone})
 			}
 			return
 		}
 
 		if ag.Mode() == agent.ModePlan && ag.LastPlan() != "" {
 			// In standalone plan mode, show the extracted plan.
-			emit(agent.Event{Type: agent.EventAgent, Message: ag.LastPlan()})
+			emit(&agent.Event{Type: agent.EventAgent, Message: ag.LastPlan()})
 		}
 
 		// Classifier path: only when orchestrator is OFF and we are in ModePlan.
@@ -933,7 +988,7 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 		}
 
 		verdict, classifyErr := agent.ClassifyResponse(
-			taskCtx, thinkClient, thinkModel, cfg.Agent.Language, task, responseText, 60*time.Second,
+			taskCtx, thinkClient, thinkModel, cfg.Agent.Language, task, responseText, classifyTimeout,
 		)
 		if classifyErr != nil {
 			slog.Debug("classifier failed", "err", classifyErr)
@@ -945,28 +1000,28 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 
 		// Append CTA only if the agent did not already include one.
 		if verdict.CTAText != "" && !strings.Contains(responseText, verdict.CTAText) {
-			emit(agent.Event{Type: agent.EventAgent, Message: verdict.CTAText})
+			emit(&agent.Event{Type: agent.EventAgent, Message: verdict.CTAText})
 		}
 
 		// Show the plan-confirm dialog.
 		cr := planConfirmFn(responseText)
 		switch cr.Action {
 		case agent.PlanDeny:
-			emit(agent.Event{Type: agent.EventAgent, Message: "Execution cancelled by user."})
+			emit(&agent.Event{Type: agent.EventAgent, Message: "Execution cancelled by user."})
 			return
 		case agent.PlanAugment:
 			// Re-route augment text as a new task in the next turn.
-			emit(agent.Event{Type: agent.EventAgent, Message: "Plan augmentation: send your refinement as a new message."})
+			emit(&agent.Event{Type: agent.EventAgent, Message: "Plan augmentation: send your refinement as a new message."})
 			return
 		case agent.PlanAutoAccept, agent.PlanManualApprove:
 			var confirmFn agent.ConfirmFunc
 			if cr.Action == agent.PlanManualApprove {
 				confirmFn = ag.GetConfirmFunc()
 			}
-			emit(agent.Event{Type: agent.EventAgent, Message: "▸ Executing approved plan..."})
-			orch := newOrchestrator(client, chatProv, reg, cfg, emit, confirmFn, planConfirmFn, ruleCatalog, ragIndex, godocIndexer, langState, loader)
+			emit(&agent.Event{Type: agent.EventAgent, Message: "▸ Executing approved plan..."})
+			orch := newOrchestrator(client, chatProv, reg, &cfg, emit, confirmFn, planConfirmFn, stepConfirmFn, ruleCatalog, ragIndex, godocIndexer, langState, loader)
 			if err := orch.RunExecutor(taskCtx, responseText, confirmFn); err != nil && taskCtx.Err() == nil {
-				emit(agent.Event{Type: agent.EventError, Message: err.Error()})
+				emit(&agent.Event{Type: agent.EventError, Message: err.Error()})
 			}
 		}
 	}
@@ -985,13 +1040,17 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 	}
 
 	commands := buildCommandItems(loader)
-	model := tui.NewModel(chatProv.Model, version, chatProv.ContextSize, taskFn, cancelTask, events, commands, confirmCh, planConfirmCh,
+	model := tui.NewModel(chatProv.Model, version, chatProv.ContextSize, taskFn, cancelTask, events, commands, confirmCh, planConfirmCh, stepConfirmCh,
 		flags.workDir, defaultMode, cfg.Agent.Think, setModeFn, contextFn, cfg.Agent.Language, cfg.TUI.MaxHistory)
 
 	// Save terminal state before bubbletea modifies it (alt screen, mouse reporting).
 	// Deferred restore acts as safety net if bubbletea cannot clean up.
 	if oldState, err := term.GetState(int(os.Stdin.Fd())); err == nil {
-		defer term.Restore(int(os.Stdin.Fd()), oldState)
+		defer func() {
+			if restoreErr := term.Restore(int(os.Stdin.Fd()), oldState); restoreErr != nil {
+				slog.Warn("kodrun: failed to restore terminal state", "error", restoreErr)
+			}
+		}()
 	}
 
 	p := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
@@ -1015,7 +1074,7 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 
 	select {
 	case <-waitDone:
-	case <-time.After(3 * time.Second):
+	case <-time.After(shutdownTimeout):
 		slog.Warn("kodrun: shutdown timeout, forcing exit")
 	}
 
@@ -1026,12 +1085,12 @@ func runRoot(_ context.Context, cmd *cli.Command) error {
 
 func buildCommandItems(loader *rules.Loader) []tui.CommandItem {
 	cmds := loader.Commands()
-	items := make([]tui.CommandItem, 0, len(cmds)+3)
+	items := make([]tui.CommandItem, 0, len(cmds)+builtinCmdCount)
 
 	// Built-in commands
 	items = append(items,
 		tui.CommandItem{Name: "compact", Description: "Summarize conversation to free context"},
-		tui.CommandItem{Name: "edit", Description: "Switch to edit mode (with plan if available)"},
+		tui.CommandItem{Name: cmdNameEdit, Description: "Switch to edit mode (with plan if available)"},
 		tui.CommandItem{Name: "init", Description: "Create .kodrun/ starter structure"},
 		tui.CommandItem{Name: "clear", Description: "Clear conversation context"},
 		tui.CommandItem{Name: "diff", Description: "Show git diff (uncommitted changes)"},
@@ -1041,7 +1100,7 @@ func buildCommandItems(loader *rules.Loader) []tui.CommandItem {
 		tui.CommandItem{Name: "rag", Description: "Show RAG index status"},
 		tui.CommandItem{Name: "add_doc", Description: "Add a document to RAG index"},
 		tui.CommandItem{Name: "orchestrate", Description: "Run Plan→Execute→Review pipeline"},
-		tui.CommandItem{Name: "code-review", Description: "Parallel specialist code review: rules, idiomaticity, best practices, security, structure, architecture"},
+		tui.CommandItem{Name: cmdNameCodeReview, Description: "Parallel specialist code review: rules, idiomaticity, best practices, security, structure, architecture"},
 		tui.CommandItem{Name: "exit", Description: "Exit KodRun"},
 	)
 
@@ -1064,10 +1123,10 @@ func buildCommandItems(loader *rules.Loader) []tui.CommandItem {
 // before applying any size cap — truncating before filtering causes a
 // head-of-alphabet directory like `.kodrun/` to consume the whole budget and
 // starve the real source files later in the alphabet.
-func gitDiffRaw(workDir string, args []string) (string, error) {
+func gitDiffRaw(ctx context.Context, workDir string, args []string) (string, error) {
 	full := []string{"diff"}
 	full = append(full, args...)
-	cmd := exec.Command("git", full...)
+	cmd := exec.CommandContext(ctx, "git", full...)
 	cmd.Dir = workDir
 	var out bytes.Buffer
 	cmd.Stdout = &out
@@ -1082,35 +1141,39 @@ func gitDiffRaw(workDir string, args []string) (string, error) {
 }
 
 // gitStatRaw runs `git diff --stat <args>` and returns the raw stat output.
-func gitStatRaw(workDir string, args []string) string {
+func gitStatRaw(ctx context.Context, workDir string, args []string) string {
 	full := []string{"diff", "--stat"}
 	full = append(full, args...)
-	cmd := exec.Command("git", full...)
+	cmd := exec.CommandContext(ctx, "git", full...)
 	cmd.Dir = workDir
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
-	cmd.Run() // ignore error, stat may be empty
+	if err := cmd.Run(); err != nil {
+		slog.Debug("git diff --stat failed", "error", err)
+	}
 	return strings.TrimSpace(out.String())
 }
 
 // gitDiff runs git diff and returns formatted output.
-func gitDiff(workDir string, args []string) (string, error) {
+func gitDiff(ctx context.Context, workDir string, args []string) (string, error) {
 	cmdArgs := []string{"diff", "--stat"}
 	cmdArgs = append(cmdArgs, args...)
 
 	// First get stat summary
-	statCmd := exec.Command("git", cmdArgs...)
+	statCmd := exec.CommandContext(ctx, "git", cmdArgs...)
 	statCmd.Dir = workDir
 	var statOut bytes.Buffer
 	statCmd.Stdout = &statOut
 	statCmd.Stderr = &statOut
-	statCmd.Run() // ignore error, stat may be empty
+	if err := statCmd.Run(); err != nil {
+		slog.Debug("git diff --stat failed", "error", err)
+	}
 
 	// Then get full diff
 	fullArgs := []string{"diff"}
 	fullArgs = append(fullArgs, args...)
-	fullCmd := exec.Command("git", fullArgs...)
+	fullCmd := exec.CommandContext(ctx, "git", fullArgs...)
 	fullCmd.Dir = workDir
 	var fullOut bytes.Buffer
 	fullCmd.Stdout = &fullOut
@@ -1151,7 +1214,7 @@ func gitDiff(workDir string, args []string) (string, error) {
 // buildCodeReviewPrompt builds a structured, language-aware code review prompt
 // for the LLM. It tells the model exactly which tools to use to fetch rules,
 // snippets and project knowledge depending on what is enabled in the config.
-func buildCodeReviewPrompt(lang projectlang.Language, diff string, cfg config.Config) string {
+func buildCodeReviewPrompt(lang projectlang.Language, diff string, cfg *config.Config) string {
 	var b strings.Builder
 
 	langName := "Unknown"
@@ -1344,17 +1407,17 @@ var pinnedOverviewTagsNice = map[string]struct{}{
 	"conventions": {},
 }
 
-// pinnedTagTier classifies a tag list. "must" wins over "nice" if both
-// apply to the same snippet.
+// pinnedTagTier classifies a tag list. pinnedTierMust wins over pinnedTierNice
+// if both apply to the same snippet.
 func pinnedTagTier(tags []string) string {
 	tier := ""
 	for _, t := range tags {
 		norm := strings.ToLower(strings.TrimSpace(t))
 		if _, ok := pinnedOverviewTagsMust[norm]; ok {
-			return "must"
+			return pinnedTierMust
 		}
 		if _, ok := pinnedOverviewTagsNice[norm]; ok {
-			tier = "nice"
+			tier = pinnedTierNice
 		}
 	}
 	return tier
@@ -1368,7 +1431,7 @@ func buildCodeReviewRAGPrefetch(ctx context.Context, ragIndex tools.RAGSearcher,
 		topK = 5
 	}
 	if budgetBytes <= 0 {
-		budgetBytes = 24 * 1024
+		budgetBytes = ragBudgetKB * ragBudgetMulti
 	}
 
 	files := changedFilesFromDiff(diff)
@@ -1447,20 +1510,20 @@ func buildCodeReviewRAGPrefetch(ctx context.Context, ragIndex tools.RAGSearcher,
 	// Two tiers: must (always attempted) and nice (only if budget >50% free).
 	pinnedSeen := make(map[string]bool)
 	var mustSnips, niceSnips []snippets.Snippet
-	for _, s := range allSnippets {
-		switch pinnedTagTier(s.Tags) {
-		case "must":
-			mustSnips = append(mustSnips, s)
-		case "nice":
-			niceSnips = append(niceSnips, s)
+	for i := range allSnippets {
+		switch pinnedTagTier(allSnippets[i].Tags) {
+		case pinnedTierMust:
+			mustSnips = append(mustSnips, allSnippets[i])
+		case pinnedTierNice:
+			niceSnips = append(niceSnips, allSnippets[i])
 		}
 	}
-	for _, s := range mustSnips {
-		if pinnedSeen[s.SourcePath] {
+	for i := range mustSnips {
+		if pinnedSeen[mustSnips[i].SourcePath] {
 			continue
 		}
-		pinnedSeen[s.SourcePath] = true
-		entry := fmt.Sprintf("--- PINNED OVERVIEW: %s ---\n%s\n\n", s.SourcePath, s.Content)
+		pinnedSeen[mustSnips[i].SourcePath] = true
+		entry := fmt.Sprintf("--- PINNED OVERVIEW: %s ---\n%s\n\n", mustSnips[i].SourcePath, mustSnips[i].Content)
 		if b.Len()+len(entry) > maxBytes {
 			b.WriteString("[... pinned overview truncated ...]\n")
 			break
@@ -1469,12 +1532,12 @@ func buildCodeReviewRAGPrefetch(ctx context.Context, ragIndex tools.RAGSearcher,
 	}
 	// Nice-tier snippets only squeeze in when at least half the budget is free.
 	if b.Len() < maxBytes/2 {
-		for _, s := range niceSnips {
-			if pinnedSeen[s.SourcePath] {
+		for i := range niceSnips {
+			if pinnedSeen[niceSnips[i].SourcePath] {
 				continue
 			}
-			pinnedSeen[s.SourcePath] = true
-			entry := fmt.Sprintf("--- PINNED OVERVIEW: %s ---\n%s\n\n", s.SourcePath, s.Content)
+			pinnedSeen[niceSnips[i].SourcePath] = true
+			entry := fmt.Sprintf("--- PINNED OVERVIEW: %s ---\n%s\n\n", niceSnips[i].SourcePath, niceSnips[i].Content)
 			if b.Len()+len(entry) > maxBytes/2 {
 				break
 			}
@@ -1515,7 +1578,7 @@ func waitForRAGReady(ctx context.Context, indexing *atomic.Bool, timeout time.Du
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(250 * time.Millisecond):
+		case <-time.After(pollInterval):
 		}
 	}
 }
@@ -1595,7 +1658,7 @@ func filterDiffToSourceCode(diff string) string {
 // conservative: extend the allow list when new languages are added rather
 // than trying to derive it from projectlang.
 func isSourceCodePath(path string) bool {
-	if path == "" || path == "/dev/null" {
+	if path == "" || path == pathDevNull {
 		return false
 	}
 	// Deny: project metadata and convention dumps.
@@ -1609,11 +1672,11 @@ func isSourceCodePath(path string) bool {
 		}
 	}
 	denyNames := map[string]bool{
-		"go.mod": true, "go.sum": true,
-		"package.json": true, "package-lock.json": true, "yarn.lock": true,
+		"go.sum":            true,
+		"package-lock.json": true, "yarn.lock": true,
 		"pnpm-lock.yaml": true, "Cargo.lock": true, "poetry.lock": true,
 		"Pipfile.lock": true, "AGENTS.md": true, "README.md": true,
-		"CLAUDE.md": true, "Makefile": true, "Dockerfile": true,
+		"CLAUDE.md": true,
 	}
 	base := path
 	if i := strings.LastIndex(base, "/"); i >= 0 {
@@ -1642,16 +1705,17 @@ func isSourceCodePath(path string) bool {
 // changedFilesFromDiff extracts file paths from a unified-diff `git diff`
 // output. It looks at "+++ b/<path>" lines and ignores /dev/null entries.
 func changedFilesFromDiff(diff string) []string {
-	var files []string
+	lines := strings.Split(diff, "\n")
+	files := make([]string, 0, len(lines))
 	seen := make(map[string]bool)
-	for _, line := range strings.Split(diff, "\n") {
+	for _, line := range lines {
 		if !strings.HasPrefix(line, "+++ ") {
 			continue
 		}
 		p := strings.TrimPrefix(line, "+++ ")
 		p = strings.TrimPrefix(p, "b/")
 		p = strings.TrimSpace(p)
-		if p == "" || p == "/dev/null" || seen[p] {
+		if p == "" || p == pathDevNull || seen[p] {
 			continue
 		}
 		seen[p] = true
@@ -1660,7 +1724,7 @@ func changedFilesFromDiff(diff string) []string {
 	return files
 }
 
-func newOrchestrator(client *ollama.Client, chatProv config.ProviderConfig, reg *tools.Registry, cfg config.Config, emit agent.EventHandler, confirmFn agent.ConfirmFunc, planConfirmFn agent.PlanConfirmFunc, ruleCatalog string, ragIndex tools.RAGSearcher, godocIndexer tools.GoDocIndexer, langState *projectlang.State, rulesLoader *rules.Loader) *agent.Orchestrator {
+func newOrchestrator(client *ollama.Client, chatProv config.ProviderConfig, reg *tools.Registry, cfg *config.Config, emit agent.EventHandler, confirmFn agent.ConfirmFunc, planConfirmFn agent.PlanConfirmFunc, stepConfirmFn agent.StepConfirmFunc, ruleCatalog string, ragIndex tools.RAGSearcher, godocIndexer tools.GoDocIndexer, langState *projectlang.State, rulesLoader *rules.Loader) *agent.Orchestrator {
 	// Resolve thinking/executor providers (fallback to chat provider).
 	thinkProv := cfg.ThinkingProvider()
 	execProv := cfg.ExecutorProvider()
@@ -1702,10 +1766,11 @@ func newOrchestrator(client *ollama.Client, chatProv config.ProviderConfig, reg 
 		extractorClient = client
 	}
 
-	return agent.NewOrchestrator(primaryClient, primaryModel, reg, flags.workDir, primaryCtx, agent.OrchestratorConfig{
+	return agent.NewOrchestrator(primaryClient, primaryModel, reg, flags.workDir, primaryCtx, &agent.OrchestratorConfig{
 		EventHandler:         emit,
 		ConfirmFunc:          confirmFn,
 		PlanConfirm:          planConfirmFn,
+		StepConfirmFn:        stepConfirmFn,
 		Language:             cfg.Agent.Language,
 		RuleCatalog:          ruleCatalog,
 		Review:               cfg.Agent.Review,
@@ -1726,6 +1791,10 @@ func newOrchestrator(client *ollama.Client, chatProv config.ProviderConfig, reg 
 		ExtractorFormat:      extractorProv.Format,
 		MaxParallelTasks:     cfg.Agent.MaxParallelTasks,
 		MaxReplans:           cfg.Agent.MaxReplans,
+		MaxIterations:        cfg.Agent.MaxIterations,
+		SpecialistTimeout:    cfg.Agent.SpecialistTimeout,
+		AutoCommit:           cfg.Agent.AutoCommit,
+		Verbose:              flags.verbose,
 	})
 }
 
@@ -1734,7 +1803,7 @@ func buildCmd() *cli.Command {
 		Name:  "build",
 		Usage: "Run go build with auto-fix",
 		Action: func(ctx context.Context, cmd *cli.Command) error {
-			return runGoTool("go_build", cmd.Args().Slice())
+			return runGoTool(ctx, "go_build", cmd.Args().Slice())
 		},
 	}
 }
@@ -1744,7 +1813,7 @@ func testCmd() *cli.Command {
 		Name:  "test",
 		Usage: "Run go test with auto-fix",
 		Action: func(ctx context.Context, cmd *cli.Command) error {
-			return runGoTool("go_test", cmd.Args().Slice())
+			return runGoTool(ctx, "go_test", cmd.Args().Slice())
 		},
 	}
 }
@@ -1754,7 +1823,7 @@ func lintCmd() *cli.Command {
 		Name:  "lint",
 		Usage: "Run golangci-lint with auto-fix",
 		Action: func(ctx context.Context, cmd *cli.Command) error {
-			return runGoTool("go_lint", cmd.Args().Slice())
+			return runGoTool(ctx, "go_lint", cmd.Args().Slice())
 		},
 	}
 }
@@ -1763,17 +1832,18 @@ func fixCmd() *cli.Command {
 	return &cli.Command{
 		Name:  "fix",
 		Usage: "Fix issues in a specific file",
-		Action: func(_ context.Context, cmd *cli.Command) error {
+		Action: func(ctx context.Context, cmd *cli.Command) error {
 			if cmd.NArg() != 1 {
 				return errors.New("fix requires exactly one file argument")
 			}
-			cfg, err := loadConfig()
+			cfg, err := loadConfig(ctx)
 			if err != nil {
 				return err
 			}
-			ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			ctx, cancel := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 			defer cancel()
-			ag, _, loader, _, _, _, _, mcpMgr, _ := setupAgent(ctx, cfg, rules.ScopeFix)
+			s := setupAgent(ctx, &cfg, rules.ScopeFix)
+			ag, loader, mcpMgr := s.ag, s.loader, s.mcpMgr
 			if mcpMgr != nil {
 				defer mcpMgr.Close()
 			}
@@ -1793,7 +1863,7 @@ func initCmd() *cli.Command {
 		Name:  "init",
 		Usage: "Create .kodrun/ starter structure",
 		Action: func(ctx context.Context, _ *cli.Command) error {
-			cfg, err := loadConfig()
+			cfg, err := loadConfig(ctx)
 			if err != nil {
 				return err
 			}
@@ -1834,16 +1904,17 @@ func formatContext(history []ollama.Message) string {
 	return b.String()
 }
 
-func runGoTool(toolName string, args []string) error {
-	cfg, err := loadConfig()
+func runGoTool(ctx context.Context, toolName string, args []string) error {
+	cfg, err := loadConfig(ctx)
 	if err != nil {
 		return err
 	}
 
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	ag, reg, _, _, _, _, _, mcpMgr, _ := setupAgent(ctx, cfg, rules.ScopeFix)
+	s := setupAgent(ctx, &cfg, rules.ScopeFix)
+	ag, reg, mcpMgr := s.ag, s.reg, s.mcpMgr
 	if mcpMgr != nil {
 		defer mcpMgr.Close()
 	}
@@ -1863,11 +1934,17 @@ func runGoTool(toolName string, args []string) error {
 
 	fmt.Println(result.Output)
 
-	if !result.Success && cfg.Agent.AutoFix && !flags.noFix {
+	exitCode, ok := result.Meta["exit_code"].(int)
+	if !ok {
+		exitCode = 0
+	}
+	success := exitCode == 0
+
+	if !success && cfg.Agent.AutoFix && !flags.noFix {
 		fmt.Println("\n[auto-fix] Attempting to fix errors...")
 		chatProv := cfg.ChatProvider()
 		client := ollama.NewClient(chatProv.BaseURL, chatProv.Timeout)
-		fixer := runner.NewFixer(ctx, client, chatProv.Model, reg, 3)
+		fixer := runner.NewFixer(ctx, client, chatProv.Model, reg, maxFixAttempts)
 		fixed, err := fixer.Fix(ctx, toolName, result.Output, func(msg string) {
 			fmt.Println(msg)
 		})
@@ -1881,8 +1958,8 @@ func runGoTool(toolName string, args []string) error {
 		}
 	}
 
-	if !result.Success {
-		os.Exit(1)
+	if !success {
+		exitWithCode(1)
 	}
 	return nil
 }

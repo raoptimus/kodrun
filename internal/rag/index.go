@@ -22,6 +22,9 @@ const (
 	maxEmbedInputBytes  = 2000 // ~500-650 tokens, safely under nomic-embed-text 2048 token context
 	maxEmbedRetries     = 3    // total attempts per batch before failing
 	embedRetryBaseDelay = 500 * time.Millisecond
+	dirPermission       = 0o755
+	filePermission      = 0o644
+	initialCapDivisor   = 2 // pre-allocate half of input size for new chunks
 )
 
 func truncateInput(s string, maxBytes int) string {
@@ -143,7 +146,7 @@ func (idx *Index) Save() error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
-	if err := os.MkdirAll(idx.path, 0o755); err != nil {
+	if err := os.MkdirAll(idx.path, dirPermission); err != nil {
 		return errors.WithMessage(err, "create index dir")
 	}
 
@@ -152,7 +155,7 @@ func (idx *Index) Save() error {
 		return errors.WithMessage(err, "encode index")
 	}
 
-	return os.WriteFile(filepath.Join(idx.path, "index.json"), data, 0o644)
+	return os.WriteFile(filepath.Join(idx.path, "index.json"), data, filePermission)
 }
 
 // ProgressFunc is invoked from Build/BuildWithProgress while embedding
@@ -181,8 +184,8 @@ func (idx *Index) BuildWithProgress(ctx context.Context, chunks []Chunk, progres
 	idx.mu.RUnlock()
 
 	// Find new chunks.
-	newChunks := make([]Chunk, 0, len(chunks)/2)
-	newHashes := make([]string, 0, len(chunks)/2)
+	newChunks := make([]Chunk, 0, len(chunks)/initialCapDivisor)
+	newHashes := make([]string, 0, len(chunks)/initialCapDivisor)
 	for _, c := range chunks {
 		h := chunkHash(c)
 		if !existing[h] {

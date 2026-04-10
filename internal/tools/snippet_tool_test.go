@@ -41,7 +41,7 @@ paths: ["**/repository/**/*.go"]
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !listRes.Success || !strings.Contains(listRes.Output, "go-repository") {
+	if !strings.Contains(listRes.Output, "go-repository") {
 		t.Fatalf("unexpected list result: %#v", listRes)
 	}
 
@@ -52,7 +52,7 @@ paths: ["**/repository/**/*.go"]
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !matchRes.Success || !strings.Contains(matchRes.Output, "go-repository") {
+	if !strings.Contains(matchRes.Output, "go-repository") {
 		t.Fatalf("unexpected match result: %#v", matchRes)
 	}
 }

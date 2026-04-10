@@ -56,7 +56,7 @@ func TestSystemPromptForRole_WithRuleCatalog(t *testing.T) {
 }
 
 func TestNewOrchestrator(t *testing.T) {
-	orch := NewOrchestrator(nil, "test-model", nil, "/tmp", 32768, OrchestratorConfig{})
+	orch := NewOrchestrator(nil, "test-model", nil, "/tmp", 32768, &OrchestratorConfig{})
 	if orch == nil {
 		t.Fatal("NewOrchestrator returned nil")
 	}
@@ -69,7 +69,7 @@ func TestNewOrchestrator(t *testing.T) {
 }
 
 func TestOrchestrator_NewAgent_Roles(t *testing.T) {
-	orch := NewOrchestrator(nil, "test-model", nil, "/tmp", 32768, OrchestratorConfig{
+	orch := NewOrchestrator(nil, "test-model", nil, "/tmp", 32768, &OrchestratorConfig{
 		Language: "ru",
 	})
 
@@ -98,7 +98,7 @@ func TestOrchestrator_NewAgent_Roles(t *testing.T) {
 }
 
 func TestOrchestrator_Config(t *testing.T) {
-	orch := NewOrchestrator(nil, "m", nil, "/tmp", 32768, OrchestratorConfig{
+	orch := NewOrchestrator(nil, "m", nil, "/tmp", 32768, &OrchestratorConfig{
 		Review: true,
 	})
 	if !orch.review {

@@ -24,6 +24,7 @@ func newTestModel(t *testing.T) Model {
 		nil,
 		make(chan ConfirmRequest),
 		make(chan PlanConfirmRequest),
+		make(chan StepConfirmRequest),
 		t.TempDir(),
 		agent.ModeEdit,
 		false,

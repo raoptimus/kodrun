@@ -2,11 +2,11 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime/debug"
 	"slices"
 	"sort"
 	"strconv"
@@ -20,6 +20,24 @@ import (
 	"github.com/raoptimus/kodrun/internal/rag"
 	"github.com/raoptimus/kodrun/internal/rules"
 	"github.com/raoptimus/kodrun/internal/tools"
+)
+
+const (
+	taskTruncateLen       = 40  // max chars for task in phase group messages
+	maxToolWorkersDefault = 4   // default parallel tool workers for sub-agents
+	orchestratorRAGTopK   = 5   // top-K results for orchestrator RAG prefetch
+	perStepRAGTopK        = 3   // top-K results for per-step RAG search
+	maxPlanIterations     = 100 // max LLM iterations for planning phase
+	maxExecIterations     = 50  // max LLM iterations for execution phase
+	hitRatePctMultiplier  = 100 // multiplier to convert hit rate ratio to percentage
+	minStructuredSteps    = 4   // min steps for a plan to be considered structured
+	ragRuleTopK           = 2   // top-K for broad rule-name RAG queries
+	minRegexMatches       = 2   // min regex submatch groups / plan steps for validity
+	minStepTextLen        = 10  // min chars for a plan step to be meaningful
+	structurerMaxIter     = 3   // max iterations for structurer sub-agent
+	extractorMaxIter      = 5   // max iterations for extractor sub-agent
+	severityMinor         = 2   // severity rank for minor findings
+	severityUnknown       = 3   // severity rank for unrecognized severity
 )
 
 // Orchestrator coordinates sub-agents in a Plan → Execute → Review pipeline.
@@ -40,27 +58,31 @@ type Orchestrator struct {
 	extractorContextSize int
 	extractorTemperature float64
 	extractorFormat      string
-	language        string
-	ruleCatalog     string
-	onEvent         EventHandler
-	confirmFn       ConfirmFunc
-	planConfirm     PlanConfirmFunc
-	review          bool
-	hasSnippets     bool
-	hasRAG          bool
-	ragIndex        tools.RAGSearcher
-	godocIndexer    tools.GoDocIndexer
-	langState       *projectlang.State
-	rulesLoader     *rules.Loader
-	ruleNames       []string
+	language             string
+	ruleCatalog          string
+	onEvent              EventHandler
+	confirmFn            ConfirmFunc
+	planConfirm          PlanConfirmFunc
+	stepConfirmFn        StepConfirmFunc
+	review               bool
+	hasSnippets          bool
+	hasRAG               bool
+	ragIndex             tools.RAGSearcher
+	godocIndexer         tools.GoDocIndexer
+	langState            *projectlang.State
+	rulesLoader          *rules.Loader
+	ruleNames            []string
 
 	prefetchCode bool
 
-	maxPlanIter      int
-	maxExecIter      int
-	maxRevIter       int
-	maxParallelTasks int
-	maxReplans       int
+	maxPlanIter       int
+	maxExecIter       int
+	maxRevIter        int
+	maxParallelTasks  int
+	maxReplans        int
+	specialistTimeout time.Duration
+	autoCommit        bool
+	verbose           bool
 
 	cachedProjectFiles string
 
@@ -73,19 +95,20 @@ type Orchestrator struct {
 
 // OrchestratorConfig holds configuration for the orchestrator.
 type OrchestratorConfig struct {
-	EventHandler EventHandler
-	ConfirmFunc  ConfirmFunc
-	PlanConfirm  PlanConfirmFunc
-	Language     string
-	RuleCatalog  string
-	Review       bool
-	HasSnippets  bool
-	HasRAG       bool
-	RAGIndex       tools.RAGSearcher
-	GodocIndexer   tools.GoDocIndexer
-	LangState      *projectlang.State
-	RulesLoader  *rules.Loader
-	PrefetchCode bool
+	EventHandler  EventHandler
+	ConfirmFunc   ConfirmFunc
+	PlanConfirm   PlanConfirmFunc
+	StepConfirmFn StepConfirmFunc
+	Language      string
+	RuleCatalog   string
+	Review        bool
+	HasSnippets   bool
+	HasRAG        bool
+	RAGIndex      tools.RAGSearcher
+	GodocIndexer  tools.GoDocIndexer
+	LangState     *projectlang.State
+	RulesLoader   *rules.Loader
+	PrefetchCode  bool
 
 	// Optional dedicated executor wiring. When ExecutorClient is nil
 	// or ExecutorModel is empty, the orchestrator reuses the main client/model
@@ -110,6 +133,17 @@ type OrchestratorConfig struct {
 	MaxParallelTasks int
 	// Maximum number of REPLAN cycles allowed inside a single Run. Default 2.
 	MaxReplans int
+
+	// AutoCommit controls whether the executor may call git_commit.
+	// When false, git_commit is disabled for all sub-agents.
+	AutoCommit bool
+	// Verbose enables per-iteration and per-specialist timing diagnostics.
+	Verbose bool
+	// MaxIterations is the agent loop limit, used for review specialists.
+	MaxIterations int
+	// SpecialistTimeout caps wall time for a single review specialist.
+	// 0 means no per-specialist deadline.
+	SpecialistTimeout time.Duration
 }
 
 // NewOrchestrator creates a new orchestrator.
@@ -119,14 +153,14 @@ func NewOrchestrator(
 	reg *tools.Registry,
 	workDir string,
 	contextSize int,
-	cfg OrchestratorConfig,
+	cfg *OrchestratorConfig,
 ) *Orchestrator {
 	o := &Orchestrator{
-		client:          client,
-		model:           model,
-		reg:             reg,
-		workDir:         workDir,
-		contextSize:     contextSize,
+		client:               client,
+		model:                model,
+		reg:                  reg,
+		workDir:              workDir,
+		contextSize:          contextSize,
 		execClient:           cfg.ExecutorClient,
 		execModel:            cfg.ExecutorModel,
 		execContextSize:      cfg.ExecutorContextSize,
@@ -137,23 +171,30 @@ func NewOrchestrator(
 		extractorFormat:      cfg.ExtractorFormat,
 		maxParallelTasks:     cfg.MaxParallelTasks,
 		maxReplans:           cfg.MaxReplans,
-		onEvent:         cfg.EventHandler,
-		confirmFn:       cfg.ConfirmFunc,
-		planConfirm:     cfg.PlanConfirm,
-		language:        cfg.Language,
-		ruleCatalog:     cfg.RuleCatalog,
-		review:          cfg.Review,
-		hasSnippets:     cfg.HasSnippets,
-		hasRAG:          cfg.HasRAG,
-		ragIndex:        cfg.RAGIndex,
-		godocIndexer:    cfg.GodocIndexer,
-		langState:       cfg.LangState,
-		rulesLoader:     cfg.RulesLoader,
-		ruleNames:       collectRuleNames(cfg.RulesLoader),
-		prefetchCode:    cfg.PrefetchCode,
-		maxPlanIter:       100,
-		maxExecIter:       50,
-		maxRevIter:        15,
+		onEvent:              cfg.EventHandler,
+		confirmFn:            cfg.ConfirmFunc,
+		planConfirm:          cfg.PlanConfirm,
+		stepConfirmFn:        cfg.StepConfirmFn,
+		language:             cfg.Language,
+		ruleCatalog:          cfg.RuleCatalog,
+		review:               cfg.Review,
+		hasSnippets:          cfg.HasSnippets,
+		hasRAG:               cfg.HasRAG,
+		ragIndex:             cfg.RAGIndex,
+		godocIndexer:         cfg.GodocIndexer,
+		langState:            cfg.LangState,
+		rulesLoader:          cfg.RulesLoader,
+		ruleNames:            collectRuleNames(cfg.RulesLoader),
+		prefetchCode:         cfg.PrefetchCode,
+		maxPlanIter:          maxPlanIterations,
+		maxExecIter:          maxExecIterations,
+		maxRevIter:           cfg.MaxIterations,
+		specialistTimeout:    cfg.SpecialistTimeout,
+		autoCommit:           cfg.AutoCommit,
+		verbose:              cfg.Verbose,
+	}
+	if o.maxRevIter <= 0 {
+		o.maxRevIter = maxExecIterations
 	}
 	if o.execClient == nil {
 		o.execClient = client
@@ -170,7 +211,7 @@ func NewOrchestrator(
 // SetEventHandler sets the event handler shared by all sub-agents.
 func (o *Orchestrator) SetEventHandler(h EventHandler) { o.onEvent = h }
 
-func (o *Orchestrator) emit(e Event) {
+func (o *Orchestrator) emit(e *Event) {
 	if o.onEvent != nil {
 		o.onEvent(e)
 	}
@@ -188,7 +229,7 @@ func (o *Orchestrator) ensureLanguageDetected() {
 		return
 	}
 	tools.RegisterLanguageTools(o.reg, lang, o.workDir, o.godocIndexer)
-	o.emit(Event{Type: EventAgent, Message: fmt.Sprintf("Project language detected: %s — language tools registered", lang)})
+	o.emit(&Event{Type: EventAgent, Message: fmt.Sprintf("Project language detected: %s — language tools registered", lang)})
 }
 
 // emitCacheStats logs the final cache hit/miss summary if the cache saw any
@@ -202,8 +243,8 @@ func (o *Orchestrator) emitCacheStats(c *tools.ResultCache) {
 	if hits == 0 && misses == 0 {
 		return
 	}
-	rate := c.HitRate() * 100
-	o.emit(Event{
+	rate := c.HitRate() * hitRatePctMultiplier
+	o.emit(&Event{
 		Type:        EventCacheStats,
 		Message:     fmt.Sprintf("Tool cache: %d hits / %d misses (%.0f%% hit rate)", hits, misses, rate),
 		CacheHits:   hits,
@@ -214,7 +255,7 @@ func (o *Orchestrator) emitCacheStats(c *tools.ResultCache) {
 // emitPhase fires an EventPhase so the TUI can render a phase indicator. Name
 // should be one of: planning, awaiting_approval, executing, reviewing.
 func (o *Orchestrator) emitPhase(name string) {
-	o.emit(Event{Type: EventPhase, Message: name})
+	o.emit(&Event{Type: EventPhase, Message: name})
 }
 
 // extractReplanReason pulls the reason text from a REPLAN sentinel emitted by
@@ -246,12 +287,12 @@ func (o *Orchestrator) Run(ctx context.Context, task string) error {
 
 	// Phase 1: Planning
 	o.emitPhase("planning")
-	o.emit(Event{Type: EventAgent, Message: "▸ Phase 1: Planning..."})
-	o.emit(Event{Type: EventGroupStart, Message: fmt.Sprintf("Analyze(%s)", truncateTask(task, 40))})
+	o.emit(&Event{Type: EventAgent, Message: "▸ Phase 1: Planning..."})
+	o.emit(&Event{Type: EventGroupStart, Message: fmt.Sprintf("Analyze(%s)", truncateTask(task, taskTruncateLen))})
 
 	plan, err := o.runPlanner(ctx, task)
 
-	o.emit(Event{Type: EventGroupEnd})
+	o.emit(&Event{Type: EventGroupEnd})
 
 	if err != nil {
 		return errors.WithMessage(err, "planner")
@@ -260,8 +301,15 @@ func (o *Orchestrator) Run(ctx context.Context, task string) error {
 		return errors.New("planner produced empty plan")
 	}
 
+	return o.confirmAndExecute(ctx, plan, "Orchestrator completed")
+}
+
+// confirmAndExecute is the shared second half of the orchestrator pipeline.
+// It shows the plan, runs the confirm dialog (with optional revision), then
+// executes and optionally reviews. Used by both Run() and RunCodeReview().
+func (o *Orchestrator) confirmAndExecute(ctx context.Context, plan, doneMsg string) error {
 	// Show the plan to the user
-	o.emit(Event{Type: EventAgent, Message: plan})
+	o.emit(&Event{Type: EventAgent, Message: plan})
 
 	// Confirm before execution (3-option dialog)
 	autoAccept := false
@@ -269,7 +317,9 @@ func (o *Orchestrator) Run(ctx context.Context, task string) error {
 		cr := o.planConfirm(plan)
 		switch cr.Action {
 		case PlanDeny:
-			o.emit(Event{Type: EventAgent, Message: "Execution cancelled by user."})
+			o.emit(&Event{Type: EventAgent, Message: "Execution cancelled by user."})
+			o.emit(&Event{Type: EventModeChange, Message: "plan"})
+			o.emit(&Event{Type: EventDone, Message: doneMsg})
 			return nil
 		case PlanAutoAccept:
 			autoAccept = true
@@ -277,12 +327,12 @@ func (o *Orchestrator) Run(ctx context.Context, task string) error {
 			// keep confirmFn as-is
 		case PlanAugment:
 			// Re-run planner with feedback
-			o.emit(Event{Type: EventAgent, Message: "▸ Revising plan..."})
-			o.emit(Event{Type: EventGroupStart, Message: "Revise(plan)"})
+			o.emit(&Event{Type: EventAgent, Message: "▸ Revising plan..."})
+			o.emit(&Event{Type: EventGroupStart, Message: "Revise(plan)"})
 
 			revised, err := o.runPlannerRevision(ctx, plan, cr.Augment)
 
-			o.emit(Event{Type: EventGroupEnd})
+			o.emit(&Event{Type: EventGroupEnd})
 
 			if err != nil {
 				return errors.WithMessage(err, "planner revision")
@@ -291,26 +341,30 @@ func (o *Orchestrator) Run(ctx context.Context, task string) error {
 				return errors.New("planner revision produced empty plan")
 			}
 			plan = revised
-			o.emit(Event{Type: EventAgent, Message: plan})
+			o.emit(&Event{Type: EventAgent, Message: plan})
 
 			// Ask again after revision
 			cr2 := o.planConfirm(plan)
 			switch cr2.Action {
 			case PlanDeny:
-				o.emit(Event{Type: EventAgent, Message: "Execution cancelled by user."})
+				o.emit(&Event{Type: EventAgent, Message: "Execution cancelled by user."})
+				o.emit(&Event{Type: EventModeChange, Message: "plan"})
+				o.emit(&Event{Type: EventDone, Message: doneMsg})
 				return nil
 			case PlanAutoAccept:
 				autoAccept = true
 			case PlanManualApprove:
 				// keep confirmFn
 			case PlanAugment:
-				o.emit(Event{Type: EventAgent, Message: "Execution cancelled (too many revisions)."})
+				o.emit(&Event{Type: EventAgent, Message: "Execution cancelled (too many revisions)."})
+				o.emit(&Event{Type: EventModeChange, Message: "plan"})
+				o.emit(&Event{Type: EventDone, Message: doneMsg})
 				return nil
 			}
 		}
 	}
 
-	// Phase 2: Execution
+	// Execution phase.
 	// If context was cancelled (e.g. ESC during planning) but user approved
 	// the plan anyway, use a detached context so the executor can proceed.
 	execCtx := ctx
@@ -319,8 +373,8 @@ func (o *Orchestrator) Run(ctx context.Context, task string) error {
 	}
 
 	o.emitPhase("executing")
-	o.emit(Event{Type: EventModeChange, Message: "edit"})
-	o.emit(Event{Type: EventAgent, Message: "▸ Phase 2: Executing plan..."})
+	o.emit(&Event{Type: EventModeChange, Message: "edit"})
+	o.emit(&Event{Type: EventAgent, Message: "▸ Executing plan..."})
 
 	var confirmForExec ConfirmFunc
 	if !autoAccept {
@@ -332,19 +386,19 @@ func (o *Orchestrator) Run(ctx context.Context, task string) error {
 		return errors.WithMessage(err, "executor")
 	}
 
-	// Phase 3: Review (optional)
+	// Review phase (optional, planner path only).
 	if o.review {
 		o.emitPhase("reviewing")
-		o.emit(Event{Type: EventAgent, Message: "▸ Phase 3: Reviewing changes..."})
+		o.emit(&Event{Type: EventAgent, Message: "▸ Reviewing changes..."})
 
-		feedback, err := o.runReviewer(ctx, plan, execStats)
+		feedback, err := o.runReviewer(ctx, plan, &execStats)
 		if err != nil {
 			return errors.WithMessage(err, "reviewer")
 		}
 
 		// If reviewer found issues, run one more executor pass.
 		if feedback != "" {
-			o.emit(Event{Type: EventAgent, Message: "▸ Phase 3b: Applying review feedback..."})
+			o.emit(&Event{Type: EventAgent, Message: "▸ Applying review feedback..."})
 			if _, err := o.runExecutor(ctx, feedback, o.confirmFn); err != nil {
 				return errors.WithMessage(err, "executor (review fix)")
 			}
@@ -352,8 +406,8 @@ func (o *Orchestrator) Run(ctx context.Context, task string) error {
 	}
 
 	// Restore plan mode in TUI after orchestrator completes.
-	o.emit(Event{Type: EventModeChange, Message: "plan"})
-	o.emit(Event{Type: EventDone, Message: "Orchestrator completed", Stats: &execStats})
+	o.emit(&Event{Type: EventModeChange, Message: "plan"})
+	o.emit(&Event{Type: EventDone, Message: doneMsg, Stats: &execStats})
 	return nil
 }
 
@@ -380,12 +434,12 @@ func (o *Orchestrator) runPlanner(ctx context.Context, task string) (string, err
 
 	// Log quality issues as warnings (informational only, not a gate).
 	if issues := validatePlanQuality(plan); len(issues) > 0 {
-		o.emit(Event{Type: EventAgent, Message: "Plan quality notes: " + strings.Join(issues, "; ")})
+		o.emit(&Event{Type: EventAgent, Message: "Plan quality notes: " + strings.Join(issues, "; ")})
 	}
 
 	// Validate that the plan references real files.
 	if invalid := o.validatePlanPaths(plan); len(invalid) > 0 {
-		o.emit(Event{Type: EventAgent, Message: fmt.Sprintf("Warning: plan references %d non-existent file(s): %s", len(invalid), strings.Join(invalid, ", "))})
+		o.emit(&Event{Type: EventAgent, Message: fmt.Sprintf("Warning: plan references %d non-existent file(s): %s", len(invalid), strings.Join(invalid, ", "))})
 	}
 
 	return plan, nil
@@ -394,8 +448,8 @@ func (o *Orchestrator) runPlanner(ctx context.Context, task string) (string, err
 // extractPlan runs the extractor agent to normalize raw analysis into a structured plan.
 // Always called — this is the second phase of the two-phase planner→extractor architecture.
 func (o *Orchestrator) extractPlan(ctx context.Context, rawPlan string) (string, error) {
-	o.emit(Event{Type: EventGroupStart, Message: "Extract(plan)"})
-	defer o.emit(Event{Type: EventGroupEnd})
+	o.emit(&Event{Type: EventGroupStart, Message: "Extract(plan)"})
+	defer o.emit(&Event{Type: EventGroupEnd})
 
 	extracted, err := o.runExtractor(ctx, rawPlan)
 	if err != nil {
@@ -443,7 +497,7 @@ func (o *Orchestrator) runPlannerWithTools(ctx context.Context, task string) (st
 
 	// If planner didn't use any tools, retry once with a stronger hint.
 	if toolCalls == 0 && plan == "" {
-		o.emit(Event{Type: EventAgent, Message: "Planner did not read any files. Retrying with reinforced prompt..."})
+		o.emit(&Event{Type: EventAgent, Message: "Planner did not read any files. Retrying with reinforced prompt..."})
 		reinforced := "IMPORTANT: You MUST call list_dir(\".\") first, then read_file on each .go file. Do NOT generate a plan without reading files.\n\n" + task
 		plan, _, err = o.runPlannerOnce(ctx, reinforced)
 		if err != nil {
@@ -452,7 +506,7 @@ func (o *Orchestrator) runPlannerWithTools(ctx context.Context, task string) (st
 	}
 
 	if toolCalls == 0 && plan != "" {
-		o.emit(Event{Type: EventAgent, Message: "Warning: planner did not read source files — plan may contain hallucinations"})
+		o.emit(&Event{Type: EventAgent, Message: "Warning: planner did not read source files — plan may contain hallucinations"})
 	}
 
 	return plan, nil
@@ -473,9 +527,9 @@ func (o *Orchestrator) doCollectProjectFiles() string {
 	var buf strings.Builder
 	var files []string
 
-	_ = filepath.WalkDir(o.workDir, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil
+	if err := filepath.WalkDir(o.workDir, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return filepath.SkipDir
 		}
 		if d.IsDir() {
 			name := d.Name()
@@ -484,19 +538,24 @@ func (o *Orchestrator) doCollectProjectFiles() string {
 			}
 			return nil
 		}
-		rel, _ := filepath.Rel(o.workDir, path)
+		rel, relErr := filepath.Rel(o.workDir, path)
+		if relErr != nil {
+			return filepath.SkipDir
+		}
 		if strings.HasSuffix(rel, ".go") || rel == "go.mod" {
 			files = append(files, rel)
 		}
 		return nil
-	})
+	}); err != nil {
+		return ""
+	}
 
 	for _, rel := range files {
 		data, err := os.ReadFile(filepath.Join(o.workDir, rel))
 		if err != nil {
 			continue
 		}
-		o.emit(Event{Type: EventTool, Tool: "read_file", Message: rel, Success: true})
+		o.emit(&Event{Type: EventTool, Tool: "read_file", Message: rel, Success: true})
 
 		lines := strings.Split(string(data), "\n")
 		fmt.Fprintf(&buf, "=== %s ===\n", rel)
@@ -518,11 +577,45 @@ func (o *Orchestrator) runPlannerOnce(ctx context.Context, task string) (plan st
 	if ragContext := o.ragPrefetchForReview(ctx, task); ragContext != "" {
 		enrichedTask = ragContext + "\n" + task
 	}
+	// When the task mentions specific file paths, tell the planner to read
+	// them directly instead of scanning the entire project tree.
+	if hint := buildFileHint(enrichedTask); hint != "" {
+		enrichedTask = hint + "\n" + enrichedTask
+	}
 	if err := ag.Send(ctx, enrichedTask); err != nil && !errors.Is(err, ErrMaxIterations) {
 		return "", 0, err
 	}
 
 	return ag.LastPlan(), ag.Stats().ToolCalls, nil
+}
+
+// buildFileHint extracts .go file paths mentioned in the task and returns
+// an instruction telling the planner to read those files first. Returns ""
+// if no paths are found.
+func buildFileHint(task string) string {
+	matches := goFilePathRe.FindAllStringSubmatch(task, -1)
+	if len(matches) == 0 {
+		return ""
+	}
+	seen := make(map[string]bool)
+	files := make([]string, 0, len(matches))
+	for _, m := range matches {
+		p := m[1]
+		if seen[p] {
+			continue
+		}
+		seen[p] = true
+		files = append(files, p)
+	}
+	if len(files) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(
+		"MANDATORY: The task references specific file(s): %s\n"+
+			"Your FIRST tool call(s) MUST be read_file for these files. Do NOT call list_dir or find_files before reading them.\n"+
+			"After reading these files, only read additional files that are directly imported or referenced by the code you found.",
+		strings.Join(files, ", "),
+	)
 }
 
 // validatePlanPaths extracts .go file paths from the plan and checks they exist.
@@ -594,7 +687,7 @@ func validatePlanQuality(plan string) []string {
 	var actionLines, vagueLines int
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		if len(trimmed) < 4 {
+		if len(trimmed) < minStructuredSteps {
 			continue
 		}
 		// Detect actionable lines: numbered (1. / 1)), bulleted (- ), or bold (**).
@@ -649,13 +742,13 @@ func (o *Orchestrator) runPlannerRevision(ctx context.Context, plan, feedback st
 // (e.g. via the standalone agent + classifier path) and want to delegate just
 // the execution to the orchestrator's executor sub-agent.
 func (o *Orchestrator) RunExecutor(ctx context.Context, plan string, confirmFn ConfirmFunc) error {
-	o.emit(Event{Type: EventModeChange, Message: "edit"})
+	o.emit(&Event{Type: EventModeChange, Message: "edit"})
 	stats, err := o.runExecutor(ctx, plan, confirmFn)
 	if err != nil {
 		return errors.WithMessage(err, "executor")
 	}
-	o.emit(Event{Type: EventModeChange, Message: "plan"})
-	o.emit(Event{Type: EventDone, Message: "Executor completed", Stats: &stats})
+	o.emit(&Event{Type: EventModeChange, Message: "plan"})
+	o.emit(&Event{Type: EventDone, Message: "Executor completed", Stats: &stats})
 	return nil
 }
 
@@ -670,7 +763,7 @@ func (o *Orchestrator) runExecutor(ctx context.Context, plan string, confirmFn C
 		if parallel < 1 {
 			parallel = 1
 		}
-		o.emit(Event{
+		o.emit(&Event{
 			Type:    EventAgent,
 			Message: fmt.Sprintf("Executing plan as DAG: %d steps, max %d parallel", len(structured.Steps), parallel),
 		})
@@ -679,12 +772,12 @@ func (o *Orchestrator) runExecutor(ctx context.Context, plan string, confirmFn C
 
 	// Fallback: structurer unavailable or returned empty plan. Use single
 	// monolithic executor (no per-step examples in this path).
-	o.emit(Event{Type: EventAgent, Message: "Structurer unavailable; falling back to sequential executor"})
+	o.emit(&Event{Type: EventAgent, Message: "Structurer unavailable; falling back to sequential executor"})
 
 	// Pre-read project files so executor doesn't waste iterations on read_file/list_dir.
-	o.emit(Event{Type: EventGroupStart, Message: "Reading project files..."})
+	o.emit(&Event{Type: EventGroupStart, Message: "Reading project files..."})
 	codeContext := o.collectProjectFiles()
-	o.emit(Event{Type: EventGroupEnd})
+	o.emit(&Event{Type: EventGroupEnd})
 
 	ag := o.newAgent(RoleExecutor, o.maxExecIter)
 	prompt := systemPromptForRole(RoleExecutor, o.language, o.ruleCatalog, ag.reg.Names(), o.hasSnippets, o.hasRAG)
@@ -698,7 +791,7 @@ func (o *Orchestrator) runExecutor(ctx context.Context, plan string, confirmFn C
 	whitelist := mdPlan.AffectedFiles()
 	if len(whitelist) > 0 {
 		ag.SetAllowedReadPaths(whitelist)
-		o.emit(Event{
+		o.emit(&Event{
 			Type:    EventAgent,
 			Message: fmt.Sprintf("Executor read whitelist: %d file(s)", len(whitelist)),
 		})
@@ -715,7 +808,7 @@ func (o *Orchestrator) runExecutor(ctx context.Context, plan string, confirmFn C
 
 	// Detect REPLAN sentinel from the executor.
 	if last := ag.LastPlan(); strings.Contains(last, "REPLAN:") {
-		o.emit(Event{
+		o.emit(&Event{
 			Type:    EventReplan,
 			Message: extractReplanReason(last),
 		})
@@ -724,7 +817,7 @@ func (o *Orchestrator) runExecutor(ctx context.Context, plan string, confirmFn C
 	return ag.Stats(), nil
 }
 
-func (o *Orchestrator) runReviewer(ctx context.Context, plan string, execStats SessionStats) (string, error) {
+func (o *Orchestrator) runReviewer(ctx context.Context, plan string, execStats *SessionStats) (string, error) {
 	ag := o.newAgent(RoleReviewer, o.maxRevIter)
 	prompt := systemPromptForRole(RoleReviewer, o.language, o.ruleCatalog, ag.reg.NamesFiltered(readOnlyTools), o.hasSnippets, o.hasRAG)
 	ag.InitWithPrompt(prompt)
@@ -764,10 +857,11 @@ func (o *Orchestrator) newAgent(role Role, maxIter int) *Agent {
 	ag := New(client, model, o.reg, maxIter, o.workDir, ctxSize)
 	ag.SetLanguage(o.language)
 	ag.SetAutoCompact(true)
-	ag.SetMaxToolWorkers(4)
+	ag.SetMaxToolWorkers(maxToolWorkersDefault)
 	ag.SetHasSnippets(o.hasSnippets)
 	ag.SetHasRAG(o.hasRAG)
 	ag.SetTaskLabel(taskLabelForRole(role))
+	ag.SetVerbose(o.verbose)
 
 	switch role {
 	case RolePlanner:
@@ -797,10 +891,24 @@ func (o *Orchestrator) newAgent(role Role, maxIter int) *Agent {
 		if o.extractorFormat != "" {
 			ag.SetFormat(o.extractorFormat)
 		}
+	case RoleStructurer:
+		ag.SetMode(ModePlan)
+		ag.SetThink(false)
+		// Structurer only converts text to JSON — no tools needed.
+		ag.SetToolsDisabled(true)
+		ag.SetTemperature(o.extractorTemperature)
+		if o.extractorFormat != "" {
+			ag.SetFormat(o.extractorFormat)
+		}
+	}
+
+	// Disable git_commit when auto_commit is off.
+	if !o.autoCommit {
+		ag.DisableTools("git_commit")
 	}
 
 	// Filter out EventDone from sub-agents — only the orchestrator emits the final Done.
-	ag.SetEventHandler(func(e Event) {
+	ag.SetEventHandler(func(e *Event) {
 		if e.Type == EventDone {
 			return
 		}
@@ -813,10 +921,10 @@ func (o *Orchestrator) newAgent(role Role, maxIter int) *Agent {
 // ragPrefetch performs an automatic RAG search and returns formatted results
 // to be injected into the user message. Returns "" if RAG is not configured.
 func (o *Orchestrator) ragPrefetch(ctx context.Context, query string) string {
-	if o.ragIndex == nil {
+	if !o.hasRAG || o.ragIndex == nil {
 		return ""
 	}
-	results, err := o.ragIndex.Search(ctx, query, 5)
+	results, err := o.ragIndex.Search(ctx, query, orchestratorRAGTopK)
 	if err != nil || len(results) == 0 {
 		return ""
 	}
@@ -855,7 +963,7 @@ func collectRuleNames(l *rules.Loader) []string {
 //
 // Returns "" if RAG is not configured or nothing was found.
 func (o *Orchestrator) ragPrefetchForReview(ctx context.Context, task string) string {
-	if o.ragIndex == nil {
+	if !o.hasRAG || o.ragIndex == nil {
 		return ""
 	}
 
@@ -873,7 +981,7 @@ func (o *Orchestrator) ragPrefetchForReview(ctx context.Context, task string) st
 	}
 
 	// 1. Semantic search by task text.
-	if results, err := o.ragIndex.Search(ctx, task, 5); err == nil {
+	if results, err := o.ragIndex.Search(ctx, task, orchestratorRAGTopK); err == nil {
 		add(results)
 	}
 
@@ -883,7 +991,7 @@ func (o *Orchestrator) ragPrefetchForReview(ctx context.Context, task string) st
 
 	// 3. Rule names from .go paths mentioned in the task text.
 	for _, m := range goFilePathRe.FindAllStringSubmatch(task, -1) {
-		if len(m) >= 2 {
+		if len(m) >= minRegexMatches {
 			if t := detectEntityTypeFromPath(m[1], o.ruleNames); t != "" && !slices.Contains(types, t) {
 				types = append(types, t)
 			}
@@ -891,7 +999,7 @@ func (o *Orchestrator) ragPrefetchForReview(ctx context.Context, task string) st
 	}
 
 	for _, t := range types {
-		if results, err := o.ragIndex.Search(ctx, t, 5); err == nil {
+		if results, err := o.ragIndex.Search(ctx, t, orchestratorRAGTopK); err == nil {
 			add(results)
 		}
 	}
@@ -903,7 +1011,7 @@ func (o *Orchestrator) ragPrefetchForReview(ctx context.Context, task string) st
 		if slices.Contains(types, name) {
 			continue // already covered above
 		}
-		if results, err := o.ragIndex.Search(ctx, name, 2); err == nil {
+		if results, err := o.ragIndex.Search(ctx, name, ragRuleTopK); err == nil {
 			add(results)
 		}
 	}
@@ -919,7 +1027,7 @@ func (o *Orchestrator) ragPrefetchForReview(ctx context.Context, task string) st
 // that match specific conventions (e.g., "create validator" finds validator snippets,
 // "configure bootstrap" finds bootstrap patterns).
 func (o *Orchestrator) ragPrefetchBySteps(ctx context.Context, plan string) string {
-	if o.ragIndex == nil {
+	if !o.hasRAG || o.ragIndex == nil {
 		return ""
 	}
 
@@ -932,7 +1040,7 @@ func (o *Orchestrator) ragPrefetchBySteps(ctx context.Context, plan string) stri
 	var allResults []rag.SearchResult
 
 	for _, step := range steps {
-		results, err := o.ragIndex.Search(ctx, step, 3)
+		results, err := o.ragIndex.Search(ctx, step, perStepRAGTopK)
 		if err != nil {
 			continue
 		}
@@ -953,12 +1061,12 @@ func (o *Orchestrator) ragPrefetchBySteps(ctx context.Context, plan string) stri
 
 // splitPlanSteps splits a structured plan into individual steps.
 // Plans are typically numbered lists (1. ... 2. ...) or paragraph-separated blocks.
-var stepSplitRe = regexp.MustCompile(`(?m)^\d+[\.\)]\s`)
+var stepSplitRe = regexp.MustCompile(`(?m)^\d+[.\)]\s`)
 
 func splitPlanSteps(plan string) []string {
 	// Try splitting by numbered steps first.
 	indices := stepSplitRe.FindAllStringIndex(plan, -1)
-	if len(indices) >= 2 {
+	if len(indices) >= minRegexMatches {
 		steps := make([]string, 0, len(indices))
 		for i, idx := range indices {
 			var end int
@@ -968,11 +1076,11 @@ func splitPlanSteps(plan string) []string {
 				end = len(plan)
 			}
 			step := strings.TrimSpace(plan[idx[0]:end])
-			if len(step) >= 10 {
+			if len(step) >= minStepTextLen {
 				steps = append(steps, step)
 			}
 		}
-		if len(steps) >= 2 {
+		if len(steps) >= minRegexMatches {
 			return steps
 		}
 	}
@@ -982,7 +1090,7 @@ func splitPlanSteps(plan string) []string {
 	var steps []string
 	for _, p := range paragraphs {
 		p = strings.TrimSpace(p)
-		if len(p) >= 10 {
+		if len(p) >= minStepTextLen {
 			steps = append(steps, p)
 		}
 	}
@@ -1010,12 +1118,12 @@ func (o *Orchestrator) structurePlan(ctx context.Context, markdownPlan string) *
 			return nil
 		}
 
-		ag := o.newAgent(RoleStructurer, 3)
+		ag := o.newAgent(RoleStructurer, structurerMaxIter)
 		prompt := systemPromptForRole(RoleStructurer, o.language, o.ruleCatalog, nil)
 		ag.InitWithPrompt(prompt)
 
 		if err := ag.Send(ctx, task); err != nil && !errors.Is(err, ErrMaxIterations) {
-			o.emit(Event{Type: EventAgent, Message: fmt.Sprintf("structurer error (attempt %d/%d): %s", attempt+1, maxAttempts, err.Error())})
+			o.emit(&Event{Type: EventAgent, Message: fmt.Sprintf("structurer error (attempt %d/%d): %s", attempt+1, maxAttempts, err.Error())})
 			if attempt < maxAttempts-1 {
 				time.Sleep(time.Second)
 			}
@@ -1029,7 +1137,7 @@ func (o *Orchestrator) structurePlan(ctx context.Context, markdownPlan string) *
 
 		plan, err := parseStructuredPlan(raw)
 		if err != nil {
-			o.emit(Event{Type: EventAgent, Message: "structurer JSON parse failed: " + err.Error()})
+			o.emit(&Event{Type: EventAgent, Message: "structurer JSON parse failed: " + err.Error()})
 			continue
 		}
 		plan.Raw = markdownPlan
@@ -1042,7 +1150,7 @@ func (o *Orchestrator) structurePlan(ctx context.Context, markdownPlan string) *
 // using a separate agent with its own context. This solves the problem of models
 // producing "thinking" text instead of actionable plans.
 func (o *Orchestrator) runExtractor(ctx context.Context, rawAnalysis string) (string, error) {
-	ag := o.newAgent(RoleExtractor, 5)
+	ag := o.newAgent(RoleExtractor, extractorMaxIter)
 	prompt := systemPromptForRole(RoleExtractor, o.language, o.ruleCatalog, nil)
 	ag.InitWithPrompt(prompt)
 
@@ -1075,6 +1183,9 @@ func (o *Orchestrator) RunCodeReview(ctx context.Context, task string, roles []R
 
 	o.ensureLanguageDetected()
 
+	reviewStart := time.Now()
+	_ = reviewStart // used in verbose timing below
+
 	cache := tools.NewResultCache()
 	o.reg.WithCache(cache)
 	defer func() {
@@ -1093,7 +1204,7 @@ func (o *Orchestrator) RunCodeReview(ctx context.Context, task string, roles []R
 	}
 
 	const reviewGroupID = "code-review"
-	o.emit(Event{Type: EventGroupStart, GroupID: reviewGroupID, Message: "CodeReview(...)"})
+	o.emit(&Event{Type: EventGroupStart, GroupID: reviewGroupID, Message: "CodeReview(...)"})
 
 	// Circuit breaker: cancel remaining specialists on first connection error.
 	reviewCtx, reviewCancel := context.WithCancel(ctx)
@@ -1114,35 +1225,65 @@ func (o *Orchestrator) RunCodeReview(ctx context.Context, task string, roles []R
 			defer func() { <-sem }()
 			defer func() {
 				if r := recover(); r != nil {
-					results[i] = reviewResult{role: role, err: errors.Errorf("panic: %v", r)}
+					results[i] = reviewResult{role: role, err: errors.Errorf("panic: %v\n%s", r, debug.Stack())}
 				}
 			}()
 
-			o.emit(Event{
+			// Per-specialist timeout prevents a single slow specialist
+			// from blocking the entire review when parallelism is limited.
+			specCtx := reviewCtx
+			if o.specialistTimeout > 0 {
+				var specCancel context.CancelFunc
+				specCtx, specCancel = context.WithTimeout(reviewCtx, o.specialistTimeout)
+				defer specCancel()
+			}
+
+			o.emit(&Event{
 				Type:    EventGroupTitleUpdate,
 				GroupID: reviewGroupID,
 				Message: fmt.Sprintf("CodeReview(%s)", reviewerShortLabel(role)),
 			})
 
-			text, err := o.runReviewerSpecialistInGroup(reviewCtx, role, task, reviewGroupID)
-			results[i] = reviewResult{role: role, text: text, err: err}
+			specStart := time.Now()
+			text, agStats, err := o.runReviewerSpecialistInGroup(specCtx, role, task, reviewGroupID)
+			results[i] = reviewResult{role: role, text: text, err: err, duration: time.Since(specStart), stats: agStats}
 
 			if err != nil && isConnectionError(err) {
-				o.emit(Event{Type: EventError, Message: "Ollama unreachable — aborting remaining reviewers."})
+				o.emit(&Event{Type: EventError, Message: "Ollama unreachable — aborting remaining reviewers."})
 				reviewCancel()
 			}
 		}(i, role)
 	}
 	wg.Wait()
+	reviewWall := time.Since(reviewStart)
 
-	o.emit(Event{Type: EventGroupEnd, GroupID: reviewGroupID})
+	o.emit(&Event{Type: EventGroupEnd, GroupID: reviewGroupID})
+
+	// Emit per-specialist timing when verbose is enabled.
+	if o.verbose {
+		for i := range results {
+			r := &results[i]
+			status := "ok"
+			if r.err != nil {
+				status = "err"
+			}
+			o.emit(&Event{
+				Type: EventAgent,
+				Message: fmt.Sprintf("[perf] specialist=%s wall=%s llm=%s tools=%s iter=%d ctx_peak=%d%% status=%s",
+					reviewerShortLabel(r.role), r.duration.Truncate(time.Millisecond),
+					r.stats.TotalLLMTime.Truncate(time.Millisecond), r.stats.TotalToolTime.Truncate(time.Millisecond),
+					r.stats.Iterations, r.stats.PeakContextPct, status),
+			})
+		}
+		o.emit(&Event{Type: EventAgent, Message: fmt.Sprintf("[perf] review_total=%s parallel=%d", reviewWall.Truncate(time.Millisecond), maxPar)})
+	}
 
 	// If the context was cancelled but some reviewers succeeded, continue
 	// processing their results instead of discarding everything.
 	ctxCancelled := ctx.Err() != nil
 	hasSuccess := false
-	for _, r := range results {
-		if r.err == nil {
+	for i := range results {
+		if results[i].err == nil {
 			hasSuccess = true
 			break
 		}
@@ -1151,9 +1292,10 @@ func (o *Orchestrator) RunCodeReview(ctx context.Context, task string, roles []R
 		return ctx.Err()
 	}
 
-	var sections []string
+	sections := make([]string, 0, len(results))
 	var failedCount int
-	for _, r := range results {
+	for i := range results {
+		r := &results[i]
 		if r.err != nil {
 			failedCount++
 			continue
@@ -1167,13 +1309,13 @@ func (o *Orchestrator) RunCodeReview(ctx context.Context, task string, roles []R
 
 	if len(sections) == 0 {
 		if failedCount > 0 {
-			o.emit(Event{Type: EventAgent, Message: fmt.Sprintf(
+			o.emit(&Event{Type: EventAgent, Message: fmt.Sprintf(
 				"⚠ %d reviewer(s) failed, but no issues found by the rest — treating as LGTM.", failedCount)})
 		} else {
-			o.emit(Event{Type: EventAgent, Message: "LGTM — no issues found."})
+			o.emit(&Event{Type: EventAgent, Message: "LGTM — no issues found."})
 		}
-		o.emit(Event{Type: EventModeChange, Message: "plan"})
-		o.emit(Event{Type: EventDone, Message: "Code review completed"})
+		o.emit(&Event{Type: EventModeChange, Message: "plan"})
+		o.emit(&Event{Type: EventDone, Message: "Code review completed"})
 		return nil
 	}
 
@@ -1182,147 +1324,35 @@ func (o *Orchestrator) RunCodeReview(ctx context.Context, task string, roles []R
 	// we parse them directly instead of sending the concatenated text to
 	// another LLM (extractor), which tends to drop items under aggressive
 	// dedup.
-	o.emit(Event{Type: EventAgent, Message: "▸ Merging reviewer findings..."})
+	o.emit(&Event{Type: EventAgent, Message: "▸ Merging reviewer findings..."})
 	finalPlan := mergeSpecialistFindings(results)
 	if finalPlan == "" {
 		// Fallback: no strict lines parsed — surface this explicitly so the
 		// operator knows why the output looks unstructured, then show raw
 		// concatenated sections so nothing is silently lost.
-		o.emit(Event{Type: EventAgent, Message: "⚠ Specialists did not emit strict finding lines — showing raw concatenated reports."})
+		o.emit(&Event{Type: EventAgent, Message: "⚠ Specialists did not emit strict finding lines — showing raw concatenated reports."})
 		finalPlan = strings.Join(sections, "\n\n---\n\n")
 	}
 
-	// Run extractor over concatenated specialist reports to produce a
-	// project-level Context paragraph. We discard its plan (deterministic
-	// merge above already has every finding) and splice only its context
-	// ahead of our ## Plan section. Skip if context is already cancelled
-	// to avoid a pointless LLM call that will likely timeout.
-	if !ctxCancelled {
-		concat := strings.Join(sections, "\n\n---\n\n")
-		if ctxPara, err := o.extractReviewContext(ctx, concat); err == nil && ctxPara != "" {
-			finalPlan = "## Context\n\n" + ctxPara + "\n\n" + stripContextSection(finalPlan)
-		}
-	}
-
-	o.emit(Event{Type: EventAgent, Message: finalPlan})
-	o.emit(Event{Type: EventModeChange, Message: "plan"})
-
-	autoAccept := false
-	if o.planConfirm != nil {
-		cr := o.planConfirm(finalPlan)
-		switch cr.Action {
-		case PlanDeny:
-			o.emit(Event{Type: EventAgent, Message: "Execution cancelled by user."})
-			o.emit(Event{Type: EventDone, Message: "Code review completed"})
-			return nil
-		case PlanAugment:
-			o.emit(Event{Type: EventAgent, Message: "▸ Revising plan..."})
-			o.emit(Event{Type: EventGroupStart, Message: "Revise(plan)"})
-			revised, err := o.runPlannerRevision(ctx, finalPlan, cr.Augment)
-			o.emit(Event{Type: EventGroupEnd})
-			if err != nil {
-				o.emit(Event{Type: EventDone, Message: "Code review completed"})
-				return errors.WithMessage(err, "planner revision")
-			}
-			if revised != "" {
-				finalPlan = revised
-				o.emit(Event{Type: EventAgent, Message: finalPlan})
-			}
-		case PlanAutoAccept:
-			autoAccept = true
-		case PlanManualApprove:
-			// keep confirmFn as-is
-		}
-	}
-
-	// Phase 2: Execute the review plan.
-	// If the original context was cancelled (e.g. user pressed ESC during
-	// review) but the user subsequently approved the plan, we need a fresh
-	// context for the executor — otherwise every LLM call returns immediately
-	// with context.Canceled.
-	execCtx := ctx
-	if ctx.Err() != nil {
-		execCtx = context.WithoutCancel(ctx)
-	}
-
-	o.emitPhase("executing")
-	o.emit(Event{Type: EventModeChange, Message: "edit"})
-	o.emit(Event{Type: EventAgent, Message: "▸ Executing review plan..."})
-
-	var confirmForExec ConfirmFunc
-	if !autoAccept {
-		confirmForExec = o.confirmFn
-	}
-
-	execStats, err := o.runExecutor(execCtx, finalPlan, confirmForExec)
+	// Pass merged findings through extractor to group by file.
+	o.emit(&Event{Type: EventAgent, Message: "▸ Extracting structured plan..."})
+	extracted, err := o.runExtractor(ctx, finalPlan)
 	if err != nil {
-		return errors.WithMessage(err, "executor")
+		o.emit(&Event{Type: EventError, Message: fmt.Sprintf("Extractor failed, using raw merge: %v", err)})
+	} else {
+		finalPlan = RenderExtractorOutput(extracted)
 	}
 
-	o.emit(Event{Type: EventModeChange, Message: "plan"})
-	o.emit(Event{Type: EventDone, Message: "Code review completed", Stats: &execStats})
-	return nil
-}
-
-// extractReviewContext runs the extractor over concatenated specialist
-// reports and returns only the "context" paragraph from its JSON output.
-// The plan items are discarded — we use the deterministic merge for those.
-func (o *Orchestrator) extractReviewContext(ctx context.Context, concat string) (string, error) {
-	raw, err := o.runExtractor(ctx, concat)
-	if err != nil {
-		return "", err
-	}
-	raw = strings.TrimSpace(raw)
-	// Strip optional ```json fences.
-	raw = strings.TrimPrefix(raw, "```json")
-	raw = strings.TrimPrefix(raw, "```")
-	raw = strings.TrimSuffix(raw, "```")
-	raw = strings.TrimSpace(raw)
-
-	// Try JSON first: {"context": "...", "plan": [...]}
-	if start := strings.Index(raw, "{"); start >= 0 {
-		if end := strings.LastIndex(raw, "}"); end > start {
-			var payload struct {
-				Context string `json:"context"`
-			}
-			if jerr := json.Unmarshal([]byte(raw[start:end+1]), &payload); jerr != nil {
-				// Log the parse failure so operators can see why the extractor
-				// output was rejected. We still fall back to markdown below.
-				o.emit(Event{Type: EventAgent, Message: fmt.Sprintf("extractor JSON parse failed: %v", jerr)})
-			} else if c := strings.TrimSpace(payload.Context); c != "" {
-				return c, nil
-			}
-		}
-	}
-	// Fallback: look for a "## Context" markdown section.
-	if idx := strings.Index(raw, "## Context"); idx >= 0 {
-		rest := raw[idx+len("## Context"):]
-		if cut := strings.Index(rest, "## "); cut >= 0 {
-			rest = rest[:cut]
-		}
-		return strings.TrimSpace(rest), nil
-	}
-	return "", nil
-}
-
-// stripContextSection removes a leading "## Context ..." block from text,
-// returning only the remainder (typically starting at "## Plan").
-func stripContextSection(s string) string {
-	s = strings.TrimSpace(s)
-	if !strings.HasPrefix(s, "## Context") {
-		return s
-	}
-	if idx := strings.Index(s, "## Plan"); idx >= 0 {
-		return strings.TrimSpace(s[idx:])
-	}
-	return s
+	return o.confirmAndExecute(ctx, finalPlan, "Code review completed")
 }
 
 // reviewResult holds the outcome of a single specialist reviewer sub-agent.
 type reviewResult struct {
-	role Role
-	text string
-	err  error
+	role     Role
+	text     string
+	err      error
+	duration time.Duration
+	stats    SessionStats
 }
 
 // specialistFinding is a parsed line from a specialist's output in the
@@ -1344,9 +1374,9 @@ func severityRank(s string) int {
 	case "major":
 		return 1
 	case "minor":
-		return 2
+		return severityMinor
 	}
-	return 3
+	return severityUnknown
 }
 
 // specialistFindingRe captures file, line, severity and body from a single
@@ -1366,8 +1396,9 @@ var exampleLineRe = regexp.MustCompile(
 // raw output. Non-matching lines (headers, prose) are ignored. EXAMPLE:
 // continuation lines are attached to the immediately preceding finding.
 func parseSpecialistFindings(text string, role Role) []specialistFinding {
-	var out []specialistFinding
-	for _, line := range strings.Split(text, "\n") {
+	lines := strings.Split(text, "\n")
+	out := make([]specialistFinding, 0, len(lines))
+	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
@@ -1375,7 +1406,10 @@ func parseSpecialistFindings(text string, role Role) []specialistFinding {
 		// Try EXAMPLE: continuation line first — attach to last finding.
 		if em := exampleLineRe.FindStringSubmatch(line); em != nil {
 			if len(out) > 0 {
-				exLine, _ := strconv.Atoi(em[2])
+				exLine, atoiErr := strconv.Atoi(em[2])
+				if atoiErr != nil {
+					continue
+				}
 				out[len(out)-1].examples = append(out[len(out)-1].examples, Example{
 					File: em[1],
 					Line: exLine,
@@ -1442,20 +1476,20 @@ func isNoIssues(text string) bool {
 func mergeSpecialistFindings(results []reviewResult) string {
 	var all []specialistFinding
 	var unparsed []specialistFinding
-	for _, r := range results {
-		if r.err != nil {
+	for i := range results {
+		if results[i].err != nil {
 			continue
 		}
-		parsed := parseSpecialistFindings(r.text, r.role)
+		parsed := parseSpecialistFindings(results[i].text, results[i].role)
 		if len(parsed) > 0 {
 			all = append(all, parsed...)
 			continue
 		}
-		txt := strings.TrimSpace(r.text)
+		txt := strings.TrimSpace(results[i].text)
 		if isNoIssues(txt) {
 			continue
 		}
-		for _, line := range strings.Split(r.text, "\n") {
+		for _, line := range strings.Split(results[i].text, "\n") {
 			line = strings.TrimSpace(strings.TrimLeft(line, "-*>0123456789.) "))
 			if isNoIssues(line) {
 				continue
@@ -1464,7 +1498,7 @@ func mergeSpecialistFindings(results []reviewResult) string {
 				file:     "(unstructured)",
 				severity: "minor",
 				body:     line,
-				roles:    []Role{r.role},
+				roles:    []Role{results[i].role},
 			})
 		}
 	}
@@ -1556,7 +1590,7 @@ func mergeSpecialistFindings(results []reviewResult) string {
 	}
 
 	// Build final grouped findings.
-	var grouped []specialistFinding
+	grouped := make([]specialistFinding, 0, len(groupOrder))
 	for _, key := range groupOrder {
 		g := byGroup[key]
 		f := g.finding
@@ -1604,17 +1638,8 @@ func mergeSpecialistFindings(results []reviewResult) string {
 // whose events are routed into the given TUI group. It returns the agent's
 // final plan text (LastPlan). Errors other than ErrMaxIterations are
 // returned; an empty result is not an error (treated as LGTM upstream).
-func (o *Orchestrator) runReviewerSpecialistInGroup(ctx context.Context, role Role, task, groupID string) (string, error) {
-	// Specialists must read every changed file before emitting findings, which
-	// on a 5-10 file diff eats ~10-15 iterations on tool calls alone. Cap the
-	// budget from below so the default maxRevIter (often 15) does not starve
-	// the analysis/output phases. maxRevIter stays the source of truth for
-	// the single-reviewer fallback.
-	iter := o.maxRevIter
-	if iter < 30 {
-		iter = 30
-	}
-	ag := o.newAgent(role, iter)
+func (o *Orchestrator) runReviewerSpecialistInGroup(ctx context.Context, role Role, task, groupID string) (string, SessionStats, error) {
+	ag := o.newAgent(role, o.maxRevIter)
 	// Specialists should not emit a redundant start-label — the group
 	// header already says "Reviewing: security" etc. Their activity in the
 	// UI is expressed purely through tool calls landing in the group.
@@ -1623,9 +1648,9 @@ func (o *Orchestrator) runReviewerSpecialistInGroup(ctx context.Context, role Ro
 	prompt := systemPromptForRole(role, o.language, o.ruleCatalog, ag.reg.NamesFiltered(readOnlyTools), o.hasSnippets, o.hasRAG)
 	ag.InitWithPrompt(prompt)
 	if err := ag.Send(ctx, task); err != nil && !errors.Is(err, ErrMaxIterations) {
-		return "", err
+		return "", ag.Stats(), err
 	}
-	return ag.LastPlan(), nil
+	return ag.LastPlan(), ag.Stats(), nil
 }
 
 func truncateTask(s string, maxLen int) string {

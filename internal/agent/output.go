@@ -16,7 +16,7 @@ func NewPlainOutput(w io.Writer) *PlainOutput {
 }
 
 // Handle processes an agent event and writes it to the output.
-func (p *PlainOutput) Handle(e Event) {
+func (p *PlainOutput) Handle(e *Event) {
 	switch e.Type {
 	case EventAgent:
 		fmt.Fprintf(p.w, "%s\n", e.Message)

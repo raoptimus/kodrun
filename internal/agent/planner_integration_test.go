@@ -38,7 +38,7 @@ func setupIntegrationOrchestrator(t *testing.T) *Orchestrator {
 	reg.Register(tools.NewFindFilesTool(testWorkDir, forbidden))
 	reg.Register(tools.NewGrepTool(testWorkDir, forbidden))
 
-	orch := NewOrchestrator(client, testModel, reg, testWorkDir, testContextSize)
+	orch := NewOrchestrator(client, testModel, reg, testWorkDir, testContextSize, &OrchestratorConfig{})
 	orch.SetLanguage("ru")
 
 	return orch
@@ -54,7 +54,7 @@ func TestPlanner_UsesToolsAndProducesValidPlan(t *testing.T) {
 	for attempt := range maxAttempts {
 		orch := setupIntegrationOrchestrator(t)
 		toolCallCount = 0
-		orch.SetEventHandler(func(e Event) {
+		orch.SetEventHandler(func(e *Event) {
 			if e.Type == EventTool {
 				toolCallCount++
 			}
@@ -145,7 +145,7 @@ func TestPlanner_RetryOnZeroToolCalls(t *testing.T) {
 	orch := setupIntegrationOrchestrator(t)
 
 	var retryMessages []string
-	orch.SetEventHandler(func(e Event) {
+	orch.SetEventHandler(func(e *Event) {
 		if e.Type == EventAgent && strings.Contains(e.Message, "Retrying") {
 			retryMessages = append(retryMessages, e.Message)
 		}

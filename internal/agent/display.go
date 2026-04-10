@@ -5,37 +5,39 @@ import "strings"
 // ToolDisplayName maps internal tool names to user-friendly display names.
 func ToolDisplayName(name string) string {
 	switch name {
-	case "read_file":
+	case toolNameReadFile:
 		return "Read"
-	case "write_file":
+	case toolNameWriteFile:
 		return "Write"
-	case "edit_file":
+	case toolNameEditFile:
 		return "Edit"
 	case "delete_file":
-		return "Delete"
+		return actionDelete
 	case "list_dir":
 		return "ListDir"
 	case "find_files":
 		return "Find"
 	case "create_dir":
 		return "CreateDir"
-	case "move_file":
+	case toolNameMoveFile:
 		return "Move"
 	case "grep":
 		return "Grep"
 	case "go_build":
 		return "Build"
-	case "go_test":
+	case toolNameGoTest:
 		return "Test"
 	case "go_lint":
 		return "Lint"
-	case "go_vet":
+	case toolNameGoVet:
 		return "Vet"
 	case "go_doc":
 		return "GoDoc"
+	case "go_structure":
+		return "Structure"
 	case "search_docs":
 		return "SearchDocs"
-	case "bash":
+	case toolNameBash:
 		return "Bash"
 	case "snippets":
 		return "Snippets"
@@ -45,7 +47,7 @@ func ToolDisplayName(name string) string {
 		return "GitDiff"
 	case "git_log":
 		return "GitLog"
-	case "git_commit":
+	case toolNameGitCommit:
 		return "GitCommit"
 	case "get_rule":
 		return "GetRule"

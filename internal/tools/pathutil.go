@@ -29,12 +29,12 @@ func SafePath(_ context.Context, workDir, path string) (string, error) {
 	}
 
 	// Resolve symlinks and re-check to prevent symlink-based traversal.
-	if real, err := filepath.EvalSymlinks(resolved); err == nil {
+	if realPath, err := filepath.EvalSymlinks(resolved); err == nil {
 		realWorkDir := workDir
 		if rwd, e := filepath.EvalSymlinks(workDir); e == nil {
 			realWorkDir = rwd
 		}
-		realRel, relErr := filepath.Rel(realWorkDir, real)
+		realRel, relErr := filepath.Rel(realWorkDir, realPath)
 		if relErr != nil || strings.HasPrefix(realRel, "..") {
 			return "", errors.Errorf("symlink escapes work directory: %s", path)
 		}
@@ -55,7 +55,7 @@ func IsForbiddenDir(_ context.Context, relPath string, patterns []string) bool {
 	}
 	for _, pattern := range patterns {
 		if dirPattern, ok := strings.CutSuffix(pattern, "/**"); ok {
-			if matched, _ := filepath.Match(dirPattern, dirName); matched {
+			if matched, err := filepath.Match(dirPattern, dirName); err == nil && matched {
 				return true
 			}
 		}
@@ -66,11 +66,11 @@ func IsForbiddenDir(_ context.Context, relPath string, patterns []string) bool {
 // IsForbidden checks if a path matches any forbidden patterns.
 func IsForbidden(_ context.Context, path string, patterns []string) bool {
 	for _, pattern := range patterns {
-		if matched, _ := filepath.Match(pattern, filepath.Base(path)); matched {
+		if matched, err := filepath.Match(pattern, filepath.Base(path)); err == nil && matched {
 			return true
 		}
 		// Also check full relative path for glob patterns
-		if matched, _ := filepath.Match(pattern, path); matched {
+		if matched, err := filepath.Match(pattern, path); err == nil && matched {
 			return true
 		}
 	}

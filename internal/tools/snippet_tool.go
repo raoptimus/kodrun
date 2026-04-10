@@ -10,6 +10,11 @@ import (
 	"github.com/raoptimus/kodrun/internal/snippets"
 )
 
+const (
+	snippetActionMatch = "match"
+	snippetModeAND     = "AND"
+)
+
 type matchResult struct {
 	Name         string            `json:"name"`
 	Description  string            `json:"description"`
@@ -59,7 +64,7 @@ func (t *SnippetTool) Schema() ollama.JSONSchema {
 	return ollama.JSONSchema{
 		Type: "object",
 		Properties: map[string]ollama.JSONSchema{
-			"action":   {Type: "string", Description: "match (default), list, or tags", Enum: []string{"match", "list", "tags"}},
+			"action":   {Type: "string", Description: "match (default), list, or tags", Enum: []string{snippetActionMatch, "list", "tags"}},
 			"paths":    {Type: "array", Description: "File paths to match against snippet globs", Items: stringArray.Items},
 			"tags":     {Type: "array", Description: "Filter snippets by tags", Items: stringArray.Items},
 			"tag_mode": {Type: "string", Description: "How to combine tags: and (default) or or", Enum: []string{"and", "or"}},
@@ -70,39 +75,39 @@ func (t *SnippetTool) Schema() ollama.JSONSchema {
 	}
 }
 
-func (t *SnippetTool) Execute(_ context.Context, params map[string]any) (ToolResult, error) {
+func (t *SnippetTool) Execute(_ context.Context, params map[string]any) (*ToolResult, error) {
 	if t.loader == nil {
-		return ToolResult{Error: "snippets loader is not configured", Success: false}, nil
+		return nil, &ToolError{Msg: "snippets loader is not configured"}
 	}
 
-	action, _ := params["action"].(string)
+	action := stringParam(params, "action")
 	if action == "" {
-		action = "match"
+		action = snippetActionMatch
 	}
 
 	all := t.loader.Snippets()
 	switch action {
-	case "match":
+	case snippetActionMatch:
 		return t.match(all, params)
 	case "list":
 		return t.list(all, params)
 	case "tags":
 		return t.tags(all)
 	default:
-		return ToolResult{Error: "unknown action: " + action, Success: false}, nil
+		return nil, &ToolError{Msg: "unknown action: " + action}
 	}
 }
 
-func (t *SnippetTool) match(all []snippets.Snippet, params map[string]any) (ToolResult, error) {
-	query, _ := params["query"].(string)
-	section, _ := params["section"].(string)
-	tagMode, _ := params["tag_mode"].(string)
-	full, _ := params["full"].(bool)
+func (t *SnippetTool) match(all []snippets.Snippet, params map[string]any) (*ToolResult, error) {
+	query := stringParam(params, "query")
+	section := stringParam(params, "section")
+	tagMode := stringParam(params, "tag_mode")
+	full := boolParam(params, "full")
 	tags := extractStringSlice(params, "tags")
 	paths := extractStringSlice(params, "paths")
 
 	if len(paths) == 0 && len(tags) == 0 && query == "" {
-		return ToolResult{Error: "at least one of paths, tags, or query is required", Success: false}, nil
+		return nil, &ToolError{Msg: "at least one of paths, tags, or query is required"}
 	}
 
 	out := snippets.MatchWithOpts(all, &snippets.MatchOpts{
@@ -144,9 +149,9 @@ func (t *SnippetTool) match(all []snippets.Snippet, params map[string]any) (Tool
 	return marshalToolResult(resp)
 }
 
-func (t *SnippetTool) list(all []snippets.Snippet, params map[string]any) (ToolResult, error) {
+func (t *SnippetTool) list(all []snippets.Snippet, params map[string]any) (*ToolResult, error) {
 	tags := extractStringSlice(params, "tags")
-	tagMode, _ := params["tag_mode"].(string)
+	tagMode := stringParam(params, "tag_mode")
 	filtered := snippets.FilterByTags(all, tags, tagMode)
 
 	results := make([]listResult, len(filtered))
@@ -162,16 +167,16 @@ func (t *SnippetTool) list(all []snippets.Snippet, params map[string]any) (ToolR
 	return marshalToolResult(results)
 }
 
-func (t *SnippetTool) tags(all []snippets.Snippet) (ToolResult, error) {
+func (t *SnippetTool) tags(all []snippets.Snippet) (*ToolResult, error) {
 	return marshalToolResult(snippets.GroupByTags(all))
 }
 
-func marshalToolResult(v any) (ToolResult, error) {
+func marshalToolResult(v any) (*ToolResult, error) {
 	data, err := json.Marshal(v)
 	if err != nil {
-		return ToolResult{Error: err.Error(), Success: false}, nil
+		return nil, fmt.Errorf("marshal result: %w", err)
 	}
-	return ToolResult{Output: string(data), Success: true}, nil
+	return &ToolResult{Output: string(data)}, nil
 }
 
 func extractStringSlice(args map[string]any, key string) []string {
@@ -216,12 +221,12 @@ func buildNoMatchHint(all []snippets.Snippet, paths, tags []string, tagMode stri
 	}
 
 	if len(tags) > 0 {
-		modeLabel := "AND"
+		modeLabel := snippetModeAND
 		if strings.EqualFold(tagMode, "or") {
 			modeLabel = "OR"
 		}
 		parts = append(parts, fmt.Sprintf("No snippets matched tags %v (%s mode). Use snippets(action=\"tags\") to inspect available tags.", tags, modeLabel))
-		if modeLabel == "AND" && len(tags) > 1 {
+		if modeLabel == snippetModeAND && len(tags) > 1 {
 			parts = append(parts, "Tip: try tag_mode=\"or\".")
 		}
 	}

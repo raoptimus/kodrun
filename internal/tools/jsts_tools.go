@@ -3,13 +3,16 @@ package tools
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"os/exec"
 	"strings"
 	"time"
 
-	"github.com/pkg/errors"
 	"github.com/raoptimus/kodrun/internal/ollama"
 )
+
+const defaultArgsDesc = "Additional arguments"
 
 // jstsTool is the base for JavaScript/TypeScript ecosystem command tools.
 type jstsTool struct {
@@ -25,9 +28,10 @@ func (t *jstsTool) Name() string              { return t.name }
 func (t *jstsTool) Description() string       { return t.description }
 func (t *jstsTool) Schema() ollama.JSONSchema { return t.schema }
 
-func (t *jstsTool) Execute(ctx context.Context, params map[string]any) (ToolResult, error) {
-	args := make([]string, len(t.defaultArgs))
-	copy(args, t.defaultArgs)
+func (t *jstsTool) Execute(ctx context.Context, params map[string]any) (*ToolResult, error) {
+	const extraArgsCap = 4
+	args := make([]string, 0, len(t.defaultArgs)+extraArgsCap)
+	args = append(args, t.defaultArgs...)
 
 	if extra, ok := params["args"].(string); ok && extra != "" {
 		args = append(args, strings.Fields(extra)...)
@@ -50,7 +54,7 @@ func (t *jstsTool) Execute(ctx context.Context, params map[string]any) (ToolResu
 		if errors.As(err, &exitErr) {
 			exitCode = exitErr.ExitCode()
 		} else {
-			return ToolResult{Error: err.Error(), Success: false}, nil
+			return nil, fmt.Errorf("run %s: %w", t.command, err)
 		}
 	}
 
@@ -62,9 +66,8 @@ func (t *jstsTool) Execute(ctx context.Context, params map[string]any) (ToolResu
 		output += stderr.String()
 	}
 
-	return ToolResult{
-		Output:  output,
-		Success: exitCode == 0,
+	return &ToolResult{
+		Output: output,
 		Meta: map[string]any{
 			"exit_code": exitCode,
 			"duration":  duration.String(),
@@ -74,7 +77,7 @@ func (t *jstsTool) Execute(ctx context.Context, params map[string]any) (ToolResu
 
 func jstsToolSchema(argsDesc string) ollama.JSONSchema {
 	if argsDesc == "" {
-		argsDesc = "Additional arguments"
+		argsDesc = defaultArgsDesc
 	}
 	return ollama.JSONSchema{
 		Type: "object",
@@ -102,7 +105,7 @@ func RegisterJSTSTools(reg *Registry, workDir string) {
 		workDir: workDir, name: "npm_test",
 		description: "Run npm test",
 		command:     "npm", defaultArgs: []string{"test"},
-		schema: jstsToolSchema("Additional arguments"),
+		schema: jstsToolSchema(defaultArgsDesc),
 	})
 	reg.Register(&jstsTool{
 		workDir: workDir, name: "tsc",

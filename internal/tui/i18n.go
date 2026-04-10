@@ -91,13 +91,19 @@ var translations = map[string]map[string]string{
 		"diff.more_lines": "  ... (%d more lines)",
 
 		// Plan confirm
-		"plan_confirm.header":         "Agent has written up a plan and is ready to execute. Would you like to proceed?",
 		"plan_confirm.auto_accept":    "Yes, auto-accept edits",
 		"plan_confirm.manual_approve": "Yes, manually approve edits",
 		"plan_confirm.augment":        "Type here to tell Agent what to change",
 		"plan_confirm.hint":           "↑↓ navigate · enter confirm · esc cancel",
 		"plan_confirm.enter_feedback": "  ↩ enter feedback (Esc to cancel):",
 		"plan_confirm.feedback":       "  ↩ feedback: ",
+
+		// Step confirm
+		"step_confirm.header": "Execute this step?",
+		"step_confirm.allow":  "Execute",
+		"step_confirm.skip":   "Skip",
+		"step_confirm.deny":   "Cancel all",
+		"step_confirm.hint":   "↑↓ navigate · enter confirm",
 
 		// Group
 		"group.more_tools": "  +%d more tool uses (ctrl+o to expand)",
@@ -163,13 +169,19 @@ var translations = map[string]map[string]string{
 		"diff.more_lines": "  ... (ещё %d строк)",
 
 		// Plan confirm
-		"plan_confirm.header":         "Агент подготовил план и готов к выполнению. Продолжить?",
 		"plan_confirm.auto_accept":    "Да, авто-принять правки",
 		"plan_confirm.manual_approve": "Да, подтверждать правки вручную",
 		"plan_confirm.augment":        "Написать что изменить",
 		"plan_confirm.hint":           "↑↓ навигация · enter подтвердить · esc отмена",
 		"plan_confirm.enter_feedback": "  ↩ введите замечание (Esc для отмены):",
 		"plan_confirm.feedback":       "  ↩ замечание: ",
+
+		// Step confirm
+		"step_confirm.header": "Выполнить этот шаг?",
+		"step_confirm.allow":  "Выполнить",
+		"step_confirm.skip":   "Пропустить",
+		"step_confirm.deny":   "Отменить всё",
+		"step_confirm.hint":   "↑↓ навигация · enter подтвердить",
 
 		// Group
 		"group.more_tools": "  +%d вызовов (ctrl+o развернуть)",
