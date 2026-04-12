@@ -3,4 +3,5 @@
 .build
 *.md
 !README.md
+!internal/rag/docs/*.md
 
