@@ -121,8 +121,10 @@ func (r *Registry) Execute(ctx context.Context, name string, params map[string]a
 				cacheKey = buildCacheKey(name, policy, params)
 				resolvedPaths = resolveParamPaths(t, policy, params)
 				if hit, found := cache.Get(cacheKey); found {
-					hit.Meta = cloneMetaWithCacheHit(hit.Meta)
-					return hit, nil
+					return &ToolResult{
+						Output: hit.Output,
+						Meta:   cloneMetaWithCacheHit(hit.Meta),
+					}, nil
 				}
 			}
 		}
