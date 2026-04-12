@@ -2,7 +2,7 @@
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/raoptimus/kodrun.svg)](https://pkg.go.dev/github.com/raoptimus/kodrun/v2)
 [![Go Report Card](https://goreportcard.com/badge/github.com/raoptimus/kodrun)](https://goreportcard.com/report/github.com/raoptimus/kodrun)
-[![License](https://img.shields.io/github/license/raoptimus/kodrun)](https://https://github.com/raoptimus/kodrun/blob/main/LICENSE)
+[![License](https://img.shields.io/github/license/raoptimus/kodrun)](https://github.com/raoptimus/kodrun/blob/main/LICENSE)
 
 > **Beta** — this project is under active development. APIs and configuration may change.
 
@@ -18,12 +18,15 @@ Tested with **qwen3-coder:30b**. For RAG (semantic code search) the **nomic-embe
 - **Automatic project language detection** — Go, Python, JS/TS; per-language tools auto-registered.
 - **Rules + snippets + custom commands** — `.kodrun/` driven, with `@`-reference validation at startup.
 - **RAG with multi-index** — semantic search over code + docs + snippets + embedded references. Architecture overview snippets are pinned verbatim in `/code-review`.
-- **`/code-review` command** — strict read-only review of the current diff with RAG prefetch, pinned overviews and anti-hallucination guardrails.
-- **TUI** — fullscreen bubbletea interface, markdown rendering, confirm card with diff preview, RAG indexing progress, cache stats. Plain stdout mode for pipes/scripts.
+- **`/code-review` command** — strict read-only review of the current diff with RAG prefetch, pinned overviews and anti-hallucination guardrails. Runs **6 specialist reviewers in parallel** (rules, idiomatic, best practices, security, structure, architecture) with configurable timeout.
+- **Edit nudge** — auto-correction for models that respond with prose instead of tool calls in EDIT mode; prevents plan-shaped text from being silently accepted.
+- **`web_fetch` tool** — download web pages, convert HTML to markdown, and optionally index via RAG for semantic search.
+- **TUI** — fullscreen bubbletea interface, markdown rendering, confirm card with diff preview, step-level confirmation, RAG indexing progress, cache stats. Plain stdout mode for pipes/scripts.
 - **Tool-call result cache** — repeated read-only calls are served from cache.
 - **MCP (Model Context Protocol)** support for external tool servers.
 - **Security** — path traversal protection, `forbidden_patterns`, executor write-whitelist scoped to the approved plan.
 - **Context management** — auto-compaction on overflow.
+- **CI** — GitHub Actions pipeline with lint, test and coverage upload.
 
 ## Quick Start
 
@@ -166,6 +169,14 @@ See [`examples/kodrun.yaml`](examples/kodrun.yaml) for a fully annotated project
 - The `ollama:` section is now a legacy fallback, only used when `providers:` is empty. Prefer `providers:`.
 - `temperature` now lives on the provider profile, not on `agent:`.
 - Rule `@`-references must point at `.kodrun/` (not `.claude/`). Broken references are logged via `slog.Warn` at startup.
+
+### ⚠️ Migrating from beta2
+
+- `agent.max_workers` is **renamed** to `agent.max_tool_workers`.
+- RAG **no longer indexes project source code**. Only `.kodrun/rules/`, `.kodrun/snippets/`, `.kodrun/docs/` and embedded language standards are indexed. Source files are read live via `read_file`.
+- `rag.index_dirs`, `rag.exclude_dirs` and `rag.max_chunks_per_file` are **deprecated** (kept for config compatibility, ignored at runtime).
+- New option `agent.specialist_timeout` (default `5m`) — wall-time cap for a single `/code-review` specialist.
+- New option `rag.review_budget_bytes` (default `24576`) — hard cap on RAG prefetch block in `/code-review` prompts.
 
 ### Minimal `.kodrun/kodrun.yaml`
 
@@ -410,8 +421,9 @@ Tools are **auto-registered based on the detected project language**. Read-only 
 | `delete_file` | Delete a file |
 | `create_dir` | Create a directory |
 | `move_file` | Move/rename a file |
+| `file_stat` | File metadata (size, permissions, modification time) without reading contents |
 | `bash` | Execute a shell command |
-| `web_fetch` | Fetch a web page, convert HTML to markdown |
+| `web_fetch` | Fetch a web page, convert HTML to markdown (+ optional RAG indexing) |
 
 ### Git
 
@@ -433,6 +445,7 @@ Tools are **auto-registered based on the detected project language**. Read-only 
 | `go_vet` | `go vet` |
 | `go_mod_tidy` | `go mod tidy` |
 | `go_doc` | `go doc` lookup by package/symbol, or semantic search over indexed godoc via `query` |
+| `go_structure` | Show Go file/package structure (types, interfaces, functions, constants) with line numbers |
 
 ### Python (auto-registered for Python projects)
 

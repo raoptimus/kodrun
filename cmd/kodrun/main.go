@@ -36,7 +36,7 @@ import (
 	"github.com/raoptimus/kodrun/internal/tui"
 )
 
-var version = "v1.0.0-beta1"
+var version = "v1.0.0-beta3"
 
 const (
 	cmdNameEdit       = "edit"
