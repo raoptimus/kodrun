@@ -300,6 +300,15 @@ type Agent struct {
 	// EDIT mode. Reset at the start of every Send. See nudgeOrTerminate.
 	editNudges int
 
+	// planToolNudges counts how many times the current Send() invocation has
+	// pushed a "you must call tools first" nudge in PLAN mode because the
+	// model returned NO_ISSUES without calling any tools. Reset in Send().
+	planToolNudges int
+
+	// toolCallCount counts the total number of tool calls executed during
+	// the current Send() invocation. Reset at the start of every Send.
+	toolCallCount int
+
 	// planBlockedStreak counts consecutive iterations where ALL tool calls
 	// were blocked (write tools in plan mode). When the streak reaches
 	// maxPlanBlocked the agent stops early to avoid wasting iterations.
@@ -535,6 +544,11 @@ func (a *Agent) LastPlan() string {
 	return a.lastPlan
 }
 
+// ToolCallCount returns the number of tool calls executed during the last Send.
+func (a *Agent) ToolCallCount() int {
+	return a.toolCallCount
+}
+
 // LastAssistantMessage returns the content of the most recent assistant
 // message in the agent's history, or "" if there is none. Used by the
 // structurer/extractor pipeline to fetch raw model output without going
@@ -753,6 +767,8 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 	a.stats.reset()
 	a.planBuf.Reset()
 	a.editNudges = 0
+	a.planToolNudges = 0
+	a.toolCallCount = 0
 	a.planBlockedStreak = 0
 
 	// Emit a start-of-task status line only when a label was set. Sub-agents
@@ -870,6 +886,22 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 				continue
 			}
 			if a.mode == ModePlan {
+				// PLAN-mode nudge: specialist reviewers must call tools
+				// (file_stat, read_file) before concluding. If the model
+				// returned NO_ISSUES without any tool calls, nudge it once.
+				content := strings.TrimSpace(resp.Content)
+				if a.toolCallCount == 0 && a.planToolNudges < maxPlanToolNudges &&
+					(content == "" || isNoIssues(content)) {
+					a.planToolNudges++
+					a.emit(&Event{Type: EventAgent, Message: fmt.Sprintf(
+						"Model responded without calling any tools; nudging (%d/%d)...",
+						a.planToolNudges, maxPlanToolNudges)})
+					a.history = append(a.history, ollama.Message{
+						Role:    "user",
+						Content: "You responded without calling any tools. This is FORBIDDEN. You MUST call file_stat and read_file on every file listed in the task BEFORE responding. Start now with file_stat calls.",
+					})
+					continue
+				}
 				if resp.Content != "" {
 					a.planBuf.WriteString(resp.Content)
 				}
@@ -904,6 +936,7 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 
 		// Execute read-only tools in parallel via WorkerPool.
 		if len(parallelCalls) > 0 {
+			a.toolCallCount += len(parallelCalls)
 			a.executeParallel(ctx, parallelCalls)
 		}
 
@@ -961,6 +994,7 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 				}
 			}
 
+			a.toolCallCount++
 			a.executeSingle(ctx, tc)
 		}
 

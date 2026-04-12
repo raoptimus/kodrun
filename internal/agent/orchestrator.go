@@ -1245,8 +1245,8 @@ func (o *Orchestrator) RunCodeReview(ctx context.Context, task string, roles []R
 			})
 
 			specStart := time.Now()
-			text, agStats, err := o.runReviewerSpecialistInGroup(specCtx, role, task, reviewGroupID)
-			results[i] = reviewResult{role: role, text: text, err: err, duration: time.Since(specStart), stats: agStats}
+			text, tcCount, agStats, err := o.runReviewerSpecialistInGroup(specCtx, role, task, reviewGroupID)
+			results[i] = reviewResult{role: role, text: text, err: err, duration: time.Since(specStart), stats: agStats, toolCalls: tcCount}
 
 			if err != nil && isConnectionError(err) {
 				o.emit(&Event{Type: EventError, Message: "Ollama unreachable — aborting remaining reviewers."})
@@ -1293,7 +1293,7 @@ func (o *Orchestrator) RunCodeReview(ctx context.Context, task string, roles []R
 	}
 
 	sections := make([]string, 0, len(results))
-	var failedCount int
+	var failedCount, skippedCount int
 	for i := range results {
 		r := &results[i]
 		if r.err != nil {
@@ -1301,17 +1301,30 @@ func (o *Orchestrator) RunCodeReview(ctx context.Context, task string, roles []R
 			continue
 		}
 		text := strings.TrimSpace(r.text)
+		if text == "" {
+			// Empty response with no error is a silent failure, not "all clear".
+			failedCount++
+			continue
+		}
 		if isNoIssues(text) {
+			if r.toolCalls == 0 {
+				// Model said NO_ISSUES without reading any files — unreliable.
+				skippedCount++
+			}
 			continue
 		}
 		sections = append(sections, fmt.Sprintf("## [%s]\n\n%s", strings.ToUpper(string(r.role)), text))
 	}
 
 	if len(sections) == 0 {
-		if failedCount > 0 {
+		switch {
+		case skippedCount > 0:
+			o.emit(&Event{Type: EventAgent, Message: fmt.Sprintf(
+				"⚠ %d reviewer(s) responded without reading files — review is unreliable. Re-run or use a stronger model.", skippedCount)})
+		case failedCount > 0:
 			o.emit(&Event{Type: EventAgent, Message: fmt.Sprintf(
 				"⚠ %d reviewer(s) failed, but no issues found by the rest — treating as LGTM.", failedCount)})
-		} else {
+		default:
 			o.emit(&Event{Type: EventAgent, Message: "LGTM — no issues found."})
 		}
 		o.emit(&Event{Type: EventModeChange, Message: "plan"})
@@ -1348,11 +1361,12 @@ func (o *Orchestrator) RunCodeReview(ctx context.Context, task string, roles []R
 
 // reviewResult holds the outcome of a single specialist reviewer sub-agent.
 type reviewResult struct {
-	role     Role
-	text     string
-	err      error
-	duration time.Duration
-	stats    SessionStats
+	role      Role
+	text      string
+	err       error
+	duration  time.Duration
+	stats     SessionStats
+	toolCalls int
 }
 
 // specialistFinding is a parsed line from a specialist's output in the
@@ -1463,9 +1477,9 @@ func normalizeBody(s string) string {
 }
 
 // isNoIssues reports whether text is a specialist "all clear" response.
+// Empty text is NOT treated as "no issues" — it indicates a silent failure.
 func isNoIssues(text string) bool {
-	return text == "" ||
-		strings.EqualFold(text, "LGTM") ||
+	return strings.EqualFold(text, "LGTM") ||
 		strings.EqualFold(text, "NO_ISSUES")
 }
 
@@ -1486,12 +1500,12 @@ func mergeSpecialistFindings(results []reviewResult) string {
 			continue
 		}
 		txt := strings.TrimSpace(results[i].text)
-		if isNoIssues(txt) {
+		if txt == "" || isNoIssues(txt) {
 			continue
 		}
 		for _, line := range strings.Split(results[i].text, "\n") {
 			line = strings.TrimSpace(strings.TrimLeft(line, "-*>0123456789.) "))
-			if isNoIssues(line) {
+			if line == "" || isNoIssues(line) {
 				continue
 			}
 			unparsed = append(unparsed, specialistFinding{
@@ -1638,7 +1652,7 @@ func mergeSpecialistFindings(results []reviewResult) string {
 // whose events are routed into the given TUI group. It returns the agent's
 // final plan text (LastPlan). Errors other than ErrMaxIterations are
 // returned; an empty result is not an error (treated as LGTM upstream).
-func (o *Orchestrator) runReviewerSpecialistInGroup(ctx context.Context, role Role, task, groupID string) (string, SessionStats, error) {
+func (o *Orchestrator) runReviewerSpecialistInGroup(ctx context.Context, role Role, task, groupID string) (text string, toolCalls int, stats SessionStats, err error) {
 	ag := o.newAgent(role, o.maxRevIter)
 	// Specialists should not emit a redundant start-label — the group
 	// header already says "Reviewing: security" etc. Their activity in the
@@ -1648,9 +1662,9 @@ func (o *Orchestrator) runReviewerSpecialistInGroup(ctx context.Context, role Ro
 	prompt := systemPromptForRole(role, o.language, o.ruleCatalog, ag.reg.NamesFiltered(readOnlyTools), o.hasSnippets, o.hasRAG)
 	ag.InitWithPrompt(prompt)
 	if err := ag.Send(ctx, task); err != nil && !errors.Is(err, ErrMaxIterations) {
-		return "", ag.Stats(), err
+		return "", ag.ToolCallCount(), ag.Stats(), err
 	}
-	return ag.LastPlan(), ag.Stats(), nil
+	return ag.LastPlan(), ag.ToolCallCount(), ag.Stats(), nil
 }
 
 func truncateTask(s string, maxLen int) string {

@@ -2,6 +2,7 @@
 
 BINARY    := kodrun
 BUILD_DIR := .build
+REPORT_DIR := .report
 VERSION   := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS   := -ldflags "-X main.version=$(VERSION)"
 
@@ -34,9 +35,16 @@ go-test: build
 go-lint: build
 	$(BUILD_DIR)/$(BINARY) lint
 
-## test: Юнит-тесты с race detector и coverage
-test:
-	go test -race -count=1 -coverprofile=coverage.out ./...
+## test: Unit tests with race detector & coverage
+test-unit:
+	go test -race -count=1 -coverprofile=${REPORT_DIR}/coverage.out ./...
+
+test-integration: ## Run Integration Tests only
+	@go test $$(go list ./... | grep -v mock) \
+		-buildvcs=false \
+		-run Integration \
+		-tags=integration \
+		-v
 
 ## lint: golangci-lint (конфиг: .golangci.yml)
 lint:
@@ -52,7 +60,7 @@ init: build
 
 ## clean: Удалить артефакты сборки
 clean:
-	rm -rf $(BUILD_DIR) coverage.out
+	rm -rf $(BUILD_DIR) $(REPORT_DIR)
 
 ## help: Показать список целей
 help:
