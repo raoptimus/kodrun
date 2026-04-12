@@ -23,6 +23,11 @@ const (
 // prose. Prevents loops on models that refuse to call tools.
 const maxEditNudges = 2
 
+// maxPlanToolNudges caps how many times a single Send() invocation will
+// nudge the model to call tools when it returns NO_ISSUES in plan mode
+// without having called any tools first.
+const maxPlanToolNudges = 1
+
 // maxPlanBlocked caps consecutive iterations in plan mode where every tool
 // call was blocked (model hallucinated write tools). After this many
 // iterations the agent stops early to avoid wasting the iteration budget.

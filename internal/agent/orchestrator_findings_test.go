@@ -254,12 +254,13 @@ func TestNormalizeBody(t *testing.T) {
 }
 
 func TestIsNoIssues(t *testing.T) {
-	for _, s := range []string{"", "LGTM", "lgtm", "NO_ISSUES", "no_issues"} {
+	for _, s := range []string{"LGTM", "lgtm", "NO_ISSUES", "no_issues"} {
 		if !isNoIssues(s) {
 			t.Errorf("isNoIssues(%q) should be true", s)
 		}
 	}
-	for _, s := range []string{"some finding", "LGTM but...", "NO"} {
+	// Empty string is NOT "no issues" — it's a silent failure.
+	for _, s := range []string{"", "some finding", "LGTM but...", "NO"} {
 		if isNoIssues(s) {
 			t.Errorf("isNoIssues(%q) should be false", s)
 		}
