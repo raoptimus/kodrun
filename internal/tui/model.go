@@ -251,6 +251,7 @@ type Model struct {
 	pausedDuration time.Duration // accumulated paused time
 	totalPrompt    int
 	totalEval      int
+	liveEval       int // tokens generated during current inference (reset on EventTokens)
 	lastTkPerSec   float64
 
 	// Context usage tracking
@@ -825,6 +826,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.pausedDuration = 0
 			m.totalPrompt = 0
 			m.totalEval = 0
+			m.liveEval = 0
 			m.lastTkPerSec = 0
 			m.recalcViewport()
 
@@ -966,6 +968,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						buf.WriteString(line)
 					}
 					m.addLog(prefix + buf.String())
+					// Fallback: if the agent emitted a text-form tool call
+					// (edit_file with old_str/new_str as prose), render it
+					// as a colored diff so the user sees additions/removals.
+					if diff := agent.ExtractDiffFromText(e.Message); diff != "" {
+						m.addDiffLog(diff)
+					}
 				}
 			}
 		case agent.EventTool:
@@ -1033,6 +1041,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case agent.EventError:
 			m.addLog(errorStyle.Render(fmt.Sprintf("%s%s: %s", m.locale.Get("event.error"), e.Tool, e.Message)))
 		case agent.EventTokens:
+			m.liveEval = 0
 			m.totalPrompt += e.PromptTokens
 			m.totalEval += e.EvalTokens
 			if e.EvalTkPerSec > 0 {
@@ -1043,6 +1052,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if e.ContextTotal > 0 {
 				m.contextTotal = e.ContextTotal
+			}
+		case agent.EventInferenceProgress:
+			m.liveEval = e.InferenceTokens
+			if e.InferenceElapsed > 0 && e.InferenceTokens > 0 {
+				m.lastTkPerSec = float64(e.InferenceTokens) / e.InferenceElapsed.Seconds()
 			}
 		case agent.EventCompact:
 			m.addLog(systemStyle.Render(m.locale.Get("event.compact") + e.Message))
@@ -1558,7 +1572,7 @@ func (m Model) View() string {
 	var timeLine string
 	if m.running {
 		elapsed := m.elapsed()
-		timeLine = "\n" + toolbarStyle.Render(fmt.Sprintf("  %s ⏱ %s · %s tk", m.locale.Get("status.working"), elapsed, formatTokens(m.totalEval))) + "\n"
+		timeLine = "\n" + toolbarStyle.Render(fmt.Sprintf("  %s ⏱ %s · %s tk", m.locale.Get("status.working"), elapsed, formatTokens(m.totalEval+m.liveEval))) + "\n"
 	}
 	if m.ragProgressTotal > 0 {
 		pct := m.ragProgressDone * percentMultiplier / m.ragProgressTotal

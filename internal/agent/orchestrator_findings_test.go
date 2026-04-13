@@ -85,7 +85,7 @@ func TestParseSpecialistFindings(t *testing.T) {
 func TestMergeSpecialistFindings_SortAndFormat(t *testing.T) {
 	results := []reviewResult{
 		{role: RoleReviewer, text: "b.go:20 — minor — z\na.go:10 — blocker — x"},
-		{role: RoleReviewerArchitecture, text: "a.go:5 — major — y"},
+		{role: RoleArchReviewer, text: "a.go:5 — major — y"},
 	}
 	out := mergeSpecialistFindings(results)
 	if out == "" {
@@ -107,7 +107,7 @@ func TestMergeSpecialistFindings_SortAndFormat(t *testing.T) {
 func TestMergeSpecialistFindings_AllLGTM(t *testing.T) {
 	results := []reviewResult{
 		{role: RoleReviewer, text: "LGTM"},
-		{role: RoleReviewerArchitecture, text: ""},
+		{role: RoleArchReviewer, text: ""},
 	}
 	if out := mergeSpecialistFindings(results); out != "" {
 		t.Errorf("expected empty, got %q", out)
@@ -117,7 +117,7 @@ func TestMergeSpecialistFindings_AllLGTM(t *testing.T) {
 func TestMergeSpecialistFindings_AllNoIssues(t *testing.T) {
 	results := []reviewResult{
 		{role: RoleReviewer, text: "NO_ISSUES"},
-		{role: RoleReviewerArchitecture, text: "NO_ISSUES"},
+		{role: RoleArchReviewer, text: "NO_ISSUES"},
 	}
 	if out := mergeSpecialistFindings(results); out != "" {
 		t.Errorf("expected empty, got %q", out)
@@ -140,7 +140,7 @@ func TestMergeSpecialistFindings_UnparsedFallback(t *testing.T) {
 func TestMergeSpecialistFindings_DedupSameBodyDifferentLines(t *testing.T) {
 	// Same file, same body, different lines → should be grouped into one finding.
 	results := []reviewResult{
-		{role: RoleReviewerIdiomatic, text: strings.Join([]string{
+		{role: RoleCodeReviewer, text: strings.Join([]string{
 			"f_test.go:10 — major — context.Background() in tests",
 			"f_test.go:25 — major — context.Background() in tests",
 			"f_test.go:40 — major — context.Background() in tests",
@@ -163,8 +163,8 @@ func TestMergeSpecialistFindings_DedupSameBodyDifferentLines(t *testing.T) {
 func TestMergeSpecialistFindings_DedupSameBodyDifferentSpecialists(t *testing.T) {
 	// Same file:line:body from two specialists → merged roles.
 	results := []reviewResult{
-		{role: RoleReviewerIdiomatic, text: "a.go:10 — major — missing error check"},
-		{role: RoleReviewerArchitecture, text: "a.go:10 — major — missing error check"},
+		{role: RoleCodeReviewer, text: "a.go:10 — major — missing error check"},
+		{role: RoleArchReviewer, text: "a.go:10 — major — missing error check"},
 	}
 	out := mergeSpecialistFindings(results)
 	lines := countPlanLines(out)
@@ -172,11 +172,11 @@ func TestMergeSpecialistFindings_DedupSameBodyDifferentSpecialists(t *testing.T)
 		t.Errorf("expected 1 merged finding, got %d plan lines:\n%s", lines, out)
 	}
 	// Both roles should appear in the output.
-	if !strings.Contains(out, string(RoleReviewerIdiomatic)) {
-		t.Errorf("expected role %s in output:\n%s", RoleReviewerIdiomatic, out)
+	if !strings.Contains(out, string(RoleCodeReviewer)) {
+		t.Errorf("expected role %s in output:\n%s", RoleCodeReviewer, out)
 	}
-	if !strings.Contains(out, string(RoleReviewerArchitecture)) {
-		t.Errorf("expected role %s in output:\n%s", RoleReviewerArchitecture, out)
+	if !strings.Contains(out, string(RoleArchReviewer)) {
+		t.Errorf("expected role %s in output:\n%s", RoleArchReviewer, out)
 	}
 }
 
@@ -184,19 +184,19 @@ func TestMergeSpecialistFindings_DedupCombined(t *testing.T) {
 	// Same body on multiple lines from multiple specialists → one finding,
 	// merged roles, grouped lines.
 	results := []reviewResult{
-		{role: RoleReviewerIdiomatic, text: strings.Join([]string{
+		{role: RoleCodeReviewer, text: strings.Join([]string{
 			"f.go:10 — major — bad pattern",
 			"f.go:20 — major — bad pattern",
 		}, "\n")},
-		{role: RoleReviewerBestPractice, text: "f.go:10 — major — bad pattern"},
+		{role: RoleArchReviewer, text: "f.go:10 — major — bad pattern"},
 	}
 	out := mergeSpecialistFindings(results)
 	lines := countPlanLines(out)
 	if lines != 1 {
 		t.Errorf("expected 1 combined finding, got %d plan lines:\n%s", lines, out)
 	}
-	if !strings.Contains(out, string(RoleReviewerIdiomatic)) ||
-		!strings.Contains(out, string(RoleReviewerBestPractice)) {
+	if !strings.Contains(out, string(RoleCodeReviewer)) ||
+		!strings.Contains(out, string(RoleArchReviewer)) {
 		t.Errorf("expected both roles in output:\n%s", out)
 	}
 	if !strings.Contains(out, "строки:") {
@@ -222,8 +222,8 @@ func TestMergeSpecialistFindings_DifferentBodiesNotMerged(t *testing.T) {
 func TestMergeSpecialistFindings_SeverityUpgrade(t *testing.T) {
 	// Same finding from two specialists with different severity → keep max (blocker > major).
 	results := []reviewResult{
-		{role: RoleReviewerIdiomatic, text: "a.go:10 — major — race condition"},
-		{role: RoleReviewerSecurity, text: "a.go:10 — blocker — race condition"},
+		{role: RoleCodeReviewer, text: "a.go:10 — major — race condition"},
+		{role: RoleReviewer, text: "a.go:10 — blocker — race condition"},
 	}
 	out := mergeSpecialistFindings(results)
 	lines := countPlanLines(out)

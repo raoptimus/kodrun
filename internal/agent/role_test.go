@@ -20,12 +20,8 @@ func TestTaskLabelForRole_KnownRoles_Successfully(t *testing.T) {
 		{name: "extractor", role: RoleExtractor, want: "Extracting structured plan..."},
 		{name: "structurer", role: RoleStructurer, want: "Converting plan to JSON..."},
 		{name: "response_classifier", role: RoleResponseClassifier, want: "Classifying response..."},
-		{name: "reviewer_rules", role: RoleReviewerRules, want: "Reviewing: project rules & naming"},
-		{name: "reviewer_idiomatic", role: RoleReviewerIdiomatic, want: "Reviewing: language idiomaticity"},
-		{name: "reviewer_best_practice", role: RoleReviewerBestPractice, want: "Reviewing: best practices"},
-		{name: "reviewer_security", role: RoleReviewerSecurity, want: "Reviewing: security"},
-		{name: "reviewer_structure", role: RoleReviewerStructure, want: "Reviewing: structure & layering"},
-		{name: "reviewer_architecture", role: RoleReviewerArchitecture, want: "Reviewing: architecture"},
+		{name: "code_reviewer", role: RoleCodeReviewer, want: "Reviewing file..."},
+		{name: "arch_reviewer", role: RoleArchReviewer, want: "Reviewing architecture..."},
 	}
 
 	for _, tt := range tests {
@@ -43,53 +39,6 @@ func TestTaskLabelForRole_UnknownRole_Successfully(t *testing.T) {
 	got := taskLabelForRole(Role("unknown_role"))
 
 	assert.Equal(t, "Processing task...", got)
-}
-
-func TestReviewerShortLabel_ReviewerRoles_Successfully(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-		role Role
-		want string
-	}{
-		{name: "reviewer_rules", role: RoleReviewerRules, want: "project rules & naming"},
-		{name: "reviewer_idiomatic", role: RoleReviewerIdiomatic, want: "language idiomaticity"},
-		{name: "reviewer_best_practice", role: RoleReviewerBestPractice, want: "best practices"},
-		{name: "reviewer_security", role: RoleReviewerSecurity, want: "security"},
-		{name: "reviewer_structure", role: RoleReviewerStructure, want: "structure & layering"},
-		{name: "reviewer_architecture", role: RoleReviewerArchitecture, want: "architecture"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			got := reviewerShortLabel(tt.role)
-			assert.Equal(t, tt.want, got)
-		})
-	}
-}
-
-func TestReviewerShortLabel_NonReviewerRole_Successfully(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-		role Role
-		want string
-	}{
-		{name: "planner", role: RolePlanner, want: "planner"},
-		{name: "executor", role: RoleExecutor, want: "executor"},
-		{name: "unknown", role: Role("custom"), want: "custom"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			got := reviewerShortLabel(tt.role)
-			assert.Equal(t, tt.want, got)
-		})
-	}
 }
 
 func TestSystemPromptForRole_ContainsAssistantIdentity_Successfully(t *testing.T) {
@@ -216,60 +165,29 @@ func TestSystemPromptForRole_ResponseClassifierContainsSchema_Successfully(t *te
 	assert.Contains(t, got, `"needs_user_action"`)
 }
 
-func TestSpecialistReviewerFocus_AllRoles_Successfully(t *testing.T) {
+func TestReviewChecks_AllCategories_Successfully(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
-		name      string
-		role      Role
-		wantFocus string
-	}{
-		{name: "rules", role: RoleReviewerRules, wantFocus: "project rules and naming conventions"},
-		{name: "idiomatic", role: RoleReviewerIdiomatic, wantFocus: "English idiomaticity"},
-		{name: "best_practice", role: RoleReviewerBestPractice, wantFocus: "best practices"},
-		{name: "security", role: RoleReviewerSecurity, wantFocus: "security"},
-		{name: "structure", role: RoleReviewerStructure, wantFocus: "package/module structure"},
-		{name: "architecture", role: RoleReviewerArchitecture, wantFocus: "architectural invariants"},
-	}
+	checks := reviewChecks("en")
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			focus, rules := specialistReviewerFocus(tt.role, "en")
-			assert.Contains(t, focus, tt.wantFocus)
-			assert.NotEmpty(t, rules)
-		})
+	expectedKeys := []string{"rules", "idiomatic", "best_practice", "security", "structure", "architecture"}
+	for _, key := range expectedKeys {
+		assert.NotEmpty(t, checks[key], "expected non-empty checks for %q", key)
 	}
 }
 
-func TestSpecialistReviewerFocus_UnknownRole_Successfully(t *testing.T) {
+func TestReviewChecks_RussianLanguage_Successfully(t *testing.T) {
 	t.Parallel()
 
-	focus, rules := specialistReviewerFocus(Role("unknown"), "en")
+	checks := reviewChecks("ru")
 
-	assert.Equal(t, "code quality", focus)
-	assert.Nil(t, rules)
-}
-
-func TestSpecialistReviewerFocus_RussianLanguage_Successfully(t *testing.T) {
-	t.Parallel()
-
-	focus, _ := specialistReviewerFocus(RoleReviewerIdiomatic, "ru")
-
-	assert.Contains(t, focus, "Russian")
-}
-
-func TestSpecialistReviewerRoles_ContainsAllRoles_Successfully(t *testing.T) {
-	t.Parallel()
-
-	expected := []Role{
-		RoleReviewerRules,
-		RoleReviewerIdiomatic,
-		RoleReviewerBestPractice,
-		RoleReviewerSecurity,
-		RoleReviewerStructure,
-		RoleReviewerArchitecture,
+	// Idiomatic checks should mention Russian.
+	var hasRussian bool
+	for _, c := range checks["idiomatic"] {
+		if contains(c, "Russian") {
+			hasRussian = true
+			break
+		}
 	}
-
-	assert.Equal(t, expected, SpecialistReviewerRoles)
+	assert.True(t, hasRussian)
 }

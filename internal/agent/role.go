@@ -16,16 +16,11 @@ const (
 	RoleStructurer         Role = "structurer"
 	RoleResponseClassifier Role = "response_classifier"
 
-	// Specialised reviewer sub-roles used by the parallel /code-review
-	// pipeline. Each focuses on a single review axis so that its system
-	// prompt stays small and its context is not diluted by unrelated
-	// concerns. Their outputs are merged by RoleExtractor.
-	RoleReviewerRules        Role = "reviewer_rules"
-	RoleReviewerIdiomatic    Role = "reviewer_idiomatic"
-	RoleReviewerBestPractice Role = "reviewer_best_practice"
-	RoleReviewerSecurity     Role = "reviewer_security"
-	RoleReviewerStructure    Role = "reviewer_structure"
-	RoleReviewerArchitecture Role = "reviewer_architecture"
+	// Code review roles. The orchestrator pre-loads all context (file content,
+	// RAG snippets, dependency signatures) so these roles do not require
+	// tool-calling — they only analyse.
+	RoleCodeReviewer Role = "code_reviewer"
+	RoleArchReviewer Role = "arch_reviewer"
 )
 
 // taskLabelForRole returns a short human-readable label describing what a
@@ -45,39 +40,12 @@ func taskLabelForRole(role Role) string {
 		return "Converting plan to JSON..."
 	case RoleResponseClassifier:
 		return "Classifying response..."
-	case RoleReviewerRules:
-		return "Reviewing: project rules & naming"
-	case RoleReviewerIdiomatic:
-		return "Reviewing: language idiomaticity"
-	case RoleReviewerBestPractice:
-		return "Reviewing: best practices"
-	case RoleReviewerSecurity:
-		return "Reviewing: security"
-	case RoleReviewerStructure:
-		return "Reviewing: structure & layering"
-	case RoleReviewerArchitecture:
-		return "Reviewing: architecture"
+	case RoleCodeReviewer:
+		return "Reviewing file..."
+	case RoleArchReviewer:
+		return "Reviewing architecture..."
 	}
 	return "Processing task..."
-}
-
-func reviewerShortLabel(role Role) string {
-	label := taskLabelForRole(role)
-	if after, ok := strings.CutPrefix(label, "Reviewing: "); ok {
-		return after
-	}
-	return string(role)
-}
-
-// SpecialistReviewerRoles is the default ordered list of reviewer sub-roles
-// used by the parallel /code-review pipeline.
-var SpecialistReviewerRoles = []Role{
-	RoleReviewerRules,
-	RoleReviewerIdiomatic,
-	RoleReviewerBestPractice,
-	RoleReviewerSecurity,
-	RoleReviewerStructure,
-	RoleReviewerArchitecture,
 }
 
 // systemPromptForRole generates a role-specific system prompt for a sub-agent.
@@ -255,9 +223,11 @@ func systemPromptForRole(role Role, lang, ruleCatalog string, toolNames []string
 		b.WriteString("- Preserve the order and intent of the original plan exactly. Do not invent new work.\n")
 		b.WriteString("- Output ONLY the JSON object. No comments, no markdown, no trailing text.\n")
 
-	case RoleReviewerRules, RoleReviewerIdiomatic, RoleReviewerBestPractice,
-		RoleReviewerSecurity, RoleReviewerStructure, RoleReviewerArchitecture:
-		b.WriteString(specialistReviewerPrompt(role, lang, ragEnabled, snippetsEnabled))
+	case RoleCodeReviewer:
+		b.WriteString(codeReviewerPrompt(lang))
+
+	case RoleArchReviewer:
+		b.WriteString(archReviewerPrompt(lang))
 
 	case RoleResponseClassifier:
 		b.WriteString("You are the RESPONSE CLASSIFIER agent.\n")
@@ -285,117 +255,126 @@ func systemPromptForRole(role Role, lang, ruleCatalog string, toolNames []string
 	return b.String()
 }
 
-// specialistReviewerPrompt returns the body of the system prompt for one of
-// the focused reviewer sub-roles used by the parallel /code-review pipeline.
-// The common header (assistant identity, language, rule catalog) is written
-// by the caller (systemPromptForRole).
-func specialistReviewerPrompt(role Role, lang string, ragEnabled, snippetsEnabled bool) string {
-	var b strings.Builder
-
-	focus, rules := specialistReviewerFocus(role, lang)
-
-	b.WriteString("You are a SPECIALIST REVIEWER sub-agent.\n")
-	fmt.Fprintf(&b, "Your ONLY focus: %s.\n", focus)
-	b.WriteString("You are one of several parallel reviewers; another specialist covers every other aspect.\n")
-	b.WriteString("Do NOT comment on anything outside your focus — even if you notice issues there.\n\n")
-
-	b.WriteString("What to check:\n")
-	for _, r := range rules {
-		b.WriteString("- ")
-		b.WriteString(r)
-		b.WriteByte('\n')
-	}
-	b.WriteByte('\n')
-
-	b.WriteString("TOOLS AVAILABLE TO YOU: `file_stat(path)` returns file metadata (size, line count) without reading contents; `read_file(path, offset, limit)` reads a file with optional pagination; `go_structure(path)` shows file/package outline (types, functions, constants with line numbers) without reading full bodies — use it to understand structure before read_file; `list_dir(path)` lists a directory; `grep(pattern)` searches repository content; `search_docs(query)` searches the RAG knowledge base; `read_changed_files()` returns the unified diff for all changed files (optional, use if you need diff context). You MUST use these tools — they are not optional.\n\n")
-
-	b.WriteString("MANDATORY WORKFLOW (no exceptions — follow in order):\n")
-	b.WriteString("1. STAT FIRST. Your VERY FIRST action MUST be to call `file_stat(path)` on every file listed in the task. This tells you each file's size and line count without consuming context.\n")
-	b.WriteString("2. READ SMART. After stat results arrive, read each file:\n")
-	b.WriteString("   - Files with total_lines ≤ 200: call `read_file(path)` to read the entire file.\n")
-	b.WriteString("   - Files with total_lines > 200: call `read_file(path, offset, limit)` to read ONLY the changed regions (line numbers are in the diff). Use a margin of ±30 lines around each changed hunk for context.\n")
-	b.WriteString("3. Only after you have read ALL listed files (or relevant sections) may you analyze and produce findings.\n")
-	b.WriteString("4. If no files are listed in the task or all files are empty, output exactly `NO_ISSUES` and stop immediately. Do NOT call any other tools.\n")
-	b.WriteString("5. Outputting `NO_ISSUES` without first calling `file_stat` + `read_file` on every listed file is FORBIDDEN and counts as a failure.\n")
-	b.WriteString("6. If a file read fails or errors, note it and continue with the remaining files; do not invent findings.\n")
-	b.WriteString("7. A finding on a file you did not read is a hallucination and MUST NOT appear in your output.\n\n")
-
-	b.WriteString("Output format (STRICT):\n")
-	b.WriteString("- For every real issue, write one line: `path/to/file:LINE — SEVERITY — short description`.\n")
-	b.WriteString("- SEVERITY ∈ {blocker, major, minor}. No prose outside these lines.\n")
-	b.WriteString("- If you find nothing in your focus area, output exactly: `NO_ISSUES`.\n")
-	b.WriteString("- Be strict: flag only real issues in your focus, not style preferences or speculation.\n")
-	b.WriteString("- When a correct implementation of the flagged pattern exists elsewhere in the project, append on the next line: EXAMPLE: path/to/file.go:LINE — reason. This helps the executor see the correct pattern.\n")
-	b.WriteString("- Do NOT propose code fixes or diffs — another agent will consolidate findings.\n")
-	b.WriteString("- Do NOT produce Summary / Verdict / Cross-cutting sections — those belong to the aggregator, not to you.\n")
-	fmt.Fprintf(&b, "- Write descriptions in %s.\n", langName(lang))
-
-	if ragEnabled {
-		b.WriteString("\nProject rules and conventions are pre-fetched in the task context ([MANDATORY PROJECT RULES], [CODE TEMPLATES], and any language standards block present).\n")
-		b.WriteString("Treat them as REQUIREMENTS when they apply to your focus area. You may call search_docs for additional targeted lookups.\n")
-	} else if snippetsEnabled {
-		b.WriteString("\nBefore reviewing, call snippets(paths=[<changed files>]) to load code conventions relevant to your focus area.\n")
-	}
-
-	return b.String()
-}
-
-// specialistReviewerFocus returns the short focus label and the list of
-// concrete, language-agnostic checks for a specialist reviewer role. The
-// wording intentionally avoids language-specific APIs; the idiomaticity
-// specialist is the only one that pivots on the detected project language.
-func specialistReviewerFocus(role Role, lang string) (focus string, tools []string) {
+// reviewChecks returns named sets of review checks used by code and
+// architecture reviewer prompts.
+func reviewChecks(lang string) map[string][]string {
 	ln := langName(lang)
-	switch role {
-	case RoleReviewerRules:
-		return "project rules and naming conventions", []string{
+	return map[string][]string{
+		"rules": {
 			"Violations of rules under .kodrun/rules/* and any pre-fetched [MANDATORY PROJECT RULES].",
 			"Naming conventions for the project's language: identifiers, getters, error types, interfaces, files.",
 			"Error reporting follows the project's chosen helper/style (wrapping, sentinels, error types).",
 			"Public API shape matches project conventions (exported vs internal, argument order, return values).",
 			"Package/module-level conventions (comment style, file layout, documentation).",
-		}
-	case RoleReviewerIdiomatic:
-		return fmt.Sprintf("%s idiomaticity", ln), []string{
+		},
+		"idiomatic": {
 			fmt.Sprintf("Idiomatic %s: standard patterns, early returns, proper use of language primitives.", ln),
 			"Prefer language/standard-library features over hand-rolled equivalents.",
 			"Appropriate use of abstractions (interfaces, traits, protocols, generics) — not over- nor under-used.",
 			"Avoid anti-patterns: unnecessary concurrency, reflection/meta-programming when not needed, premature generalisation.",
 			fmt.Sprintf("Code that would make an experienced %s reviewer pause or rewrite.", ln),
-		}
-	case RoleReviewerBestPractice:
-		return "best practices: error handling, resources, performance", []string{
+		},
+		"best_practice": {
 			"Errors are checked, enriched with context, and never silently swallowed.",
 			"Resource handling: deterministic cleanup, context/cancellation propagation, no goroutine/task/channel leaks.",
 			"Performance footguns: unbounded allocations in hot paths, O(n^2) where O(n) suffices, unnecessary copies.",
 			"Concurrency correctness: data races, missing synchronisation, incorrect use of primitives.",
 			"Logging hygiene: no secrets, appropriate levels, structured fields where applicable.",
-		}
-	case RoleReviewerSecurity:
-		return "security", []string{
+		},
+		"security": {
 			"Input validation at every trust boundary (CLI args, HTTP/RPC handlers, file paths from users).",
 			"No secrets in code, logs, or error messages.",
 			"Injection risks: SQL, shell/command, template, header, log — only safe APIs / parameterised queries.",
 			"Path traversal: reject `..` and absolute paths that escape the working directory.",
 			"Cryptography: stdlib only, no homegrown crypto, secure random source, no broken algorithms (MD5/SHA1 for security, DES, etc.).",
 			"Authentication / authorisation checks are present where required and cannot be bypassed.",
-		}
-	case RoleReviewerStructure:
-		return "package/module structure and dependency boundaries", []string{
+		},
+		"structure": {
 			"New files are placed in the correct package/module/layer per project layout.",
 			"Package responsibilities stay cohesive; no unrelated concerns bundled together.",
 			"Dependency directions respect documented layers (no cycles, no inward→outward imports).",
 			"Public vs internal symbols: exported surface kept minimal; internal boundaries respected.",
 			"No duplication of existing utilities — flag cases where an existing helper should be reused.",
-		}
-	case RoleReviewerArchitecture:
-		return "architectural invariants", []string{
+		},
+		"architecture": {
 			"Changes fit the documented architecture (AGENTS.md, architecture/overview RAG chunks).",
 			"Forbidden cross-layer dependencies, skipping abstractions, leaking implementation details upward.",
 			"Missing or mis-placed components (e.g. business logic in transport layer, transport in domain).",
 			"Impact on system-wide concerns: transactions, error propagation across layers, extensibility points.",
 			"Whether the change introduces architectural drift that should be discussed before merging.",
+		},
+	}
+}
+
+// codeReviewerPrompt returns the system prompt body for the per-file code
+// reviewer. All context is pre-loaded by the orchestrator — no tool-calling.
+func codeReviewerPrompt(lang string) string {
+	var b strings.Builder
+	ln := langName(lang)
+
+	b.WriteString("You are a STRICT CODE REVIEWER.\n")
+	b.WriteString("The file content, project conventions, and dependency signatures are provided in the task.\n")
+	b.WriteString("You do NOT need to call any tools — everything you need is already included.\n\n")
+
+	b.WriteString("IMPORTANT — Technology scope:\n")
+	b.WriteString("If a convention or template mentions a technology, framework, or library that is NOT present in the file's imports or dependency signatures, SKIP that convention entirely. Only apply conventions for technologies the code actually uses.\n\n")
+
+	b.WriteString("Focus areas (ALL apply — check every one):\n")
+
+	checks := reviewChecks(lang)
+	for _, key := range []string{"rules", "idiomatic", "best_practice", "security"} {
+		for _, c := range checks[key] {
+			b.WriteString("- ")
+			b.WriteString(c)
+			b.WriteByte('\n')
 		}
 	}
-	return "code quality", nil
+	b.WriteByte('\n')
+
+	b.WriteString("Output format (STRICT):\n")
+	b.WriteString("- For every real issue: `path/to/file:LINE — SEVERITY — short description — FIX: concrete fix suggestion`.\n")
+	b.WriteString("- SEVERITY ∈ {blocker, major, minor}. No prose outside these lines.\n")
+	b.WriteString("- If you find nothing, output exactly: `NO_ISSUES`.\n")
+	b.WriteString("- Be strict: flag only real issues, not style preferences or speculation.\n")
+	b.WriteString("- Do NOT produce Summary / Verdict / Cross-cutting sections.\n")
+	fmt.Fprintf(&b, "- Write descriptions in %s.\n", ln)
+
+	return b.String()
+}
+
+// archReviewerPrompt returns the system prompt body for the project-wide
+// architecture reviewer. Receives go_structure output for all packages — no
+// file contents, no tool-calling.
+func archReviewerPrompt(lang string) string {
+	var b strings.Builder
+	ln := langName(lang)
+
+	b.WriteString("You are an ARCHITECTURE REVIEWER.\n")
+	b.WriteString("You receive the structural outline (types, functions, interfaces) of every package in the project.\n")
+	b.WriteString("You do NOT need to call any tools — the full project structure is provided.\n\n")
+
+	b.WriteString("IMPORTANT — Technology scope:\n")
+	b.WriteString("If a convention or template mentions a technology, framework, or library that is NOT present in the project's imports, SKIP that convention entirely. Only apply conventions for technologies the project actually uses.\n\n")
+
+	b.WriteString("Focus areas:\n")
+
+	checks := reviewChecks(lang)
+	for _, key := range []string{"structure", "architecture"} {
+		for _, c := range checks[key] {
+			b.WriteString("- ")
+			b.WriteString(c)
+			b.WriteByte('\n')
+		}
+	}
+	b.WriteByte('\n')
+
+	b.WriteString("Output format (STRICT):\n")
+	b.WriteString("- For every real issue: `path/to/package — SEVERITY — short description — FIX: concrete suggestion`.\n")
+	b.WriteString("- SEVERITY ∈ {blocker, major, minor}. No prose outside these lines.\n")
+	b.WriteString("- If you find nothing, output exactly: `NO_ISSUES`.\n")
+	b.WriteString("- Focus on structural and architectural issues only — not code-level bugs.\n")
+	b.WriteString("- Do NOT produce Summary / Verdict / Cross-cutting sections.\n")
+	fmt.Fprintf(&b, "- Write descriptions in %s.\n", ln)
+
+	return b.String()
 }

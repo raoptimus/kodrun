@@ -82,6 +82,62 @@ func TestIsForbiddenDir(t *testing.T) {
 	}
 }
 
+func TestHasHiddenPathComponent(t *testing.T) {
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{".kodrun/history", true},
+		{".git/config", true},
+		{".git/hooks/pre-commit", true},
+		{"src/.hidden/main.go", true},
+		{"foo/.bar/baz", true},
+		{".kodrun.yaml", false},
+		{".env", false},
+		{"src/main.go", false},
+		{"internal/tools/file.go", false},
+		{".", false},
+		{"file.txt", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			if got := HasHiddenPathComponent(tt.path); got != tt.want {
+				t.Errorf("HasHiddenPathComponent(%q) = %v, want %v", tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsPathBlocked(t *testing.T) {
+	patterns := []string{"*.env", "*.pem"}
+
+	tests := []struct {
+		name    string
+		path    string
+		blocked bool
+	}{
+		{"forbidden by pattern", "prod.env", true},
+		{"forbidden by pattern pem", "server.pem", true},
+		{"hidden dir path", ".git/config", true},
+		{"hidden dir nested", "src/.secret/data.go", true},
+		{"normal file", "src/main.go", false},
+		{"hidden file not dir", ".kodrun.yaml", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reason := IsPathBlocked(context.Background(), tt.path, "/work/"+tt.path, patterns)
+			if tt.blocked && reason == "" {
+				t.Errorf("IsPathBlocked(%q) expected blocked, got empty", tt.path)
+			}
+			if !tt.blocked && reason != "" {
+				t.Errorf("IsPathBlocked(%q) expected allowed, got %q", tt.path, reason)
+			}
+		})
+	}
+}
+
 func TestIsForbidden(t *testing.T) {
 	patterns := []string{"*.env", ".git/**"}
 

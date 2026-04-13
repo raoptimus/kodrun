@@ -18,6 +18,7 @@ type Snippet struct {
 	Description  string            `yaml:"description"`
 	Tags         []string          `yaml:"tags"`
 	Paths        []string          `yaml:"paths"`
+	Requires     []string          `yaml:"requires"`
 	Related      []string          `yaml:"related"`
 	Placeholders map[string]string `yaml:"placeholders"`
 	Lang         string            `yaml:"lang"`

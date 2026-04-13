@@ -161,7 +161,7 @@ func TestDeleteFileTool_ResolvePaths_EmptyPath_Successfully(t *testing.T) {
 
 func TestCreateDirTool_Execute_CreatesDir_Successfully(t *testing.T) {
 	dir := t.TempDir()
-	tool := NewCreateDirTool(dir)
+	tool := NewCreateDirTool(dir, nil)
 
 	result, err := tool.Execute(context.Background(), map[string]any{"path": "sub/deep/dir"})
 
@@ -174,7 +174,7 @@ func TestCreateDirTool_Execute_CreatesDir_Successfully(t *testing.T) {
 }
 
 func TestCreateDirTool_Execute_EmptyPath_Failure(t *testing.T) {
-	tool := NewCreateDirTool(t.TempDir())
+	tool := NewCreateDirTool(t.TempDir(), nil)
 
 	_, err := tool.Execute(context.Background(), map[string]any{})
 

@@ -327,6 +327,40 @@ func (h *Handler) Get{{EntityName}}(w http.ResponseWriter, r *http.Request) {
 }
 ```
 
+#### Front matter fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `description` | string | yes | Short description of the snippet |
+| `tags` | string[] | no | Tags for filtering and search |
+| `requires` | string[] | no | Technologies the project must use for this snippet to apply (see below) |
+| `paths` | string[] | no | Glob patterns for automatic matching by file path |
+| `lang` | string | no | Language identifier (`go`, `python`, `protobuf`, etc.) |
+| `placeholders` | map | no | Named placeholders to be replaced in the template |
+| `related` | string[] | no | Names of related snippets |
+
+#### Technology filtering with `requires`
+
+Snippets can declare which technologies the project must use for the snippet to be relevant. If the project does not use a required technology, the snippet is excluded from RAG indexing and the `snippets()` tool results.
+
+Detected technologies (for Go projects, based on `go.mod` dependencies and `.proto` files):
+
+`grpc`, `http`, `postgres`, `clickhouse`, `mongodb`, `redis`, `kafka`
+
+Example — a gRPC server snippet that is only relevant to projects using gRPC:
+
+```markdown
+---
+description: "Template for gRPC server setup"
+tags: [app, grpc, server]
+requires: [grpc]
+paths: ["**/app/**/application.go"]
+lang: go
+---
+```
+
+Snippets without `requires` are always included regardless of the project's tech stack.
+
 ### Pinned architecture overviews
 
 Snippets tagged with any of `architecture`, `overview` or `structure` are **pinned verbatim at the top of the `/code-review` RAG prefetch block**, regardless of semantic ranking. Use this for a project-wide map:

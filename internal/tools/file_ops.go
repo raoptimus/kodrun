@@ -66,8 +66,8 @@ func (t *DeleteFileTool) Execute(ctx context.Context, params map[string]any) (*T
 		return nil, fmt.Errorf("resolve path: %w", err)
 	}
 
-	if IsForbidden(ctx, path, t.forbiddenPatterns) || IsForbidden(ctx, resolved, t.forbiddenPatterns) {
-		return nil, &ToolError{Msg: fmt.Sprintf("access to %s is forbidden", path)}
+	if reason := IsPathBlocked(ctx, path, resolved, t.forbiddenPatterns); reason != "" {
+		return nil, &ToolError{Msg: reason}
 	}
 
 	if err := os.Remove(resolved); err != nil {
@@ -82,12 +82,13 @@ func (t *DeleteFileTool) Execute(ctx context.Context, params map[string]any) (*T
 
 // CreateDirTool creates a directory.
 type CreateDirTool struct {
-	workDir string
+	workDir           string
+	forbiddenPatterns []string
 }
 
 // NewCreateDirTool creates a new create_dir tool.
-func NewCreateDirTool(workDir string) *CreateDirTool {
-	return &CreateDirTool{workDir: workDir}
+func NewCreateDirTool(workDir string, forbiddenPatterns []string) *CreateDirTool {
+	return &CreateDirTool{workDir: workDir, forbiddenPatterns: forbiddenPatterns}
 }
 
 func (t *CreateDirTool) Name() string        { return "create_dir" }
@@ -112,6 +113,10 @@ func (t *CreateDirTool) Execute(ctx context.Context, params map[string]any) (*To
 	resolved, err := SafePath(ctx, t.workDir, path)
 	if err != nil {
 		return nil, fmt.Errorf("resolve path: %w", err)
+	}
+
+	if reason := IsPathBlocked(ctx, path, resolved, t.forbiddenPatterns); reason != "" {
+		return nil, &ToolError{Msg: reason}
 	}
 
 	if err := os.MkdirAll(resolved, dirPermission); err != nil {
@@ -199,9 +204,11 @@ func (t *MoveFileTool) Execute(ctx context.Context, params map[string]any) (*Too
 		return nil, fmt.Errorf("resolve destination path: %w", err)
 	}
 
-	if IsForbidden(ctx, from, t.forbiddenPatterns) || IsForbidden(ctx, to, t.forbiddenPatterns) ||
-		IsForbidden(ctx, resolvedFrom, t.forbiddenPatterns) || IsForbidden(ctx, resolvedTo, t.forbiddenPatterns) {
-		return nil, &ToolError{Msg: "access to path is forbidden"}
+	if reason := IsPathBlocked(ctx, from, resolvedFrom, t.forbiddenPatterns); reason != "" {
+		return nil, &ToolError{Msg: reason}
+	}
+	if reason := IsPathBlocked(ctx, to, resolvedTo, t.forbiddenPatterns); reason != "" {
+		return nil, &ToolError{Msg: reason}
 	}
 
 	// Ensure the destination directory exists.

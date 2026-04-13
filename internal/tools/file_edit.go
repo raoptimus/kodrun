@@ -74,8 +74,8 @@ func (t *EditFileTool) Execute(ctx context.Context, params map[string]any) (*Too
 		return nil, fmt.Errorf("resolve path: %w", err)
 	}
 
-	if IsForbidden(ctx, path, t.forbiddenPatterns) || IsForbidden(ctx, resolved, t.forbiddenPatterns) {
-		return nil, &ToolError{Msg: fmt.Sprintf("access to %s is forbidden", path)}
+	if reason := IsPathBlocked(ctx, path, resolved, t.forbiddenPatterns); reason != "" {
+		return nil, &ToolError{Msg: reason}
 	}
 
 	fi, err := os.Stat(resolved)

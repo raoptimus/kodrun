@@ -19,7 +19,7 @@ func RegisterCoreTools(reg *Registry, workDir string, forbidden []string, maxRea
 	reg.Register(NewFindFilesTool(workDir, forbidden))
 	reg.Register(NewGrepTool(workDir, forbidden))
 	reg.Register(NewDeleteFileTool(workDir, forbidden))
-	reg.Register(NewCreateDirTool(workDir))
+	reg.Register(NewCreateDirTool(workDir, forbidden))
 	reg.Register(NewMoveFileTool(workDir, forbidden))
 	reg.Register(NewReadChangedFilesTool(workDir, langState))
 	reg.Register(NewGitStatusTool(workDir))
@@ -58,6 +58,8 @@ func RegisterAllTools(_ context.Context, reg *Registry, workDir string, forbidde
 		reg.Register(NewRuleTool(loader, scope))
 	}
 	if snippetLoader != nil && useSnippetTool && !ragEnabled {
-		reg.Register(NewSnippetTool(snippetLoader))
+		st := NewSnippetTool(snippetLoader)
+		st.SetTechStack(langState.EnsureTechDetected().Strings())
+		reg.Register(st)
 	}
 }

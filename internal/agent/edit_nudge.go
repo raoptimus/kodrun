@@ -3,6 +3,9 @@ package agent
 import (
 	"regexp"
 	"strings"
+
+	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/tools"
 )
 
 // numberedListItem matches a top-level numbered list bullet at the start of
@@ -28,6 +31,12 @@ const maxEditNudges = 2
 // without having called any tools first.
 const maxPlanToolNudges = 1
 
+// maxReadFileNudges caps how many times a single Send() will nudge the
+// model to call read_file after it called file_stat but stopped without
+// reading any file contents. Part of the guided-flow mechanism for weak
+// models that execute only one workflow step per turn.
+const maxReadFileNudges = 1
+
 // maxPlanBlocked caps consecutive iterations in plan mode where every tool
 // call was blocked (model hallucinated write tools). After this many
 // iterations the agent stops early to avoid wasting the iteration budget.
@@ -48,6 +57,135 @@ var planMarkerWords = []string{
 	"## plan",
 	"## план",
 }
+
+// textToolCallKeys are the known key names that appear in text-form tool calls.
+// The order matters: we scan for these in sequence to delimit multiline values.
+var textToolCallKeys = []string{"path:", "old_str:", "new_str:", "content:"}
+
+// parseTextToolCall attempts to parse a model response that contains an
+// edit_file or write_file tool call written as plain text instead of a JSON
+// tool call. Returns nil if the pattern is not detected.
+//
+// Recognised format (lines are trimmed):
+//
+//	edit_file
+//	path: <value>
+//	old_str: <value — may span multiple lines>
+//	new_str: <value — may span multiple lines>
+func parseTextToolCall(content string) *ollama.ToolCall {
+	lines := strings.Split(content, "\n")
+
+	// Find the tool name line.
+	toolName := ""
+	startIdx := -1
+	for i, line := range lines {
+		t := strings.TrimSpace(line)
+		if t == toolNameEditFile || t == toolNameWriteFile {
+			toolName = t
+			startIdx = i + 1
+			break
+		}
+	}
+	if toolName == "" || startIdx >= len(lines) {
+		return nil
+	}
+
+	// Parse key: value pairs, collecting multiline values.
+	kv := make(map[string]string)
+	var currentKey string
+	var currentVal strings.Builder
+
+	flushKey := func() {
+		if currentKey != "" {
+			kv[currentKey] = strings.TrimRight(currentVal.String(), "\n")
+			currentVal.Reset()
+		}
+	}
+
+	for i := startIdx; i < len(lines); i++ {
+		line := lines[i]
+		trimmed := strings.TrimSpace(line)
+
+		// Check if this line starts a new key.
+		foundKey := ""
+		for _, k := range textToolCallKeys {
+			if strings.HasPrefix(trimmed, k) {
+				foundKey = k
+				break
+			}
+		}
+
+		if foundKey != "" {
+			flushKey()
+			currentKey = strings.TrimSuffix(foundKey, ":")
+			val := strings.TrimSpace(strings.TrimPrefix(trimmed, foundKey))
+			currentVal.WriteString(val)
+		} else if currentKey != "" {
+			// Continuation of the current multiline value.
+			if currentVal.Len() > 0 {
+				currentVal.WriteByte('\n')
+			}
+			currentVal.WriteString(line)
+		}
+	}
+	flushKey()
+
+	path := kv["path"]
+	if path == "" {
+		return nil
+	}
+
+	args := map[string]any{"path": path}
+
+	switch toolName {
+	case toolNameEditFile:
+		oldStr, hasOld := kv["old_str"]
+		newStr, hasNew := kv["new_str"]
+		if !hasOld && !hasNew {
+			return nil
+		}
+		if hasOld {
+			args["old_str"] = oldStr
+		}
+		if hasNew {
+			args["new_str"] = newStr
+		}
+	case toolNameWriteFile:
+		c, has := kv["content"]
+		if !has {
+			return nil
+		}
+		args["content"] = c
+	}
+
+	return &ollama.ToolCall{
+		ID: "synth_0",
+		Function: ollama.ToolCallFunc{
+			Name:      toolName,
+			Arguments: args,
+		},
+	}
+}
+
+// ExtractDiffFromText attempts to extract old_str/new_str from a text-form
+// edit_file tool call and returns a SimpleDiff string for TUI rendering.
+// Returns "" if the content does not match the pattern.
+func ExtractDiffFromText(content string) string {
+	tc := parseTextToolCall(content)
+	if tc == nil || tc.Function.Name != toolNameEditFile {
+		return ""
+	}
+	oldStr := stringFromMap(tc.Function.Arguments, "old_str")
+	newStr := stringFromMap(tc.Function.Arguments, "new_str")
+	path := stringFromMap(tc.Function.Arguments, "path")
+	if oldStr == "" && newStr == "" {
+		return ""
+	}
+	return tools.SimpleDiff(oldStr, newStr, path, editDiffMaxLines)
+}
+
+// editDiffMaxLines limits the number of diff lines shown for text-form tool calls.
+const editDiffMaxLines = 30
 
 // looksLikeMarkdownPlan reports whether content is shaped like a markdown
 // plan/analysis the model produced instead of calling tools. The intent is

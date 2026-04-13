@@ -42,12 +42,19 @@ type matchResponse struct {
 
 // SnippetTool exposes project snippets to the agent.
 type SnippetTool struct {
-	loader *snippets.Loader
+	loader    *snippets.Loader
+	techStack []string
 }
 
 // NewSnippetTool creates a new snippets tool.
 func NewSnippetTool(loader *snippets.Loader) *SnippetTool {
 	return &SnippetTool{loader: loader}
+}
+
+// SetTechStack sets the detected project technology stack for filtering
+// snippets with requires.
+func (t *SnippetTool) SetTechStack(stack []string) {
+	t.techStack = stack
 }
 
 func (t *SnippetTool) Name() string { return "snippets" }
@@ -85,7 +92,7 @@ func (t *SnippetTool) Execute(_ context.Context, params map[string]any) (*ToolRe
 		action = snippetActionMatch
 	}
 
-	all := t.loader.Snippets()
+	all := filterByRequires(t.loader.Snippets(), t.techStack)
 	switch action {
 	case snippetActionMatch:
 		return t.match(all, params)
@@ -235,6 +242,36 @@ func buildNoMatchHint(all []snippets.Snippet, paths, tags []string, tagMode stri
 		return "No matching snippets found. Use snippets(action=\"list\") or snippets(action=\"tags\") to explore."
 	}
 	return strings.Join(parts, " ")
+}
+
+// filterByRequires removes snippets whose Requires are not satisfied by the
+// detected project tech stack. A nil techStack means detection was not
+// configured — all snippets are returned. A non-nil (even empty) techStack
+// means detection ran and snippets with unmet requires are excluded.
+func filterByRequires(all []snippets.Snippet, techStack []string) []snippets.Snippet {
+	if techStack == nil {
+		return all
+	}
+
+	techSet := make(map[string]bool, len(techStack))
+	for _, t := range techStack {
+		techSet[t] = true
+	}
+
+	filtered := make([]snippets.Snippet, 0, len(all))
+	for i := range all {
+		met := true
+		for _, r := range all[i].Requires {
+			if !techSet[r] {
+				met = false
+				break
+			}
+		}
+		if met {
+			filtered = append(filtered, all[i])
+		}
+	}
+	return filtered
 }
 
 func buildMatchTip(results []matchResult) string {

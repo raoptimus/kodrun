@@ -6,12 +6,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime/debug"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/pkg/errors"
@@ -38,6 +36,9 @@ const (
 	extractorMaxIter      = 5   // max iterations for extractor sub-agent
 	severityMinor         = 2   // severity rank for minor findings
 	severityUnknown       = 3   // severity rank for unrecognized severity
+
+	perfStatusOK  = "ok"
+	perfStatusErr = "err"
 )
 
 // Orchestrator coordinates sub-agents in a Plan → Execute → Review pipeline.
@@ -82,6 +83,7 @@ type Orchestrator struct {
 	maxReplans        int
 	specialistTimeout time.Duration
 	autoCommit        bool
+	think             bool
 	verbose           bool
 
 	cachedProjectFiles string
@@ -137,6 +139,10 @@ type OrchestratorConfig struct {
 	// AutoCommit controls whether the executor may call git_commit.
 	// When false, git_commit is disabled for all sub-agents.
 	AutoCommit bool
+	// Think enables thinking mode for planners and reviewers.
+	// When false, planners and reviewers skip the thinking phase,
+	// which speeds up inference on slower models.
+	Think bool
 	// Verbose enables per-iteration and per-specialist timing diagnostics.
 	Verbose bool
 	// MaxIterations is the agent loop limit, used for review specialists.
@@ -191,6 +197,7 @@ func NewOrchestrator(
 		maxRevIter:           cfg.MaxIterations,
 		specialistTimeout:    cfg.SpecialistTimeout,
 		autoCommit:           cfg.AutoCommit,
+		think:                cfg.Think,
 		verbose:              cfg.Verbose,
 	}
 	if o.maxRevIter <= 0 {
@@ -391,15 +398,26 @@ func (o *Orchestrator) confirmAndExecute(ctx context.Context, plan, doneMsg stri
 		o.emitPhase("reviewing")
 		o.emit(&Event{Type: EventAgent, Message: "▸ Reviewing changes..."})
 
-		feedback, err := o.runReviewer(ctx, plan, &execStats)
+		reviewCtx := execCtx
+		if o.specialistTimeout > 0 {
+			var cancel context.CancelFunc
+			reviewCtx, cancel = context.WithTimeout(execCtx, o.specialistTimeout)
+			defer cancel()
+		}
+
+		feedback, err := o.runReviewer(reviewCtx, plan, &execStats)
 		if err != nil {
-			return errors.WithMessage(err, "reviewer")
+			if reviewCtx.Err() != nil {
+				o.emit(&Event{Type: EventAgent, Message: "⚠ Post-execute review timed out — skipping."})
+			} else {
+				return errors.WithMessage(err, "reviewer")
+			}
 		}
 
 		// If reviewer found issues, run one more executor pass.
 		if feedback != "" {
 			o.emit(&Event{Type: EventAgent, Message: "▸ Applying review feedback..."})
-			if _, err := o.runExecutor(ctx, feedback, o.confirmFn); err != nil {
+			if _, err := o.runExecutor(execCtx, feedback, o.confirmFn); err != nil {
 				return errors.WithMessage(err, "executor (review fix)")
 			}
 		}
@@ -759,10 +777,9 @@ func (o *Orchestrator) runExecutor(ctx context.Context, plan string, confirmFn C
 	// (and examples, RAG, whitelist) regardless of parallelism settings.
 	structured := o.structurePlan(ctx, plan)
 	if structured != nil && len(structured.Steps) > 0 {
-		parallel := o.maxParallelTasks
-		if parallel < 1 {
-			parallel = 1
-		}
+		// TODO: parallel executor support requires proper TUI multiplexing;
+		// hardcode to 1 until that is implemented.
+		parallel := 1
 		o.emit(&Event{
 			Type:    EventAgent,
 			Message: fmt.Sprintf("Executing plan as DAG: %d steps, max %d parallel", len(structured.Steps), parallel),
@@ -866,19 +883,17 @@ func (o *Orchestrator) newAgent(role Role, maxIter int) *Agent {
 	switch role {
 	case RolePlanner:
 		ag.SetMode(ModePlan)
-		ag.SetThink(true)
+		ag.SetThink(o.think)
 	case RoleExecutor:
 		ag.SetMode(ModeEdit)
 		ag.SetThink(false)
-	case RoleReviewer,
-		RoleReviewerRules,
-		RoleReviewerIdiomatic,
-		RoleReviewerBestPractice,
-		RoleReviewerSecurity,
-		RoleReviewerStructure,
-		RoleReviewerArchitecture:
+	case RoleReviewer:
 		ag.SetMode(ModePlan)
-		ag.SetThink(true)
+		ag.SetThink(o.think)
+	case RoleCodeReviewer, RoleArchReviewer:
+		ag.SetMode(ModePlan)
+		ag.SetThink(o.think)
+		ag.SetToolsDisabled(true)
 	case RoleExtractor:
 		ag.SetMode(ModePlan)
 		ag.SetThink(false) // No thinking — just structured extraction
@@ -1165,198 +1180,6 @@ func (o *Orchestrator) runExtractor(ctx context.Context, rawAnalysis string) (st
 		return strings.TrimSpace(rawAnalysis), nil
 	}
 	return plan, nil
-}
-
-// RunCodeReview runs specialised reviewer sub-agents in parallel, concatenates
-// their reports and normalises them via the extractor into a single plan that
-// is emitted to the user. The task argument is the fully-prepared review
-// prompt (already containing any RAG prefetch and the diff / project context)
-// and is sent to every specialist as-is.
-//
-// Parallelism is bounded by o.maxParallelTasks. When maxParallelTasks <= 1
-// the reviewers run sequentially. If len(roles) == 1 the fan-out degenerates
-// to a single specialist (used by /arch-review).
-func (o *Orchestrator) RunCodeReview(ctx context.Context, task string, roles []Role) error {
-	if len(roles) == 0 {
-		return errors.New("RunCodeReview: no roles provided")
-	}
-
-	o.ensureLanguageDetected()
-
-	reviewStart := time.Now()
-	_ = reviewStart // used in verbose timing below
-
-	cache := tools.NewResultCache()
-	o.reg.WithCache(cache)
-	defer func() {
-		o.reg.WithCache(nil)
-		o.emitCacheStats(cache)
-	}()
-
-	o.emitPhase("reviewing")
-
-	maxPar := o.maxParallelTasks
-	if maxPar < 1 {
-		maxPar = 1
-	}
-	if maxPar > len(roles) {
-		maxPar = len(roles)
-	}
-
-	const reviewGroupID = "code-review"
-	o.emit(&Event{Type: EventGroupStart, GroupID: reviewGroupID, Message: "CodeReview(...)"})
-
-	// Circuit breaker: cancel remaining specialists on first connection error.
-	reviewCtx, reviewCancel := context.WithCancel(ctx)
-	defer reviewCancel()
-
-	results := make([]reviewResult, len(roles))
-	sem := make(chan struct{}, maxPar)
-	var wg sync.WaitGroup
-
-	for i, role := range roles {
-		if reviewCtx.Err() != nil {
-			break
-		}
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(i int, role Role) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			defer func() {
-				if r := recover(); r != nil {
-					results[i] = reviewResult{role: role, err: errors.Errorf("panic: %v\n%s", r, debug.Stack())}
-				}
-			}()
-
-			// Per-specialist timeout prevents a single slow specialist
-			// from blocking the entire review when parallelism is limited.
-			specCtx := reviewCtx
-			if o.specialistTimeout > 0 {
-				var specCancel context.CancelFunc
-				specCtx, specCancel = context.WithTimeout(reviewCtx, o.specialistTimeout)
-				defer specCancel()
-			}
-
-			o.emit(&Event{
-				Type:    EventGroupTitleUpdate,
-				GroupID: reviewGroupID,
-				Message: fmt.Sprintf("CodeReview(%s)", reviewerShortLabel(role)),
-			})
-
-			specStart := time.Now()
-			text, tcCount, agStats, err := o.runReviewerSpecialistInGroup(specCtx, role, task, reviewGroupID)
-			results[i] = reviewResult{role: role, text: text, err: err, duration: time.Since(specStart), stats: agStats, toolCalls: tcCount}
-
-			if err != nil && isConnectionError(err) {
-				o.emit(&Event{Type: EventError, Message: "Ollama unreachable — aborting remaining reviewers."})
-				reviewCancel()
-			}
-		}(i, role)
-	}
-	wg.Wait()
-	reviewWall := time.Since(reviewStart)
-
-	o.emit(&Event{Type: EventGroupEnd, GroupID: reviewGroupID})
-
-	// Emit per-specialist timing when verbose is enabled.
-	if o.verbose {
-		for i := range results {
-			r := &results[i]
-			status := "ok"
-			if r.err != nil {
-				status = "err"
-			}
-			o.emit(&Event{
-				Type: EventAgent,
-				Message: fmt.Sprintf("[perf] specialist=%s wall=%s llm=%s tools=%s iter=%d ctx_peak=%d%% status=%s",
-					reviewerShortLabel(r.role), r.duration.Truncate(time.Millisecond),
-					r.stats.TotalLLMTime.Truncate(time.Millisecond), r.stats.TotalToolTime.Truncate(time.Millisecond),
-					r.stats.Iterations, r.stats.PeakContextPct, status),
-			})
-		}
-		o.emit(&Event{Type: EventAgent, Message: fmt.Sprintf("[perf] review_total=%s parallel=%d", reviewWall.Truncate(time.Millisecond), maxPar)})
-	}
-
-	// If the context was cancelled but some reviewers succeeded, continue
-	// processing their results instead of discarding everything.
-	ctxCancelled := ctx.Err() != nil
-	hasSuccess := false
-	for i := range results {
-		if results[i].err == nil {
-			hasSuccess = true
-			break
-		}
-	}
-	if ctxCancelled && !hasSuccess {
-		return ctx.Err()
-	}
-
-	sections := make([]string, 0, len(results))
-	var failedCount, skippedCount int
-	for i := range results {
-		r := &results[i]
-		if r.err != nil {
-			failedCount++
-			continue
-		}
-		text := strings.TrimSpace(r.text)
-		if text == "" {
-			// Empty response with no error is a silent failure, not "all clear".
-			failedCount++
-			continue
-		}
-		if isNoIssues(text) {
-			if r.toolCalls == 0 {
-				// Model said NO_ISSUES without reading any files — unreliable.
-				skippedCount++
-			}
-			continue
-		}
-		sections = append(sections, fmt.Sprintf("## [%s]\n\n%s", strings.ToUpper(string(r.role)), text))
-	}
-
-	if len(sections) == 0 {
-		switch {
-		case skippedCount > 0:
-			o.emit(&Event{Type: EventAgent, Message: fmt.Sprintf(
-				"⚠ %d reviewer(s) responded without reading files — review is unreliable. Re-run or use a stronger model.", skippedCount)})
-		case failedCount > 0:
-			o.emit(&Event{Type: EventAgent, Message: fmt.Sprintf(
-				"⚠ %d reviewer(s) failed, but no issues found by the rest — treating as LGTM.", failedCount)})
-		default:
-			o.emit(&Event{Type: EventAgent, Message: "LGTM — no issues found."})
-		}
-		o.emit(&Event{Type: EventModeChange, Message: "plan"})
-		o.emit(&Event{Type: EventDone, Message: "Code review completed"})
-		return nil
-	}
-
-	// Merge specialist findings deterministically in Go. Each specialist is
-	// prompted to emit strict `path:LINE — SEVERITY — description` lines, so
-	// we parse them directly instead of sending the concatenated text to
-	// another LLM (extractor), which tends to drop items under aggressive
-	// dedup.
-	o.emit(&Event{Type: EventAgent, Message: "▸ Merging reviewer findings..."})
-	finalPlan := mergeSpecialistFindings(results)
-	if finalPlan == "" {
-		// Fallback: no strict lines parsed — surface this explicitly so the
-		// operator knows why the output looks unstructured, then show raw
-		// concatenated sections so nothing is silently lost.
-		o.emit(&Event{Type: EventAgent, Message: "⚠ Specialists did not emit strict finding lines — showing raw concatenated reports."})
-		finalPlan = strings.Join(sections, "\n\n---\n\n")
-	}
-
-	// Pass merged findings through extractor to group by file.
-	o.emit(&Event{Type: EventAgent, Message: "▸ Extracting structured plan..."})
-	extracted, err := o.runExtractor(ctx, finalPlan)
-	if err != nil {
-		o.emit(&Event{Type: EventError, Message: fmt.Sprintf("Extractor failed, using raw merge: %v", err)})
-	} else {
-		finalPlan = RenderExtractorOutput(extracted)
-	}
-
-	return o.confirmAndExecute(ctx, finalPlan, "Code review completed")
 }
 
 // reviewResult holds the outcome of a single specialist reviewer sub-agent.
@@ -1648,25 +1471,6 @@ func mergeSpecialistFindings(results []reviewResult) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-// runReviewerSpecialistInGroup runs a single specialist reviewer sub-agent
-// whose events are routed into the given TUI group. It returns the agent's
-// final plan text (LastPlan). Errors other than ErrMaxIterations are
-// returned; an empty result is not an error (treated as LGTM upstream).
-func (o *Orchestrator) runReviewerSpecialistInGroup(ctx context.Context, role Role, task, groupID string) (text string, toolCalls int, stats SessionStats, err error) {
-	ag := o.newAgent(role, o.maxRevIter)
-	// Specialists should not emit a redundant start-label — the group
-	// header already says "Reviewing: security" etc. Their activity in the
-	// UI is expressed purely through tool calls landing in the group.
-	ag.SetTaskLabel("")
-	ag.SetGroupID(groupID)
-	prompt := systemPromptForRole(role, o.language, o.ruleCatalog, ag.reg.NamesFiltered(readOnlyTools), o.hasSnippets, o.hasRAG)
-	ag.InitWithPrompt(prompt)
-	if err := ag.Send(ctx, task); err != nil && !errors.Is(err, ErrMaxIterations) {
-		return "", ag.ToolCallCount(), ag.Stats(), err
-	}
-	return ag.LastPlan(), ag.ToolCallCount(), ag.Stats(), nil
-}
-
 func truncateTask(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s
@@ -1676,7 +1480,6 @@ func truncateTask(s string, maxLen int) string {
 
 // isConnectionError returns true when the error indicates that the LLM backend
 // (ollama) is unreachable — connection refused, DNS failure, or dial timeout.
-// Used by RunCodeReview as a circuit breaker trigger.
 func isConnectionError(err error) bool {
 	if err == nil {
 		return false

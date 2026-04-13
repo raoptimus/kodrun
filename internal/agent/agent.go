@@ -22,19 +22,20 @@ var ErrMaxIterations = errors.New("max iterations reached")
 const maxToolResultBytes = 16 * 1024 // 16KB
 
 const (
-	maxFingerprintLen    = 80   // max chars for fingerprint/display truncation
-	ragTopK              = 5    // number of top RAG results to include
-	truncatePreviewLen   = 200  // max chars for tool result preview
-	diffPreviewMaxLines  = 30   // max lines in edit/write diff preview
-	previewNewFileLines  = 20   // max lines when previewing a new file
-	toolDetailTruncate   = 60   // max chars for tool detail truncation
-	planPrefixScanLen    = 5    // max chars to scan for list markers in plan detection
-	charsPerToken        = 4    // approximate chars per token for ASCII text
-	autoCompactThreshold = 0.99 // context fill ratio that triggers auto-compact
-	nanosPerSec          = 1e9  // nanoseconds in one second
-	pctMultiplier        = 100  // multiplier to convert ratio to percentage
-	fileListMaxLen       = 120  // max chars for file list in tool result
-	toolArgTruncateLen   = 80   // max chars for tool argument display
+	maxFingerprintLen         = 80              // max chars for fingerprint/display truncation
+	ragTopK                   = 5               // number of top RAG results to include
+	truncatePreviewLen        = 200             // max chars for tool result preview
+	diffPreviewMaxLines       = 30              // max lines in edit/write diff preview
+	previewNewFileLines       = 20              // max lines when previewing a new file
+	toolDetailTruncate        = 60              // max chars for tool detail truncation
+	planPrefixScanLen         = 5               // max chars to scan for list markers in plan detection
+	charsPerToken             = 4               // approximate chars per token for ASCII text
+	autoCompactThreshold      = 0.99            // context fill ratio that triggers auto-compact
+	inferenceProgressInterval = 2 * time.Second // throttle interval for inference progress events
+	nanosPerSec               = 1e9             // nanoseconds in one second
+	pctMultiplier             = 100             // multiplier to convert ratio to percentage
+	fileListMaxLen            = 120             // max chars for file list in tool result
+	toolArgTruncateLen        = 80              // max chars for tool argument display
 
 	actionDelete       = "Delete"
 	toolNameReadFile   = "read_file"
@@ -146,6 +147,13 @@ type Event struct {
 	// FullOutput carries the complete tool result for the transcript view.
 	// Only populated on EventTool events; empty for other event types.
 	FullOutput string
+
+	// InferenceTokens is the running count of eval tokens during inference.
+	// Set on EventInferenceProgress events.
+	InferenceTokens int
+	// InferenceElapsed is the time since inference started.
+	// Set on EventInferenceProgress events.
+	InferenceElapsed time.Duration
 }
 
 // SessionStats accumulates statistics for the current task execution.
@@ -240,6 +248,10 @@ const (
 	// ProgressDone, ProgressTotal, ProgressLabel. When Done == Total the TUI
 	// stops displaying the indicator.
 	EventRAGProgress
+	// EventInferenceProgress reports live token generation during LLM inference.
+	// Fields: InferenceTokens, InferenceElapsed. Emitted periodically (throttled)
+	// while the model is generating tokens so the TUI can show progress.
+	EventInferenceProgress
 )
 
 // Agent orchestrates the LLM-tool loop.
@@ -313,6 +325,15 @@ type Agent struct {
 	// were blocked (write tools in plan mode). When the streak reaches
 	// maxPlanBlocked the agent stops early to avoid wasting iterations.
 	planBlockedStreak int
+
+	// hasCalledReadFile tracks whether read_file was called during the
+	// current Send() invocation. Used by the guided-flow nudge to detect
+	// when a model did file_stat but skipped read_file.
+	hasCalledReadFile bool
+
+	// readFileNudges counts how many times the current Send() pushed a
+	// "now call read_file" nudge after detecting file_stat without read_file.
+	readFileNudges int
 
 	// verbose enables per-iteration timing diagnostics.
 	verbose bool
@@ -770,6 +791,8 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 	a.planToolNudges = 0
 	a.toolCallCount = 0
 	a.planBlockedStreak = 0
+	a.hasCalledReadFile = false
+	a.readFileNudges = 0
 
 	// Emit a start-of-task status line only when a label was set. Sub-agents
 	// that live inside a collapsible group (parallel specialist reviewers)
@@ -786,6 +809,10 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 		}
 		iterCount++
 		iterStart := time.Now()
+
+		if a.verbose {
+			a.emit(&Event{Type: EventAgent, Message: fmt.Sprintf("Iteration %d/%d: requesting model...", iterCount, a.maxIter)})
+		}
 
 		// Auto-compact by real prompt_eval_count when context is >=99% full
 		if a.autoCompact && a.ctxMgr != nil && a.lastPromptEvalCount > 0 && a.contextSize > 0 {
@@ -822,13 +849,24 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 		if a.hasTemperature {
 			opts["temperature"] = a.temperature
 		}
-		resp, err := a.client.ChatSync(ctx, &ollama.ChatRequest{
+		var lastProgressEmit time.Time
+		progressCb := func(tokensSoFar int) {
+			if time.Since(lastProgressEmit) >= inferenceProgressInterval {
+				a.emit(&Event{
+					Type:             EventInferenceProgress,
+					InferenceTokens:  tokensSoFar,
+					InferenceElapsed: time.Since(iterStart),
+				})
+				lastProgressEmit = time.Now()
+			}
+		}
+		resp, err := a.client.ChatSyncWithCallback(ctx, &ollama.ChatRequest{
 			Model:    a.model,
 			Messages: a.history,
 			Tools:    a.toolDefsForMode(),
 			Options:  opts,
 			Format:   a.format,
-		})
+		}, progressCb)
 		llmDuration := time.Since(iterStart)
 		if err != nil {
 			a.emit(&Event{Type: EventError, Message: err.Error()})
@@ -871,6 +909,27 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 
 		// No tool calls = candidate final response.
 		if len(resp.ToolCalls) == 0 {
+			// Synthetic tool-call recovery: some models write edit_file /
+			// write_file as plain text instead of a JSON tool call. Parse
+			// the text and execute the tool synthetically so the step
+			// succeeds without a nudge round-trip.
+			if a.mode == ModeEdit {
+				if synth := parseTextToolCall(resp.Content); synth != nil {
+					a.emit(&Event{Type: EventAgent, Message: "Recovered text-form tool call — executing synthetically."})
+					// Replace the text-only assistant message (appended above)
+					// with one carrying the synthetic tool call so the
+					// subsequent tool-result message has a matching ToolCallID.
+					a.history[len(a.history)-1] = ollama.Message{
+						Role:      "assistant",
+						Content:   "",
+						ToolCalls: []ollama.ToolCall{*synth},
+					}
+					a.toolCallCount++
+					a.executeSingle(ctx, *synth)
+					continue
+				}
+			}
+
 			// EDIT-mode nudge: local models routinely answer an action task
 			// with a markdown plan instead of calling write_file/edit_file.
 			// Detect that pattern and push one or two follow-ups before
@@ -890,7 +949,7 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 				// (file_stat, read_file) before concluding. If the model
 				// returned NO_ISSUES without any tool calls, nudge it once.
 				content := strings.TrimSpace(resp.Content)
-				if a.toolCallCount == 0 && a.planToolNudges < maxPlanToolNudges &&
+				if !a.toolsDisabled && a.toolCallCount == 0 && a.planToolNudges < maxPlanToolNudges &&
 					(content == "" || isNoIssues(content)) {
 					a.planToolNudges++
 					a.emit(&Event{Type: EventAgent, Message: fmt.Sprintf(
@@ -898,7 +957,21 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 						a.planToolNudges, maxPlanToolNudges)})
 					a.history = append(a.history, ollama.Message{
 						Role:    "user",
-						Content: "You responded without calling any tools. This is FORBIDDEN. You MUST call file_stat and read_file on every file listed in the task BEFORE responding. Start now with file_stat calls.",
+						Content: "You responded without calling any tools. This is FORBIDDEN. Re-read the task above: it contains a file list section with bullet paths. You MUST call file_stat on EACH file from that list. Do NOT guess file paths — use ONLY the paths listed in the task. Start now.",
+					})
+					continue
+				}
+				// Guided-flow nudge: model called file_stat but never
+				// read_file — it cannot review code it hasn't read.
+				// Push one follow-up directing it to the next step.
+				if a.toolCallCount > 0 && !a.hasCalledReadFile && a.readFileNudges < maxReadFileNudges {
+					a.readFileNudges++
+					a.emit(&Event{Type: EventAgent, Message: fmt.Sprintf(
+						"Model called file_stat but not read_file; nudging (%d/%d)...",
+						a.readFileNudges, maxReadFileNudges)})
+					a.history = append(a.history, ollama.Message{
+						Role:    "user",
+						Content: "Good, you called file_stat. Now you MUST call read_file(path) on each file to read its contents. Use the EXACT paths from the file list in the task — do NOT guess or modify paths. You cannot review code without reading it. Call read_file now.",
 					})
 					continue
 				}
@@ -1041,8 +1114,11 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 			continue // re-send to LLM with constraint
 		}
 
-		// Emit intermediate text if any (skip for plan mode — only final response goes into planBuf)
-		if resp.Content != "" && a.mode != ModePlan {
+		// Capture intermediate text. In plan mode, accumulate into planBuf
+		// so findings emitted alongside tool calls are not lost.
+		if resp.Content != "" && a.mode == ModePlan {
+			a.planBuf.WriteString(resp.Content)
+		} else if resp.Content != "" {
 			a.emit(&Event{Type: EventAgent, Message: resp.Content})
 		}
 	}
@@ -1119,6 +1195,9 @@ func (a *Agent) executeParallel(ctx context.Context, calls []ollama.ToolCall) {
 		name := tc.Function.Name
 		args := tc.Function.Arguments
 		idx := i
+		if name == toolNameReadFile {
+			a.hasCalledReadFile = true
+		}
 		tasks[i] = func(ctx context.Context) (*tools.ToolResult, error) {
 			if guards[idx] != nil {
 				return guards[idx], nil
@@ -1186,6 +1265,9 @@ func (a *Agent) executeSingle(ctx context.Context, tc ollama.ToolCall) {
 		a.emit(&Event{Type: EventTool, Tool: tc.Function.Name, Message: "blocked by whitelist", Success: false})
 		a.emitToolResult(tc, guard, nil)
 		return
+	}
+	if tc.Function.Name == toolNameReadFile {
+		a.hasCalledReadFile = true
 	}
 	result, err := a.reg.Execute(ctx, tc.Function.Name, tc.Function.Arguments)
 	if err != nil {
@@ -1316,7 +1398,7 @@ func (a *Agent) buildConfirmPayload(ctx context.Context, name string, args map[s
 			}
 		}
 		if p.Preview == "" {
-			p.Preview = "- " + truncateOneLine(oldStr, truncatePreviewLen) + "\n+ " + truncateOneLine(newStr, truncatePreviewLen)
+			p.Preview = fallbackDiffPreview(oldStr, newStr, diffPreviewMaxLines)
 		}
 	case toolNameWriteFile:
 		path := stringFromMap(args, "path")
@@ -1361,6 +1443,26 @@ func (a *Agent) buildConfirmPayload(ctx context.Context, name string, args map[s
 		}
 	}
 	return p
+}
+
+func fallbackDiffPreview(oldStr, newStr string, maxLines int) string {
+	var b strings.Builder
+	count := 0
+	for _, line := range strings.Split(oldStr, "\n") {
+		if count >= maxLines {
+			break
+		}
+		b.WriteString("-" + line + "\n")
+		count++
+	}
+	for _, line := range strings.Split(newStr, "\n") {
+		if count >= maxLines {
+			break
+		}
+		b.WriteString("+" + line + "\n")
+		count++
+	}
+	return b.String()
 }
 
 func truncateOneLine(s string, n int) string {
