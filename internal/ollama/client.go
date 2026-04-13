@@ -30,6 +30,11 @@ const (
 	streamChanBuffer      = 16 // buffered channel size for streaming responses
 	streamScannerInitSize = 256 * 1024
 	streamScannerMaxSize  = 1024 * 1024
+
+	dialTimeout       = 30 * time.Second
+	dialKeepAlive     = 30 * time.Second
+	idleConnTimeout   = 90 * time.Second
+	streamIdleTimeout = 2 * time.Minute
 )
 
 // Client communicates with the Ollama API.
@@ -40,11 +45,22 @@ type Client struct {
 }
 
 // NewClient creates a new Ollama API client.
+// The timeout parameter controls how long to wait for the first response byte
+// (ResponseHeaderTimeout). There is no total-duration timeout — active streams
+// are protected by per-read idle timeout and context cancellation.
 func NewClient(baseURL string, timeout time.Duration) *Client {
+	transport := &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   dialTimeout,
+			KeepAlive: dialKeepAlive,
+		}).DialContext,
+		ResponseHeaderTimeout: timeout,
+		IdleConnTimeout:       idleConnTimeout,
+	}
 	return &Client{
 		baseURL: baseURL,
 		httpClient: &http.Client{
-			Timeout: timeout,
+			Transport: transport,
 		},
 		maxRetries: defaultMaxRetries,
 	}
@@ -177,10 +193,17 @@ func (c *Client) streamResponse(ctx context.Context, resp *http.Response, ch cha
 	defer close(ch)
 	defer resp.Body.Close()
 
+	// Idle timer: if no data arrives for streamIdleTimeout, close the body
+	// to unblock the scanner. This prevents indefinite hangs when the model
+	// stops producing tokens without closing the connection.
+	idle := time.AfterFunc(streamIdleTimeout, func() { resp.Body.Close() })
+	defer idle.Stop()
+
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, streamScannerInitSize), streamScannerMaxSize)
 
 	for scanner.Scan() {
+		idle.Reset(streamIdleTimeout)
 		line := scanner.Bytes()
 		if len(line) == 0 {
 			continue
@@ -226,8 +249,19 @@ func (c *Client) streamResponse(ctx context.Context, resp *http.Response, ch cha
 	}
 }
 
+// ChunkCallback is called during streaming with the number of eval tokens
+// received so far. Used by the agent to emit live progress events.
+type ChunkCallback func(tokensSoFar int)
+
 // ChatSync sends a chat request and returns aggregated response.
 func (c *Client) ChatSync(ctx context.Context, chatReq *ChatRequest) (ChatChunk, error) {
+	return c.ChatSyncWithCallback(ctx, chatReq, nil)
+}
+
+// ChatSyncWithCallback is like ChatSync but calls cb after each chunk
+// with the running count of eval tokens. This allows callers to emit
+// progress events while the model is generating.
+func (c *Client) ChatSyncWithCallback(ctx context.Context, chatReq *ChatRequest, cb ChunkCallback) (ChatChunk, error) {
 	ch, err := c.Chat(ctx, chatReq)
 	if err != nil {
 		return ChatChunk{}, err
@@ -235,12 +269,16 @@ func (c *Client) ChatSync(ctx context.Context, chatReq *ChatRequest) (ChatChunk,
 
 	var result ChatChunk
 	var contentBuf bytes.Buffer
+	var evalTokens int
 
 	for chunk := range ch {
 		if chunk.Error != nil {
 			return ChatChunk{}, chunk.Error
 		}
-		contentBuf.WriteString(chunk.Content)
+		if chunk.Content != "" {
+			contentBuf.WriteString(chunk.Content)
+			evalTokens++
+		}
 		if len(chunk.ToolCalls) > 0 {
 			result.ToolCalls = append(result.ToolCalls, chunk.ToolCalls...)
 		}
@@ -263,6 +301,9 @@ func (c *Client) ChatSync(ctx context.Context, chatReq *ChatRequest) (ChatChunk,
 		}
 		if chunk.LoadDuration > 0 {
 			result.LoadDuration = chunk.LoadDuration
+		}
+		if cb != nil {
+			cb(evalTokens)
 		}
 	}
 

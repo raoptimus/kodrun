@@ -1,6 +1,11 @@
 package agent
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/stretchr/testify/require"
+)
 
 func TestLooksLikeMarkdownPlan(t *testing.T) {
 	cases := []struct {
@@ -75,6 +80,190 @@ func TestLooksLikeMarkdownPlan(t *testing.T) {
 			if got != tc.want {
 				t.Errorf("looksLikeMarkdownPlan() = %v, want %v\ncontent:\n%s", got, tc.want, tc.content)
 			}
+		})
+	}
+}
+
+func TestParseTextToolCall_EditFile_Successfully(t *testing.T) {
+	tests := []struct {
+		name     string
+		content  string
+		wantCall *ollama.ToolCall
+	}{
+		{
+			name:    "standard edit_file with old_str and new_str",
+			content: "edit_file\npath: internal/app/api/application.go\nold_str: type Application struct {\n    logger *logrus.Logger\n}\nnew_str: type Application struct {\n    logger *logrus.Logger\n    server *http.Server\n}",
+			wantCall: &ollama.ToolCall{
+				ID: "synth_0",
+				Function: ollama.ToolCallFunc{
+					Name: "edit_file",
+					Arguments: map[string]any{
+						"path":    "internal/app/api/application.go",
+						"old_str": "type Application struct {\n    logger *logrus.Logger\n}",
+						"new_str": "type Application struct {\n    logger *logrus.Logger\n    server *http.Server\n}",
+					},
+				},
+			},
+		},
+		{
+			name:    "edit_file with only new_str",
+			content: "edit_file\npath: internal/app/handler.go\nnew_str: func Handle() error {\n    return nil\n}",
+			wantCall: &ollama.ToolCall{
+				ID: "synth_0",
+				Function: ollama.ToolCallFunc{
+					Name: "edit_file",
+					Arguments: map[string]any{
+						"path":    "internal/app/handler.go",
+						"new_str": "func Handle() error {\n    return nil\n}",
+					},
+				},
+			},
+		},
+		{
+			name:    "edit_file with multiline indented values",
+			content: "edit_file\npath: pkg/service/svc.go\nold_str: func (s *Service) Run() {\n\treturn\n}\nnew_str: func (s *Service) Run() error {\n\tif err := s.init(); err != nil {\n\t\treturn err\n\t}\n\treturn nil\n}",
+			wantCall: &ollama.ToolCall{
+				ID: "synth_0",
+				Function: ollama.ToolCallFunc{
+					Name: "edit_file",
+					Arguments: map[string]any{
+						"path":    "pkg/service/svc.go",
+						"old_str": "func (s *Service) Run() {\n\treturn\n}",
+						"new_str": "func (s *Service) Run() error {\n\tif err := s.init(); err != nil {\n\t\treturn err\n\t}\n\treturn nil\n}",
+					},
+				},
+			},
+		},
+		{
+			name:    "edit_file preceded by text on earlier lines",
+			content: "I will make the following change:\n\nedit_file\npath: main.go\nold_str: fmt.Println(\"hello\")\nnew_str: fmt.Println(\"world\")",
+			wantCall: &ollama.ToolCall{
+				ID: "synth_0",
+				Function: ollama.ToolCallFunc{
+					Name: "edit_file",
+					Arguments: map[string]any{
+						"path":    "main.go",
+						"old_str": "fmt.Println(\"hello\")",
+						"new_str": "fmt.Println(\"world\")",
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseTextToolCall(tt.content)
+			require.NotNil(t, got)
+			require.Equal(t, tt.wantCall, got)
+		})
+	}
+}
+
+func TestParseTextToolCall_WriteFile_Successfully(t *testing.T) {
+	tests := []struct {
+		name     string
+		content  string
+		wantCall *ollama.ToolCall
+	}{
+		{
+			name:    "standard write_file with content",
+			content: "write_file\npath: internal/app/new_file.go\ncontent: package app\n\nfunc New() {}",
+			wantCall: &ollama.ToolCall{
+				ID: "synth_0",
+				Function: ollama.ToolCallFunc{
+					Name: "write_file",
+					Arguments: map[string]any{
+						"path":    "internal/app/new_file.go",
+						"content": "package app\n\nfunc New() {}",
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseTextToolCall(tt.content)
+			require.NotNil(t, got)
+			require.Equal(t, tt.wantCall, got)
+		})
+	}
+}
+
+func TestParseTextToolCall_NoToolCallDetected_ReturnsNil(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+	}{
+		{
+			name:    "empty string",
+			content: "",
+		},
+		{
+			name:    "regular markdown text",
+			content: "Here is an explanation of the code.\n\nThe function does X and Y.\n\n```go\nfmt.Println(\"example\")\n```",
+		},
+		{
+			name:    "numbered plan without tool keywords",
+			content: "1. First step\n2. Second step\n3. Third step",
+		},
+		{
+			name:    "edit_file without path",
+			content: "edit_file\nold_str: foo\nnew_str: bar",
+		},
+		{
+			name:    "edit_file without old_str and new_str",
+			content: "edit_file\npath: some/file.go",
+		},
+		{
+			name:    "write_file without content",
+			content: "write_file\npath: some/file.go",
+		},
+		{
+			name:    "edit_file as substring in text",
+			content: "You should use the edit_file tool to make changes.",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseTextToolCall(tt.content)
+			require.Nil(t, got)
+		})
+	}
+}
+
+func TestExtractDiffFromText_EditFile_Successfully(t *testing.T) {
+	content := "edit_file\npath: internal/app/api/app.go\nold_str: func Run() {\n}\nnew_str: func Run() error {\n    return nil\n}"
+
+	got := ExtractDiffFromText(content)
+	require.NotEmpty(t, got)
+}
+
+func TestExtractDiffFromText_NoEditFile_ReturnsEmpty(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+	}{
+		{
+			name:    "write_file returns empty",
+			content: "write_file\npath: internal/app/new_file.go\ncontent: package app",
+		},
+		{
+			name:    "regular text returns empty",
+			content: "This is just a regular response with no tool call.",
+		},
+		{
+			name:    "empty string returns empty",
+			content: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ExtractDiffFromText(tt.content)
+			require.Empty(t, got)
 		})
 	}
 }

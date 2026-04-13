@@ -5,10 +5,14 @@ import "sync"
 // State holds the currently detected language with lazy re-detection support.
 // It is safe for concurrent use.
 type State struct {
-	mu       sync.RWMutex
-	detector *Detector
-	override Language
-	current  Language
+	mu           sync.RWMutex
+	detector     *Detector
+	techDetector *TechDetector
+	override     Language
+	current      Language
+
+	techOnce  sync.Once
+	techStack TechStack
 }
 
 // NewState creates a new State backed by the given Detector.
@@ -16,6 +20,31 @@ type State struct {
 // override is always returned.
 func NewState(detector *Detector, override Language) *State {
 	return &State{detector: detector, override: override, current: override}
+}
+
+// SetTechDetector sets the technology stack detector. Must be called before
+// EnsureTechDetected.
+func (s *State) SetTechDetector(td *TechDetector) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.techDetector = td
+}
+
+// EnsureTechDetected lazily detects and returns the project's technology stack.
+func (s *State) EnsureTechDetected() TechStack {
+	s.techOnce.Do(func() {
+		s.mu.RLock()
+		td := s.techDetector
+		s.mu.RUnlock()
+
+		if td == nil {
+			return
+		}
+
+		lang, _ := s.EnsureDetected()
+		s.techStack = td.Detect(lang)
+	})
+	return s.techStack
 }
 
 // Current returns the last known language without running detection.

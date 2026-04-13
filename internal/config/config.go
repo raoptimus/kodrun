@@ -148,8 +148,8 @@ type AgentConfig struct {
 	// Valid values: "go", "python", "jsts". Empty enables auto-detection.
 	ProjectLanguage string `mapstructure:"project_language"`
 
-	// SpecialistTimeout caps wall time for a single review specialist.
-	// 0 means no per-specialist deadline (only the HTTP client timeout applies).
+	// SpecialistTimeout caps wall time for a single review phase.
+	// 0 means no deadline (only the HTTP client timeout applies).
 	SpecialistTimeout time.Duration `mapstructure:"specialist_timeout"`
 }
 

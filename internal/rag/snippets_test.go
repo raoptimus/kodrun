@@ -8,7 +8,7 @@ import (
 )
 
 func TestChunkSnippets_EmptySlice_ReturnsEmpty_Successfully(t *testing.T) {
-	chunks := ChunkSnippets(nil)
+	chunks := ChunkSnippets(nil, nil)
 
 	assert.Empty(t, chunks)
 }
@@ -24,7 +24,7 @@ func TestChunkSnippets_SingleSnippet_ReturnsChunks_Successfully(t *testing.T) {
 		},
 	}
 
-	chunks := ChunkSnippets(snippets)
+	chunks := ChunkSnippets(snippets, nil)
 
 	require.NotEmpty(t, chunks)
 	assert.Equal(t, "snippets://grpc-handler", chunks[0].FilePath)
@@ -45,7 +45,7 @@ func TestChunkSnippets_EmptyTags_FormattedCorrectly_Successfully(t *testing.T) {
 		},
 	}
 
-	chunks := ChunkSnippets(snippets)
+	chunks := ChunkSnippets(snippets, nil)
 
 	require.NotEmpty(t, chunks)
 	assert.Contains(t, chunks[0].Content, "Tags: \n")
@@ -65,7 +65,7 @@ func TestChunkSnippets_MultipleSnippets_ProducesChunksForEach_Successfully(t *te
 		},
 	}
 
-	chunks := ChunkSnippets(snippets)
+	chunks := ChunkSnippets(snippets, nil)
 
 	require.GreaterOrEqual(t, len(chunks), 2)
 
@@ -98,7 +98,7 @@ func TestChunkSnippets_LargeSnippet_SplitsIntoMultipleChunks_Successfully(t *tes
 		},
 	}
 
-	chunks := ChunkSnippets(snippets)
+	chunks := ChunkSnippets(snippets, nil)
 
 	assert.Greater(t, len(chunks), 1)
 	for _, c := range chunks {

@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -61,6 +62,34 @@ func IsForbiddenDir(_ context.Context, relPath string, patterns []string) bool {
 		}
 	}
 	return false
+}
+
+// HasHiddenPathComponent returns true if any directory component in path
+// starts with ".". It does NOT check the final filename component —
+// only the directory segments leading to it.
+func HasHiddenPathComponent(path string) bool {
+	dir := filepath.Dir(path)
+	for _, part := range strings.Split(filepath.ToSlash(dir), "/") {
+		if part == "." || part == "" {
+			continue
+		}
+		if strings.HasPrefix(part, ".") {
+			return true
+		}
+	}
+	return false
+}
+
+// IsPathBlocked returns a non-empty reason if the path should be blocked.
+// It checks both forbidden patterns and hidden directory components.
+func IsPathBlocked(ctx context.Context, path, resolved string, patterns []string) string {
+	if IsForbidden(ctx, path, patterns) || IsForbidden(ctx, resolved, patterns) {
+		return fmt.Sprintf("access to %s is forbidden", path)
+	}
+	if HasHiddenPathComponent(path) {
+		return fmt.Sprintf("access to %s is forbidden: path contains hidden directory", path)
+	}
+	return ""
 }
 
 // IsForbidden checks if a path matches any forbidden patterns.

@@ -71,6 +71,7 @@ func TestNewOrchestrator(t *testing.T) {
 func TestOrchestrator_NewAgent_Roles(t *testing.T) {
 	orch := NewOrchestrator(nil, "test-model", nil, "/tmp", 32768, &OrchestratorConfig{
 		Language: "ru",
+		Think:    true,
 	})
 
 	tests := []struct {

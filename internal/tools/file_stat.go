@@ -51,8 +51,8 @@ func (t *FileStatTool) Execute(ctx context.Context, params map[string]any) (*Too
 		return nil, fmt.Errorf("resolve path: %w", err)
 	}
 
-	if IsForbidden(ctx, path, t.forbiddenPatterns) || IsForbidden(ctx, resolved, t.forbiddenPatterns) {
-		return nil, &ToolError{Msg: fmt.Sprintf("access to %s is forbidden", path)}
+	if reason := IsPathBlocked(ctx, path, resolved, t.forbiddenPatterns); reason != "" {
+		return nil, &ToolError{Msg: reason}
 	}
 
 	start := time.Now()
@@ -93,6 +93,29 @@ func (t *FileStatTool) Execute(ctx context.Context, params map[string]any) (*Too
 			"duration":    duration.String(),
 		},
 	}, nil
+}
+
+// CachePolicy declares file_stat results as cacheable, keyed by path
+// and invalidated by any write to the same path.
+func (t *FileStatTool) CachePolicy() CachePolicy {
+	return CachePolicy{
+		Cacheable:    true,
+		PathParams:   []string{"path"},
+		Invalidators: []string{"write_file", "edit_file", "delete_file", "move_file"},
+	}
+}
+
+// ResolvePaths returns the absolute filesystem path the call depends on.
+func (t *FileStatTool) ResolvePaths(params map[string]any) []string {
+	path := stringParam(params, "path")
+	if path == "" {
+		return nil
+	}
+	resolved, err := SafePath(context.TODO(), t.workDir, path)
+	if err != nil {
+		return nil
+	}
+	return []string{resolved}
 }
 
 func langFromExt(ext string) string {
