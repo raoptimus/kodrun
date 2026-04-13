@@ -15,10 +15,10 @@ Tested with **qwen3-coder:30b**. For RAG (semantic code search) the **nomic-embe
 - **Multi-role orchestrator** — `planner` / `executor` / `reviewer` / `extractor` / `structurer` / `step_executor` / `response_classifier`, each role wired to its own provider profile.
 - **Parallel DAG plan execution** — approved plans run as a dependency graph of sub-agents with per-file locking.
 - **Multi-provider config** — one entry per (URL, model, temperature) profile; any role can point at any profile.
-- **Automatic project language detection** — Go, Python, JS/TS; per-language tools auto-registered.
+- **Automatic project language & tech stack detection** — Go, Python, JS/TS; per-language tools auto-registered. Tech stack (gRPC, HTTP, Postgres, ClickHouse, MongoDB, Redis, Kafka) detected from dependencies for snippet filtering.
 - **Rules + snippets + custom commands** — `.kodrun/` driven, with `@`-reference validation at startup.
 - **RAG with multi-index** — semantic search over code + docs + snippets + embedded references. Architecture overview snippets are pinned verbatim in `/code-review`.
-- **`/code-review` command** — strict read-only review of the current diff with RAG prefetch, pinned overviews and anti-hallucination guardrails. Runs **6 specialist reviewers in parallel** (rules, idiomatic, best practices, security, structure, architecture) with configurable timeout.
+- **`/code-review` command** — per-file code review pipeline. Pre-loads file contents, RAG snippets and dependency signatures, then reviews each file in parallel (no tool-calling required during review). Unchanged files are served from disk cache (`.kodrun/cache/review/`). Includes a separate architecture review pass. Results are merged, deduplicated and presented as a structured plan.
 - **Edit nudge** — auto-correction for models that respond with prose instead of tool calls in EDIT mode; prevents plan-shaped text from being silently accepted.
 - **`web_fetch` tool** — download web pages, convert HTML to markdown, and optionally index via RAG for semantic search.
 - **TUI** — fullscreen bubbletea interface, markdown rendering, confirm card with diff preview, step-level confirmation, RAG indexing progress, cache stats. Plain stdout mode for pipes/scripts.
@@ -118,7 +118,7 @@ Available inside the interactive TUI. Type `/` to see the full list.
 
 | Command | Description |
 |---------|-------------|
-| `/code-review` | Strict read-only review of the current diff. Uses RAG prefetch, pinned architecture overviews and anti-hallucination guardrails. |
+| `/code-review` | Per-file code review with pre-loaded context (file contents, RAG snippets, dependency signatures), disk cache for unchanged files, and architecture review pass. |
 | `/orchestrate` | Run the full Plan → Execute → Review pipeline on a task. |
 | `/edit` | Switch to edit mode (full toolset). |
 | `/init` | Create the `.kodrun/` starter structure in the current project. |
@@ -175,8 +175,15 @@ See [`examples/kodrun.yaml`](examples/kodrun.yaml) for a fully annotated project
 - `agent.max_workers` is **renamed** to `agent.max_tool_workers`.
 - RAG **no longer indexes project source code**. Only `.kodrun/rules/`, `.kodrun/snippets/`, `.kodrun/docs/` and embedded language standards are indexed. Source files are read live via `read_file`.
 - `rag.index_dirs`, `rag.exclude_dirs` and `rag.max_chunks_per_file` are **deprecated** (kept for config compatibility, ignored at runtime).
-- New option `agent.specialist_timeout` (default `5m`) — wall-time cap for a single `/code-review` specialist.
+- New option `agent.specialist_timeout` (default `5m`) — wall-time cap for a single review phase.
 - New option `rag.review_budget_bytes` (default `24576`) — hard cap on RAG prefetch block in `/code-review` prompts.
+
+### ⚠️ Migrating from beta3
+
+- **V1 specialist fan-out pipeline removed.** `/code-review` now uses a V2 pipeline that pre-loads all context (file contents, RAG snippets, dependency signatures) per file and reviews in parallel without tool-calling. The `agent.orchestrator` toggle and `agent.specialist_timeout` option are no longer used.
+- **Review cache.** Per-file review results are cached on disk in `.kodrun/cache/review/`. Unchanged files are not re-reviewed on subsequent runs.
+- **Tech stack detection.** Project technologies (gRPC, HTTP, Postgres, ClickHouse, MongoDB, Redis, Kafka) are auto-detected from `go.mod` and `.proto` files. Snippets with a `requires` field are filtered by detected tech stack.
+- New option `agent.think` (default `false`) — enables thinking mode for planners and reviewers.
 
 ### Minimal `.kodrun/kodrun.yaml`
 
@@ -385,7 +392,7 @@ Go microservice, clean architecture. Layers:
 Dependency direction: `transport → domain ← dal ← client`.
 ```
 
-During `/code-review` the full text is injected into the `[PROJECT RULES]` block so the reviewer model sees the project map before classifying any file.
+During `/code-review` the full text is injected into the architecture review prompt so the reviewer model sees the project map when analysing cross-cutting concerns.
 
 ## Custom commands
 
