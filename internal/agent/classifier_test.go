@@ -1,3 +1,11 @@
+/**
+ * This file is part of the raoptimus/kodrun library
+ *
+ * @copyright Copyright (c) Evgeniy Urvantsev
+ * @license https://github.com/raoptimus/kodrun/blob/master/LICENSE
+ * @link https://github.com/raoptimus/kodrun
+ */
+
 package agent
 
 import (
@@ -8,13 +16,13 @@ func TestParseClassifyJSON(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name        string
-		input       string
-		wantKind    ClassifyKind
-		wantAction  ClassifySuggestedAction
-		wantNeeds   bool
-		wantCTA     string
-		wantErr     bool
+		name       string
+		input      string
+		wantKind   ClassifyKind
+		wantAction ClassifySuggestedAction
+		wantNeeds  bool
+		wantCTA    string
+		wantErr    bool
 	}{
 		{
 			name: "valid plain JSON",
@@ -50,15 +58,15 @@ Hope this helps!`,
 			wantCTA:    "Go?",
 		},
 		{
-			name: "unknown kind normalized to other",
-			input: `{"kind":"weird","needs_user_action":false,"suggested_action":"none","cta_text":""}`,
+			name:       "unknown kind normalized to other",
+			input:      `{"kind":"weird","needs_user_action":false,"suggested_action":"none","cta_text":""}`,
 			wantKind:   ClassifyKindOther,
 			wantAction: ClassifyActionNone,
 			wantNeeds:  false,
 		},
 		{
-			name: "cta_text dropped when action is not approve_plan",
-			input: `{"kind":"question_answer","needs_user_action":false,"suggested_action":"none","cta_text":"leftover"}`,
+			name:       "cta_text dropped when action is not approve_plan",
+			input:      `{"kind":"question_answer","needs_user_action":false,"suggested_action":"none","cta_text":"leftover"}`,
 			wantKind:   ClassifyKindQuestionAnswer,
 			wantAction: ClassifyActionNone,
 			wantCTA:    "",

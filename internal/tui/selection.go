@@ -1,3 +1,11 @@
+/**
+ * This file is part of the raoptimus/kodrun library
+ *
+ * @copyright Copyright (c) Evgeniy Urvantsev
+ * @license https://github.com/raoptimus/kodrun/blob/master/LICENSE
+ * @link https://github.com/raoptimus/kodrun
+ */
+
 package tui
 
 // CellPos represents a position in the content (line and column, visual width).

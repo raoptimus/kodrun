@@ -1,3 +1,11 @@
+/**
+ * This file is part of the raoptimus/kodrun library
+ *
+ * @copyright Copyright (c) Evgeniy Urvantsev
+ * @license https://github.com/raoptimus/kodrun/blob/master/LICENSE
+ * @link https://github.com/raoptimus/kodrun
+ */
+
 package tools
 
 import (
@@ -7,8 +15,8 @@ import (
 
 func TestLineStats(t *testing.T) {
 	tests := []struct {
-		name           string
-		old, new       string
+		name            string
+		old, new        string
 		wantAdd, wantRm int
 	}{
 		{"empty to empty", "", "", 0, 0},

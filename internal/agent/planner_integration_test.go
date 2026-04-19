@@ -1,5 +1,13 @@
 //go:build integration
 
+/**
+ * This file is part of the raoptimus/kodrun library
+ *
+ * @copyright Copyright (c) Evgeniy Urvantsev
+ * @license https://github.com/raoptimus/kodrun/blob/master/LICENSE
+ * @link https://github.com/raoptimus/kodrun
+ */
+
 package agent
 
 import (

@@ -1,3 +1,11 @@
+/**
+ * This file is part of the raoptimus/kodrun library
+ *
+ * @copyright Copyright (c) Evgeniy Urvantsev
+ * @license https://github.com/raoptimus/kodrun/blob/master/LICENSE
+ * @link https://github.com/raoptimus/kodrun
+ */
+
 package rules
 
 import (
@@ -29,7 +37,7 @@ scope: coding
 		t.Fatal(err)
 	}
 
-	rules := loader.Rules(context.Background(),ScopeCoding)
+	rules := loader.Rules(context.Background(), ScopeCoding)
 	if len(rules) != 1 {
 		t.Fatalf("expected 1 rule, got %d", len(rules))
 	}
@@ -52,12 +60,12 @@ func TestLoader_ScopeFilter(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	codingRules := loader.Rules(context.Background(),ScopeCoding)
+	codingRules := loader.Rules(context.Background(), ScopeCoding)
 	if len(codingRules) != 2 { // coding + all
 		t.Errorf("expected 2 coding rules, got %d", len(codingRules))
 	}
 
-	reviewRules := loader.Rules(context.Background(),ScopeReview)
+	reviewRules := loader.Rules(context.Background(), ScopeReview)
 	if len(reviewRules) != 2 { // review + all
 		t.Errorf("expected 2 review rules, got %d", len(reviewRules))
 	}
@@ -111,7 +119,7 @@ func TestLoader_ResolveReferences(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rules := loader.Rules(context.Background(),ScopeCoding)
+	rules := loader.Rules(context.Background(), ScopeCoding)
 	if len(rules) != 1 {
 		t.Fatalf("expected 1 rule, got %d", len(rules))
 	}
@@ -134,7 +142,7 @@ func TestLoader_ResolveReferences(t *testing.T) {
 	}
 
 	// ReferenceDocs should contain the actual content
-	refDocs := loader.ReferenceDocs(context.Background(),ScopeCoding)
+	refDocs := loader.ReferenceDocs(context.Background(), ScopeCoding)
 	if !strings.Contains(refDocs, "Use value objects") {
 		t.Errorf("ReferenceDocs should contain model.md content, got:\n%s", refDocs)
 	}
@@ -162,7 +170,7 @@ func TestLoader_ResolveReferences_DirectPath(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rules := loader.Rules(context.Background(),ScopeCoding)
+	rules := loader.Rules(context.Background(), ScopeCoding)
 	if len(rules) != 1 {
 		t.Fatalf("expected 1 rule, got %d", len(rules))
 	}
@@ -171,7 +179,7 @@ func TestLoader_ResolveReferences_DirectPath(t *testing.T) {
 		t.Errorf("expected [see: style.md] label, got:\n%s", rules[0].Content)
 	}
 
-	refDocs := loader.ReferenceDocs(context.Background(),ScopeCoding)
+	refDocs := loader.ReferenceDocs(context.Background(), ScopeCoding)
 	if !strings.Contains(refDocs, "Max 120 chars") {
 		t.Errorf("ReferenceDocs should contain style.md content, got:\n%s", refDocs)
 	}
@@ -196,7 +204,7 @@ func TestLoader_DeduplicateReferences(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	refDocs := loader.ReferenceDocs(context.Background(),ScopeCoding)
+	refDocs := loader.ReferenceDocs(context.Background(), ScopeCoding)
 	// styleguide.md content should appear exactly once
 	count := strings.Count(refDocs, "Use gofmt.")
 	if count != 1 {
@@ -222,7 +230,7 @@ func TestLoader_ReferenceDocs_ScopeFiltered(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	codingDocs := loader.ReferenceDocs(context.Background(),ScopeCoding)
+	codingDocs := loader.ReferenceDocs(context.Background(), ScopeCoding)
 	if !strings.Contains(codingDocs, "coding doc content") {
 		t.Error("coding scope should include coding_doc.md")
 	}
@@ -230,7 +238,7 @@ func TestLoader_ReferenceDocs_ScopeFiltered(t *testing.T) {
 		t.Error("coding scope should NOT include review_doc.md")
 	}
 
-	reviewDocs := loader.ReferenceDocs(context.Background(),ScopeReview)
+	reviewDocs := loader.ReferenceDocs(context.Background(), ScopeReview)
 	if !strings.Contains(reviewDocs, "review doc content") {
 		t.Error("review scope should include review_doc.md")
 	}
@@ -258,7 +266,7 @@ func TestLoader_Truncation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	refDocs := loader.ReferenceDocs(context.Background(),ScopeCoding)
+	refDocs := loader.ReferenceDocs(context.Background(), ScopeCoding)
 	if !strings.Contains(refDocs, "[truncated") {
 		t.Errorf("expected truncation marker, got:\n%s", refDocs)
 	}
@@ -293,7 +301,7 @@ func TestLoader_RulesContainLabels(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	content := loader.AllRulesContent(context.Background(),ScopeCoding)
+	content := loader.AllRulesContent(context.Background(), ScopeCoding)
 	if !strings.Contains(content, "[see: styleguide.md]") {
 		t.Errorf("expected [see: styleguide.md] label in rules, got:\n%s", content)
 	}

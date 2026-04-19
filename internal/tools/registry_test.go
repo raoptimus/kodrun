@@ -1,3 +1,11 @@
+/**
+ * This file is part of the raoptimus/kodrun library
+ *
+ * @copyright Copyright (c) Evgeniy Urvantsev
+ * @license https://github.com/raoptimus/kodrun/blob/master/LICENSE
+ * @link https://github.com/raoptimus/kodrun
+ */
+
 package tools
 
 import (
@@ -17,8 +25,8 @@ type stubTool struct {
 	execFn func(ctx context.Context, params map[string]any) (*ToolResult, error)
 }
 
-func (s *stubTool) Name() string              { return s.name }
-func (s *stubTool) Description() string       { return s.desc }
+func (s *stubTool) Name() string           { return s.name }
+func (s *stubTool) Description() string    { return s.desc }
 func (s *stubTool) Schema() llm.JSONSchema { return s.schema }
 func (s *stubTool) Execute(ctx context.Context, params map[string]any) (*ToolResult, error) {
 	if s.execFn != nil {
