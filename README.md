@@ -6,19 +6,21 @@
 
 > **Beta** — this project is under active development. APIs and configuration may change.
 
-CLI agent for writing and maintaining code in **Go, Python and JavaScript/TypeScript**. Runs fully locally via [Ollama](https://ollama.com) API. Loads rules, snippets and documentation from the project working directory, executes tools (file operations, build/test/lint, git) and automatically fixes errors through the LLM.
+CLI agent for writing and maintaining code in **Go, Python and JavaScript/TypeScript**. Runs locally via [Ollama](https://ollama.com) or any **OpenAI-compatible API** (vLLM, llama.cpp, LiteLLM, etc.). Loads rules, snippets and documentation from the project working directory, executes tools (file operations, build/test/lint, git) and automatically fixes errors through the LLM.
 
-Tested with **qwen3-coder:30b**. For RAG (semantic code search) the **nomic-embed-text** embedding model is recommended.
+Tested with **qwen3-coder:30b**, **qwen3.6**, **qwen3.5:35b-a3b**. For RAG (semantic code search) the **nomic-embed-text** embedding model is recommended.
 
 ## Features
 
+- **Multi-provider LLM support** — Ollama (NDJSON streaming) and OpenAI-compatible APIs (SSE streaming) via a unified `Client` interface. Backends register via `init()` factory pattern.
 - **Multi-role orchestrator** — `planner` / `executor` / `reviewer` / `extractor` / `structurer` / `step_executor` / `response_classifier`, each role wired to its own provider profile.
 - **Parallel DAG plan execution** — approved plans run as a dependency graph of sub-agents with per-file locking.
 - **Multi-provider config** — one entry per (URL, model, temperature) profile; any role can point at any profile.
+- **Language-aware system prompts** — tool names, build/lint/test commands, and coding conventions in system prompts are adapted to the detected project language (Go, Python, JS/TS). No more Go bias in non-Go projects.
 - **Automatic project language & tech stack detection** — Go, Python, JS/TS; per-language tools auto-registered. Tech stack (gRPC, HTTP, Postgres, ClickHouse, MongoDB, Redis, Kafka) detected from dependencies for snippet filtering.
 - **Rules + snippets + custom commands** — `.kodrun/` driven, with `@`-reference validation at startup.
-- **RAG with multi-index** — semantic search over code + docs + snippets + embedded references. Architecture overview snippets are pinned verbatim in `/code-review`.
-- **`/code-review` command** — per-file code review pipeline. Pre-loads file contents, RAG snippets and dependency signatures, then reviews each file in parallel (no tool-calling required during review). Unchanged files are served from disk cache (`.kodrun/cache/review/`). Includes a separate architecture review pass. Results are merged, deduplicated and presented as a structured plan.
+- **RAG with multi-index** — semantic search over conventions + docs + snippets + embedded references. Architecture overview snippets are pinned verbatim in `/code-review`. Configurable backend: local (in-memory with disk persistence) or Muninn DB.
+- **`/code-review` command** — per-file code review pipeline. Pre-loads file contents, RAG snippets and dependency signatures, then reviews each file in parallel (no tool-calling required during review). Unchanged files are served from disk cache (`.kodrun/cache/review/`). Includes a separate architecture review pass. Results are merged, deduplicated and presented as a structured plan. Live LLM streaming in transcript view (`Ctrl+O`).
 - **Edit nudge** — auto-correction for models that respond with prose instead of tool calls in EDIT mode; prevents plan-shaped text from being silently accepted.
 - **`web_fetch` tool** — download web pages, convert HTML to markdown, and optionally index via RAG for semantic search.
 - **TUI** — fullscreen bubbletea interface, markdown rendering, confirm card with diff preview, step-level confirmation, RAG indexing progress, cache stats. Plain stdout mode for pipes/scripts.
@@ -184,6 +186,15 @@ See [`examples/kodrun.yaml`](examples/kodrun.yaml) for a fully annotated project
 - **Review cache.** Per-file review results are cached on disk in `.kodrun/cache/review/`. Unchanged files are not re-reviewed on subsequent runs.
 - **Tech stack detection.** Project technologies (gRPC, HTTP, Postgres, ClickHouse, MongoDB, Redis, Kafka) are auto-detected from `go.mod` and `.proto` files. Snippets with a `requires` field are filtered by detected tech stack.
 - New option `agent.think` (default `false`) — enables thinking mode for planners and reviewers.
+
+### ⚠️ Migrating to v1.2.0-beta
+
+- **OpenAI-compatible backend.** New provider type `openai` for vLLM, llama.cpp, LiteLLM and other OpenAI-compatible servers. Set `type: openai` and `api_key` on the provider profile.
+- **Legacy `internal/ollama` package removed.** All consumers migrated to the unified `internal/llm` interface. If you have custom forks, update imports from `internal/ollama` to `internal/llm/ollama`.
+- **Language-aware prompts.** System prompts for planner, executor, and reviewer roles now use language-specific tool names (`go_build` / `tsc` / `ruff`, etc.) and conventions instead of hardcoded Go references. No config changes needed — this is automatic.
+- **Plan revision preserves context.** When you add a remark after planning, the revision agent now receives the original task context (including RAG and source code), not just the extracted plan text.
+- **RAG backend selection.** New option `rag.backend` (`local` or `muninn`). Default is `local` (unchanged). Muninn backend delegates embeddings to an external Muninn DB server.
+- **Live LLM streaming.** During `/code-review`, press `Ctrl+O` to open transcript view with real-time LLM output streaming.
 
 ### Minimal `.kodrun/kodrun.yaml`
 
