@@ -146,6 +146,14 @@ linters:
           - ireturn
         path: internal/tui/model\.go
         text: 'Update returns interface'
+      - linters:
+          - ireturn
+        path: internal/llm/factory\.go
+        text: 'NewClient returns interface'
+      - linters:
+          - ireturn
+        path: cmd/kodrun/main\.go
+        text: 'newLLMClient returns interface'
       - path: (.+)\.go$
         text: ST1000
     paths:

@@ -35,13 +35,16 @@ const (
 	kilo               = 1000 // 1K tokens
 	kibi               = 1024 // 1Ki context units
 	paddingLeftDefault = 4    // default PaddingLeft for styles
+
+	spinnerFrameCount = 10 // number of frames in the braille spinner
+	dividerLabelPad   = 2  // spaces around phase divider label
+	dividerMinPad     = 4  // minimum total padding for phase divider
+	dividerHalf       = 2  // divisor for centering divider label
 )
 
 var (
 	titleStyle         = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
 	agentStyle         = lipgloss.NewStyle()
-	userStyle          = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("2"))
-	botStyle           = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("5"))
 	toolStyle          = lipgloss.NewStyle().Foreground(lipgloss.Color("4"))
 	toolBoldStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("4"))
 	fixStyle           = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
@@ -60,9 +63,16 @@ var (
 
 	toolbarStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 
+	// Left-border accent characters for user/agent messages.
+	userAccent  = lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Render("▎") + " "
+	agentAccent = lipgloss.NewStyle().Foreground(lipgloss.Color("4")).Render("▎") + " "
+
 	completeBorder   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("8"))
 	completeNormal   = lipgloss.NewStyle().PaddingLeft(1).PaddingRight(1)
 	completeSelected = lipgloss.NewStyle().PaddingLeft(1).PaddingRight(1).Bold(true).Reverse(true)
+
+	// spinnerFrames contains braille dot characters for animated spinner.
+	spinnerFrames = [spinnerFrameCount]string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 )
 
 // CommandItem describes a slash command available in autocomplete.
@@ -258,6 +268,9 @@ type Model struct {
 	contextUsed  int
 	contextTotal int
 
+	// Spinner animation frame index (cycles through spinnerFrames).
+	spinnerFrame int
+
 	// Block 6: observability fields populated by orchestrator events.
 	phase       string
 	cacheHits   int64
@@ -289,6 +302,9 @@ type Model struct {
 
 	// Markdown rendering
 	mdRenderer *markdownRenderer
+
+	// Number of log entries occupied by the header block.
+	headerLineCount int
 }
 
 func (m *Model) defaultPlaceholder() string {
@@ -358,7 +374,9 @@ func NewModel(modelName, version string, contextSize int, taskFn TaskFunc, cance
 		locale:        locale,
 		mdRenderer:    &markdownRenderer{},
 	}
-	m.logs = m.headerLines()
+	header := m.headerLines()
+	m.logs = header
+	m.headerLineCount = len(header)
 	return m
 }
 
@@ -514,6 +532,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tickMsg:
+		if m.running {
+			m.spinnerFrame = (m.spinnerFrame + 1) % spinnerFrameCount
+		}
 		if m.running || m.ragProgressTotal > 0 {
 			cmds = append(cmds, tickEvery())
 		}
@@ -809,7 +830,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.textinput.SetHeight(1)
 			m.textinput.Focus()
 			m.recalcViewport()
-			m.addLog(userStyle.Render(m.locale.Get("avatar.user")) + " " + input)
+			m.addLog(userAccent + input)
 
 			// Persist to file
 			AppendHistory(m.workDir, input, m.maxHistory)
@@ -886,7 +907,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport.ScrollDown(m.viewport.Height / halfPageDivisor)
 			return m, nil
 		case tea.KeyCtrlL:
-			m.logs = m.headerLines()
+			header := m.headerLines()
+			m.logs = header
+			m.headerLineCount = len(header)
 			m.transcriptLogs = nil
 			m.updateViewport()
 		case tea.KeyCtrlO:
@@ -930,6 +953,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport.Width = m.width
 			m.viewport.Height = m.viewportHeight()
 		}
+		m.rebuildHeader()
 		m.updateViewport()
 	case EventMsg:
 		e := msg.Event
@@ -951,14 +975,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.groupLogs = append(m.groupLogs, agentStyle.Render(e.Message))
 					m.rebuildGroupView()
 				default:
-					prefix := botStyle.Render(m.locale.Get("avatar.agent")) + " "
+					prefix := agentAccent
 					prefixW := ansi.StringWidth(prefix)
 					avail := max(m.width-prefixW-paddingConfirmSel, diffPreviewLines) // diffPreviewLines reused as minAvailWidth
 
 					// Render markdown if the message contains markdown markers.
 					rendered := m.renderAgentMessage(e.Message, avail)
 					lines := strings.Split(rendered, "\n")
-					indent := strings.Repeat(" ", prefixW)
+					indent := agentAccent
 					var buf strings.Builder
 					for i, line := range lines {
 						if i > 0 {
@@ -1002,13 +1026,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.rebuildGroupView()
 			default:
 				m.addLog(toolLine)
-				if e.FileAction != "" {
-					if e.LinesAdded > 0 || e.LinesRemoved > 0 {
-						m.addLog(diffStatStyle.Render(fmt.Sprintf("  +%d -%d lines", e.LinesAdded, e.LinesRemoved)))
-					}
-					if e.Diff != "" {
-						m.addDiffLog(e.Diff)
-					}
+				if e.FileAction != "" && e.Diff != "" {
+					m.addDiffLog(e.Diff)
 				}
 			}
 		case agent.EventGroupStart:
@@ -1019,7 +1038,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.groupTitle = e.Message
 				m.groupLogs = nil
 				m.groupExpanded = false
-				m.addLog(botStyle.Render(m.locale.Get("avatar.agent")) + " " + toolStyle.Render(e.Message))
+				m.addLog(agentAccent + toolStyle.Render(e.Message))
 				m.groupStartIdx = len(m.logs)
 			}
 		case agent.EventGroupEnd:
@@ -1036,6 +1055,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.updateGroup(g)
 				}
 			}
+			m.addTranscriptLog(systemStyle.Render("─── " + e.Message + " ───"))
 		case agent.EventFix:
 			m.addLog(fixStyle.Render(m.locale.Get("event.fix") + e.Message))
 		case agent.EventError:
@@ -1058,6 +1078,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if e.InferenceElapsed > 0 && e.InferenceTokens > 0 {
 				m.lastTkPerSec = float64(e.InferenceTokens) / e.InferenceElapsed.Seconds()
 			}
+			if e.InferenceContent != "" {
+				width := m.width
+				if width <= 0 {
+					width = 80
+				}
+				for _, line := range strings.Split(e.InferenceContent, "\n") {
+					wrapped := wrap.String(wordwrap.String(line, width), width)
+					m.addTranscriptLog(agentStyle.Render(wrapped))
+				}
+			}
 		case agent.EventCompact:
 			m.addLog(systemStyle.Render(m.locale.Get("event.compact") + e.Message))
 			if e.ContextUsed > 0 {
@@ -1074,7 +1104,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case agent.EventPhase:
 			m.phase = e.Message
-			m.addLog(systemStyle.Render(fmt.Sprintf("◆ phase: %s", e.Message)))
+			label := strings.ToUpper(e.Message)
+			pad := m.width - len(label) - dividerLabelPad
+			if pad < dividerMinPad {
+				pad = dividerMinPad
+			}
+			left := pad / dividerHalf
+			right := pad - left
+			divider := strings.Repeat("═", left) + " " + label + " " + strings.Repeat("═", right)
+			m.addLog(systemStyle.Render(divider))
 		case agent.EventCacheStats:
 			m.cacheHits = e.CacheHits
 			m.cacheMisses = e.CacheMisses
@@ -1248,16 +1286,22 @@ func (m *Model) recalcViewport() {
 
 // formatToolEvent formats a tool event as a single log line.
 func (m Model) formatToolEvent(e *agent.Event) string {
-	status := "✓"
+	statusIcon := "✓"
 	if !e.Success {
-		status = "✗"
+		statusIcon = "✗"
 	}
-	statusStr := toolStyle.Render(status)
+	statusStr := toolStyle.Render(statusIcon)
 
 	if e.FileAction != "" {
 		name := toolBoldStyle.Render(e.FileAction)
 		args := toolStyle.Render(fmt.Sprintf("(%s)", e.Message))
-		return fmt.Sprintf("%s %s%s", statusStr, name, args)
+		line := fmt.Sprintf("%s %s%s", statusStr, name, args)
+		if e.LinesAdded > 0 || e.LinesRemoved > 0 {
+			stat := diffAddStyle.Render(fmt.Sprintf("+%d", e.LinesAdded)) + " " +
+				diffDelStyle.Render(fmt.Sprintf("-%d", e.LinesRemoved))
+			line += "  " + stat
+		}
+		return line
 	}
 
 	displayName := toolBoldStyle.Render(agent.ToolDisplayName(e.Tool))
@@ -1295,7 +1339,7 @@ const groupMaxVisible = 5
 // entries unless expanded is true.
 func (m *Model) renderGroupLines(g *groupState) []string {
 	lines := []string{
-		botStyle.Render(m.locale.Get("avatar.agent")) + " " + toolStyle.Render(g.title),
+		agentAccent + toolStyle.Render(g.title),
 	}
 	total := len(g.logs)
 	if total == 0 {
@@ -1413,11 +1457,31 @@ func (m *Model) rebuildGroupView() {
 }
 
 func (m *Model) headerLines() []string {
-	line1 := titleStyle.Render(fmt.Sprintf("KodRun %s", m.version))
 	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	line2 := dimStyle.Render(fmt.Sprintf("%s (%s ctx)", m.model, formatContextSize(m.contextSize)))
-	line3 := dimStyle.Render(shortPath(m.workDir))
-	return []string{line1, line2, line3, ""}
+	title := titleStyle.Render(fmt.Sprintf("KodRun %s", m.version))
+	meta := dimStyle.Render(fmt.Sprintf("  ·  %s (%s ctx)", m.model, formatContextSize(m.contextSize)))
+	line1 := title + meta
+	line2 := dimStyle.Render(shortPath(m.workDir))
+
+	headerBorder := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("8")).
+		PaddingLeft(1).PaddingRight(1)
+	if m.width > 0 {
+		headerBorder = headerBorder.Width(m.width - dividerLabelPad)
+	}
+	box := headerBorder.Render(line1 + "\n" + line2)
+	return []string{box, ""}
+}
+
+// rebuildHeader replaces the header block at the top of m.logs with a fresh
+// render (e.g. after terminal resize changes the available width).
+func (m *Model) rebuildHeader() {
+	header := m.headerLines()
+	if m.headerLineCount > 0 && m.headerLineCount <= len(m.logs) {
+		m.logs = append(header, m.logs[m.headerLineCount:]...)
+	}
+	m.headerLineCount = len(header)
 }
 
 func (m *Model) addLog(line string) {
@@ -1494,17 +1558,32 @@ func (m Model) renderAgentMessage(text string, width int) string {
 }
 
 // addDiffLog renders a diff string with colored lines and appends to logs.
-// Limits output to 20 visible diff lines.
+// Limits output to diffPreviewLines visible diff lines.
 func (m *Model) addDiffLog(diff string) {
 	lines := strings.Split(strings.TrimRight(diff, "\n"), "\n")
-	maxDiffLines := 20
+
+	// Extract file path from the first diff line (--- a/path or +++ b/path).
+	filePath := extractDiffFilePath(lines)
+	if filePath != "" {
+		barWidth := m.width - len(filePath) - dividerMinPad
+		if barWidth < dividerMinPad {
+			barWidth = dividerMinPad
+		}
+		header := fmt.Sprintf("  ── %s %s", filePath, strings.Repeat("─", barWidth))
+		m.logs = append(m.logs, diffStatStyle.Render(header))
+	}
+
 	shown := 0
 	for _, l := range lines {
-		if shown >= maxDiffLines {
+		if shown >= diffPreviewLines {
 			m.logs = append(m.logs, diffStatStyle.Render(fmt.Sprintf(m.locale.Get("diff.more_lines"), len(lines)-shown)))
 			break
 		}
 		if len(l) == 0 {
+			continue
+		}
+		// Skip --- and +++ header lines (already shown as file path header).
+		if (strings.HasPrefix(l, "--- ") || strings.HasPrefix(l, "+++ ")) && filePath != "" {
 			continue
 		}
 		var styled string
@@ -1523,6 +1602,23 @@ func (m *Model) addDiffLog(diff string) {
 	}
 	stickBottom := !m.ready || m.viewport.AtBottom() || (m.running && m.focus == focusInput)
 	m.updateViewportWithStickBottom(stickBottom)
+}
+
+// extractDiffFilePath extracts the file path from unified diff headers.
+func extractDiffFilePath(lines []string) string {
+	for _, l := range lines {
+		if strings.HasPrefix(l, "+++ b/") {
+			return strings.TrimPrefix(l, "+++ b/")
+		}
+		if strings.HasPrefix(l, "+++ ") {
+			return strings.TrimPrefix(l, "+++ ")
+		}
+		// Stop scanning after hunk headers.
+		if strings.HasPrefix(l, "@@") {
+			break
+		}
+	}
+	return ""
 }
 
 func (m *Model) updateViewport() {
@@ -1572,7 +1668,8 @@ func (m Model) View() string {
 	var timeLine string
 	if m.running {
 		elapsed := m.elapsed()
-		timeLine = "\n" + toolbarStyle.Render(fmt.Sprintf("  %s ⏱ %s · %s tk", m.locale.Get("status.working"), elapsed, formatTokens(m.totalEval+m.liveEval))) + "\n"
+		spinner := spinnerFrames[m.spinnerFrame]
+		timeLine = "\n" + toolbarStyle.Render(fmt.Sprintf("  %s %s ⏱ %s · %s tk", spinner, m.locale.Get("status.working"), elapsed, formatTokens(m.totalEval+m.liveEval))) + "\n"
 	}
 	if m.ragProgressTotal > 0 {
 		pct := m.ragProgressDone * percentMultiplier / m.ragProgressTotal
@@ -1634,31 +1731,39 @@ func (m Model) renderInput() string {
 }
 
 func (m Model) renderToolbar() string {
+	sep := toolbarStyle.Render(" │ ")
+
+	modelPart := toolbarStyle.Render(m.model)
+
 	modeLabel := m.locale.Get("label.edit_mode")
+	modeColor := lipgloss.Color("2") // green for edit
 	if m.mode == agent.ModePlan {
 		modeLabel = m.locale.Get("label.plan_mode")
+		modeColor = lipgloss.Color("0") // black for plan
 	}
+	modePart := lipgloss.NewStyle().Bold(true).Foreground(modeColor).Render(
+		strings.ToUpper(modeLabel),
+	) + " " + toolbarStyle.Render(m.locale.Get("label.shift_tab"))
 
-	parts := []string{
-		m.model,
-		fmt.Sprintf("%s %s", modeLabel, m.locale.Get("label.shift_tab")),
-		fmt.Sprintf("%s tk", formatTokens(m.totalPrompt+m.totalEval)),
-	}
+	tokenPart := toolbarStyle.Render(fmt.Sprintf("%s tk", formatTokens(m.totalPrompt+m.totalEval)))
+
+	parts := []string{modelPart, modePart, tokenPart}
+
 	if m.transcriptMode {
-		parts = append(parts, "[Transcript]")
+		parts = append(parts, toolbarStyle.Render("[Transcript]"))
 	}
 
 	if m.lastTkPerSec > 0 {
-		parts = append(parts, fmt.Sprintf("%.1f tk/s", m.lastTkPerSec))
+		parts = append(parts, toolbarStyle.Render(fmt.Sprintf("%.1f tk/s", m.lastTkPerSec)))
 	}
 
 	var pct int
 	if m.contextTotal > 0 {
 		pct = percentMultiplier - (m.contextUsed * percentMultiplier / m.contextTotal)
 	}
-	parts = append(parts, fmt.Sprintf(m.locale.Get("label.context_left"), pct))
+	parts = append(parts, toolbarStyle.Render(fmt.Sprintf(m.locale.Get("label.context_left"), pct)))
 
-	return toolbarStyle.Render(strings.Join(parts, " · "))
+	return strings.Join(parts, sep)
 }
 
 func (m Model) renderComplete() string {

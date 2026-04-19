@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/llm"
 )
 
 func TestSaveSession_CreatesFile_Successfully(t *testing.T) {
@@ -22,7 +22,7 @@ func TestSaveSession_CreatesFile_Successfully(t *testing.T) {
 		CreatedAt: time.Date(2026, 4, 12, 10, 0, 0, 0, time.UTC),
 		Model:     "qwen3-coder",
 		Mode:      "edit",
-		Messages: []ollama.Message{
+		Messages: []llm.Message{
 			{Role: "system", Content: "you are an assistant"},
 			{Role: "user", Content: "hello"},
 		},
@@ -72,7 +72,7 @@ func TestLoadSession_ReadsFile_Successfully(t *testing.T) {
 		UpdatedAt: time.Date(2026, 4, 12, 11, 0, 0, 0, time.UTC),
 		Model:     "test-model",
 		Mode:      "plan",
-		Messages: []ollama.Message{
+		Messages: []llm.Message{
 			{Role: "user", Content: "what is Go?"},
 		},
 		Plan:    "1. Read docs",
@@ -127,21 +127,21 @@ func TestListSessions_ReturnsSortedByUpdatedAt_Successfully(t *testing.T) {
 			UpdatedAt: time.Date(2026, 4, 10, 0, 0, 0, 0, time.UTC),
 			Model:     "model-a",
 			Mode:      "plan",
-			Messages:  []ollama.Message{{Role: "user", Content: "old"}},
+			Messages:  []llm.Message{{Role: "user", Content: "old"}},
 		},
 		{
 			ID:        "20260412-newest",
 			UpdatedAt: time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC),
 			Model:     "model-b",
 			Mode:      "edit",
-			Messages:  []ollama.Message{{Role: "user", Content: "new1"}, {Role: "assistant", Content: "new2"}},
+			Messages:  []llm.Message{{Role: "user", Content: "new1"}, {Role: "assistant", Content: "new2"}},
 		},
 		{
 			ID:        "20260411-middle",
 			UpdatedAt: time.Date(2026, 4, 11, 0, 0, 0, 0, time.UTC),
 			Model:     "model-c",
 			Mode:      "plan",
-			Messages:  []ollama.Message{},
+			Messages:  []llm.Message{},
 		},
 	}
 

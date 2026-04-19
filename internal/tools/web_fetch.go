@@ -9,7 +9,7 @@ import (
 	"time"
 
 	htmltomd "github.com/JohannesKaufmann/html-to-markdown/v2"
-	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/llm"
 	"github.com/raoptimus/kodrun/internal/rag"
 )
 
@@ -53,10 +53,10 @@ func (t *WebFetchTool) Description() string {
 		"With RAG enabled the content is indexed for semantic search; without RAG a keyword search is used."
 }
 
-func (t *WebFetchTool) Schema() ollama.JSONSchema {
-	return ollama.JSONSchema{
+func (t *WebFetchTool) Schema() llm.JSONSchema {
+	return llm.JSONSchema{
 		Type: "object",
-		Properties: map[string]ollama.JSONSchema{
+		Properties: map[string]llm.JSONSchema{
 			"url":   {Type: "string", Description: "URL of the web page to fetch"},
 			"query": {Type: "string", Description: "Optional search query to find relevant sections in the page"},
 		},

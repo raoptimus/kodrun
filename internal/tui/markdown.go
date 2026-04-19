@@ -15,7 +15,7 @@ func stringPtr(s string) *string { return &s }
 func uintPtr(u uint) *uint       { return &u }
 
 // kodrunStyle is a minimal glamour style that works on both light and dark
-// terminals. No background colors. Headings are blue bold uppercase.
+// terminals. No background colors. Headings are bold.
 // Inline code is bold (no colored background). Lists use bullet markers.
 var kodrunStyle = ansi.StyleConfig{
 	Document: ansi.StyleBlock{
@@ -28,27 +28,21 @@ var kodrunStyle = ansi.StyleConfig{
 		StylePrimitive: ansi.StylePrimitive{
 			Bold:        boolPtr(true),
 			BlockSuffix: "\n",
-			Color:       stringPtr("4"),
 		},
 	},
 	H1: ansi.StyleBlock{
 		StylePrimitive: ansi.StylePrimitive{
-			Bold:  boolPtr(true),
-			Upper: boolPtr(true),
-			Color: stringPtr("4"),
+			Bold: boolPtr(true),
 		},
 	},
 	H2: ansi.StyleBlock{
 		StylePrimitive: ansi.StylePrimitive{
-			Bold:  boolPtr(true),
-			Upper: boolPtr(true),
-			Color: stringPtr("4"),
+			Bold: boolPtr(true),
 		},
 	},
 	H3: ansi.StyleBlock{
 		StylePrimitive: ansi.StylePrimitive{
-			Bold:  boolPtr(true),
-			Color: stringPtr("4"),
+			Bold: boolPtr(true),
 		},
 	},
 	Paragraph: ansi.StyleBlock{},

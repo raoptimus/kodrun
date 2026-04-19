@@ -6,7 +6,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/llm"
 )
 
 const defaultMaxLines = 500
@@ -29,10 +29,10 @@ func NewReadFileTool(workDir string, forbiddenPatterns []string, maxLines int) *
 func (t *ReadFileTool) Name() string        { return "read_file" }
 func (t *ReadFileTool) Description() string { return "Read the contents of a file" }
 
-func (t *ReadFileTool) Schema() ollama.JSONSchema {
-	return ollama.JSONSchema{
+func (t *ReadFileTool) Schema() llm.JSONSchema {
+	return llm.JSONSchema{
 		Type: "object",
-		Properties: map[string]ollama.JSONSchema{
+		Properties: map[string]llm.JSONSchema{
 			"path":   {Type: "string", Description: "File path relative to work directory"},
 			"offset": {Type: "integer", Description: "Start line (0-based). Default: 0"},
 			"limit":  {Type: "integer", Description: "Max lines to read. Default: 500"},
@@ -54,6 +54,14 @@ func (t *ReadFileTool) Execute(ctx context.Context, params map[string]any) (*Too
 
 	if reason := IsPathBlocked(ctx, path, resolved, t.forbiddenPatterns); reason != "" {
 		return nil, &ToolError{Msg: reason}
+	}
+
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return nil, fmt.Errorf("read file: %w", err)
+	}
+	if info.IsDir() {
+		return nil, &ToolError{Msg: fmt.Sprintf("%s is a directory, use list_dir(path=%q) instead", path, path)}
 	}
 
 	data, err := os.ReadFile(resolved)

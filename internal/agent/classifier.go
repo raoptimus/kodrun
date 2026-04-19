@@ -8,7 +8,7 @@ import (
 
 	"github.com/pkg/errors"
 
-	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/llm"
 )
 
 // ClassifyKind enumerates the categories the response classifier may assign.
@@ -56,7 +56,7 @@ func safeClassifyDefault() ClassifyResult {
 // timeout caps the whole call (including LLM time). Pass 0 to disable.
 func ClassifyResponse(
 	ctx context.Context,
-	client *ollama.Client,
+	client llm.Client,
 	model, lang, userInput, agentResponse string,
 	timeout time.Duration,
 ) (ClassifyResult, error) {
@@ -73,12 +73,12 @@ func ClassifyResponse(
 		defer cancel()
 	}
 
-	systemPrompt := systemPromptForRole(RoleResponseClassifier, lang, "", nil)
+	systemPrompt := systemPromptForRole(RoleResponseClassifier, lang, "", "", nil)
 	userPayload := "USER_INPUT:\n" + userInput + "\n\nAGENT_RESPONSE:\n" + agentResponse
 
-	req := ollama.ChatRequest{
+	req := llm.ChatRequest{
 		Model: model,
-		Messages: []ollama.Message{
+		Messages: []llm.Message{
 			{Role: "system", Content: systemPrompt},
 			{Role: "user", Content: userPayload},
 		},

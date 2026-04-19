@@ -7,7 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 
-	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/llm"
 )
 
 const (
@@ -45,10 +45,10 @@ func NewDeleteFileTool(workDir string, forbiddenPatterns []string) *DeleteFileTo
 func (t *DeleteFileTool) Name() string        { return "delete_file" }
 func (t *DeleteFileTool) Description() string { return "Delete a file" }
 
-func (t *DeleteFileTool) Schema() ollama.JSONSchema {
-	return ollama.JSONSchema{
+func (t *DeleteFileTool) Schema() llm.JSONSchema {
+	return llm.JSONSchema{
 		Type: "object",
-		Properties: map[string]ollama.JSONSchema{
+		Properties: map[string]llm.JSONSchema{
 			"path": {Type: "string", Description: "File path relative to work directory"},
 		},
 		Required: []string{"path"},
@@ -94,10 +94,10 @@ func NewCreateDirTool(workDir string, forbiddenPatterns []string) *CreateDirTool
 func (t *CreateDirTool) Name() string        { return "create_dir" }
 func (t *CreateDirTool) Description() string { return "Create a directory (with parents)" }
 
-func (t *CreateDirTool) Schema() ollama.JSONSchema {
-	return ollama.JSONSchema{
+func (t *CreateDirTool) Schema() llm.JSONSchema {
+	return llm.JSONSchema{
 		Type: "object",
-		Properties: map[string]ollama.JSONSchema{
+		Properties: map[string]llm.JSONSchema{
 			"path": {Type: "string", Description: "Directory path relative to work directory"},
 		},
 		Required: []string{"path"},
@@ -156,10 +156,10 @@ func NewMoveFileTool(workDir string, forbiddenPatterns []string) *MoveFileTool {
 func (t *MoveFileTool) Name() string        { return "move_file" }
 func (t *MoveFileTool) Description() string { return "Move or rename a file" }
 
-func (t *MoveFileTool) Schema() ollama.JSONSchema {
-	return ollama.JSONSchema{
+func (t *MoveFileTool) Schema() llm.JSONSchema {
+	return llm.JSONSchema{
 		Type: "object",
-		Properties: map[string]ollama.JSONSchema{
+		Properties: map[string]llm.JSONSchema{
 			"from": {Type: "string", Description: "Source file path"},
 			"to":   {Type: "string", Description: "Destination file path"},
 		},

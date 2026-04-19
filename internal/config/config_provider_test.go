@@ -225,6 +225,7 @@ func TestConfig_Validate_RAGProviderMissing_Failure(t *testing.T) {
 		},
 		RAG: RAGConfig{
 			Enabled:  true,
+			Backend:  RAGBackendLocal,
 			Provider: "missing",
 		},
 	}
@@ -246,6 +247,7 @@ func TestConfig_Validate_RAGProviderEmptyModel_Failure(t *testing.T) {
 		},
 		RAG: RAGConfig{
 			Enabled:  true,
+			Backend:  RAGBackendLocal,
 			Provider: "rag-emb",
 		},
 	}

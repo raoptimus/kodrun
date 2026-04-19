@@ -5,7 +5,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/llm"
 )
 
 func TestEstimateStringTokens_EmptyString_Successfully(t *testing.T) {
@@ -85,7 +85,7 @@ func TestContextManager_EstimateTokens_Successfully(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		messages []ollama.Message
+		messages []llm.Message
 		want     int
 	}{
 		{
@@ -95,14 +95,14 @@ func TestContextManager_EstimateTokens_Successfully(t *testing.T) {
 		},
 		{
 			name: "single message 8 chars",
-			messages: []ollama.Message{
+			messages: []llm.Message{
 				{Role: "user", Content: "abcdefgh"},
 			},
 			want: 6, // 8/4=2 tokens + 4 overhead = 6
 		},
 		{
 			name: "two messages",
-			messages: []ollama.Message{
+			messages: []llm.Message{
 				{Role: "system", Content: "abcdefgh"},
 				{Role: "user", Content: "abcdefghijklmnop"},
 			},
@@ -133,11 +133,11 @@ func TestContextManager_BuildTrimmed_Successfully(t *testing.T) {
 
 	cm := NewContextManager(1000, nil, "test-model")
 
-	head := []ollama.Message{
+	head := []llm.Message{
 		{Role: "system", Content: "you are an assistant"},
 		{Role: "user", Content: "hello"},
 	}
-	tail := []ollama.Message{
+	tail := []llm.Message{
 		{Role: "user", Content: "latest question"},
 		{Role: "assistant", Content: "latest answer"},
 	}
@@ -160,7 +160,7 @@ func TestContextManager_Trim_UnderBudget_Successfully(t *testing.T) {
 	// maxTokens is very large, so no trimming should happen.
 	cm := NewContextManager(100000, nil, "test-model")
 
-	messages := []ollama.Message{
+	messages := []llm.Message{
 		{Role: "system", Content: "sys"},
 		{Role: "user", Content: "hello"},
 		{Role: "assistant", Content: "hi"},
@@ -178,9 +178,9 @@ func TestContextManager_Trim_TooFewMessages_Successfully(t *testing.T) {
 	// maxTokens is 1 (force trimming), but messages count <= keepFirst + keepLast.
 	cm := NewContextManager(1, nil, "test-model")
 
-	messages := make([]ollama.Message, keepFirstMessages+keepLastMessages)
+	messages := make([]llm.Message, keepFirstMessages+keepLastMessages)
 	for i := range messages {
-		messages[i] = ollama.Message{Role: "user", Content: "msg"}
+		messages[i] = llm.Message{Role: "user", Content: "msg"}
 	}
 
 	result, err := cm.Trim(t.Context(), messages)

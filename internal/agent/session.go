@@ -11,22 +11,22 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/llm"
 )
 
 const sessionFilePermission = 0o600
 
 // Session represents a saved conversation session.
 type Session struct {
-	ID        string           `json:"id"`
-	CreatedAt time.Time        `json:"created_at"`
-	UpdatedAt time.Time        `json:"updated_at"`
-	Model     string           `json:"model"`
-	Mode      string           `json:"mode"`
-	Messages  []ollama.Message `json:"messages"`
-	Plan      string           `json:"plan,omitempty"`
-	Stats     SessionStats     `json:"stats"`
-	WorkDir   string           `json:"work_dir"`
+	ID        string        `json:"id"`
+	CreatedAt time.Time     `json:"created_at"`
+	UpdatedAt time.Time     `json:"updated_at"`
+	Model     string        `json:"model"`
+	Mode      string        `json:"mode"`
+	Messages  []llm.Message `json:"messages"`
+	Plan      string        `json:"plan,omitempty"`
+	Stats     SessionStats  `json:"stats"`
+	WorkDir   string        `json:"work_dir"`
 }
 
 // SessionSummary is a lightweight view of a session for listing.

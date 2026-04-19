@@ -6,7 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/llm"
 )
 
 const (
@@ -30,10 +30,10 @@ func (t *WriteFileTool) Description() string {
 	return "Write content to a file, creating directories as needed"
 }
 
-func (t *WriteFileTool) Schema() ollama.JSONSchema {
-	return ollama.JSONSchema{
+func (t *WriteFileTool) Schema() llm.JSONSchema {
+	return llm.JSONSchema{
 		Type: "object",
-		Properties: map[string]ollama.JSONSchema{
+		Properties: map[string]llm.JSONSchema{
 			"path":    {Type: "string", Description: "File path relative to work directory"},
 			"content": {Type: "string", Description: "File content to write"},
 		},

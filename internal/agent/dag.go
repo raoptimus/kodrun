@@ -153,7 +153,7 @@ func formatStepDescription(step *Step) string {
 //
 // Sub-agents share the orchestrator's tool result cache (Block 2), so
 // repeated reads across steps are free.
-func (o *Orchestrator) runPlanDAG(ctx context.Context, plan *Plan, maxParallel int, confirmFn ConfirmFunc) (SessionStats, error) {
+func (o *Orchestrator) runPlanDAG(ctx context.Context, plan *Plan, maxParallel int, confirmFn ConfirmFunc, autoAccept bool) (SessionStats, error) {
 	if maxParallel < 1 {
 		maxParallel = 1
 	}
@@ -215,9 +215,9 @@ func (o *Orchestrator) runPlanDAG(ctx context.Context, plan *Plan, maxParallel i
 	// step, skips it, or signals cancellation. Returns false when the user
 	// chose StepDenyAll.
 	trySchedule := func(id int) bool {
-		if o.stepConfirmFn != nil {
-			step := dag.steps[id]
-			desc := formatStepDescription(step)
+		step := dag.steps[id]
+		desc := formatStepDescription(step)
+		if !autoAccept && o.stepConfirmFn != nil {
 			switch o.stepConfirmFn(desc) {
 			case StepSkip:
 				done[id] = true
@@ -229,6 +229,8 @@ func (o *Orchestrator) runPlanDAG(ctx context.Context, plan *Plan, maxParallel i
 				cancel()
 				return false
 			}
+		} else if autoAccept {
+			o.emit(&Event{Type: EventAgent, Message: desc})
 		}
 		startStep(id)
 		return true

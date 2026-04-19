@@ -6,20 +6,20 @@ import (
 	"strings"
 
 	"github.com/pkg/errors"
-	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/llm"
 	"github.com/raoptimus/kodrun/internal/tools"
 )
 
 // Fixer uses an LLM to automatically fix Go errors.
 type Fixer struct {
-	client  *ollama.Client
+	client  llm.Client
 	model   string
 	reg     *tools.Registry
 	maxIter int
 }
 
 // NewFixer creates a new error fixer.
-func NewFixer(_ context.Context, client *ollama.Client, model string, reg *tools.Registry, maxIter int) *Fixer {
+func NewFixer(_ context.Context, client llm.Client, model string, reg *tools.Registry, maxIter int) *Fixer {
 	return &Fixer{
 		client:  client,
 		model:   model,
@@ -64,9 +64,9 @@ Fix each error. Use edit_file with old_str/new_str for targeted changes.`,
 			onEvent(fmt.Sprintf("[fix] attempt %d/%d", iter+1, f.maxIter))
 		}
 
-		resp, err := f.client.ChatSync(ctx, &ollama.ChatRequest{
+		resp, err := f.client.ChatSync(ctx, &llm.ChatRequest{
 			Model: f.model,
-			Messages: []ollama.Message{
+			Messages: []llm.Message{
 				{Role: "system", Content: "You are a Go expert. Fix errors using available tools. Be precise and minimal in changes."},
 				{Role: "user", Content: prompt},
 			},

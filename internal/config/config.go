@@ -12,7 +12,15 @@ import (
 	"github.com/spf13/viper"
 )
 
-const providerDefault = "default"
+const (
+	providerDefault = "default"
+
+	// RAGBackendLocal is the default RAG backend using local in-memory vector
+	// index with disk persistence.
+	RAGBackendLocal = "local"
+	// RAGBackendMuninn selects Muninn DB as the RAG backend.
+	RAGBackendMuninn = "muninn"
+)
 
 // Config is the root configuration structure.
 type Config struct {
@@ -102,13 +110,19 @@ type MCPServerConfig struct {
 	Disabled         bool              `mapstructure:"disabled"`
 }
 
-// ProviderConfig describes a single LLM provider instance (currently only Ollama).
+// ProviderConfig describes a single LLM provider instance.
+//
+// Type selects the backend: "ollama" (default) or "openai" (for vllm and
+// other OpenAI-compatible servers). APIKey is sent as a Bearer token when
+// set (used by the "openai" backend).
 //
 // Temperature and Format are optional generation parameters used by roles that
 // need different behaviour than the default chat profile. The extractor role,
 // for instance, uses Temperature=0 and Format="json" to coerce structured
 // output from the same underlying model.
 type ProviderConfig struct {
+	Type        string        `mapstructure:"type"`
+	APIKey      string        `mapstructure:"api_key"`
 	BaseURL     string        `mapstructure:"base_url"`
 	Model       string        `mapstructure:"model"`
 	Timeout     time.Duration `mapstructure:"timeout"`
@@ -173,10 +187,14 @@ type SnippetsConfig struct {
 
 // RAGConfig holds RAG (Retrieval-Augmented Generation) settings.
 //
-// The embedding model and connection details come from the provider profile
-// referenced by Provider — there is no per-RAG embedding_model field. To
-// switch embedding model, define a dedicated profile in `providers:` and
-// point `rag.provider` at it.
+// Backend selects the storage engine: "local" (default, in-memory vector
+// index with disk persistence) or "muninn" (Muninn DB server that handles
+// embeddings internally).
+//
+// When Backend is "local", the embedding model and connection details come
+// from the provider profile referenced by Provider. When Backend is
+// "muninn", the Provider field is not required — Muninn handles embeddings
+// on its own.
 //
 // Scope: RAG indexes project conventions only — files under
 // `.kodrun/rules/`, `.kodrun/snippets/`, `.kodrun/docs/`, plus embedded
@@ -187,6 +205,9 @@ type SnippetsConfig struct {
 type RAGConfig struct {
 	Provider string `mapstructure:"provider"`
 	Enabled  bool   `mapstructure:"enabled"`
+	// Backend selects the RAG storage engine: "local" (default) or "muninn".
+	Backend string       `mapstructure:"backend"`
+	Muninn  MuninnConfig `mapstructure:"muninn"`
 	// Deprecated: kodrun no longer indexes project source code. Only
 	// .kodrun/rules, .kodrun/snippets, .kodrun/docs and embedded language
 	// standards are indexed. The field is kept so old configs continue to
@@ -203,6 +224,12 @@ type RAGConfig struct {
 	// into /code-review prompts. 0 falls back to the built-in default.
 	ReviewBudgetBytes int    `mapstructure:"review_budget_bytes"`
 	IndexPath         string `mapstructure:"index_path"`
+}
+
+// MuninnConfig holds Muninn DB connection settings.
+type MuninnConfig struct {
+	URL   string `mapstructure:"url"`
+	Vault string `mapstructure:"vault"`
 }
 
 // Default configuration values.
@@ -266,6 +293,8 @@ func Defaults() Config {
 		},
 		RAG: RAGConfig{
 			Enabled:           false,
+			Backend:           RAGBackendLocal,
+			Muninn:            MuninnConfig{URL: "http://127.0.0.1:8475", Vault: "kodrun"},
 			IndexDirs:         []string{"."},
 			ExcludeDirs:       []string{".claude", ".git", "vendor", "node_modules", ".kodrun/rag_index"},
 			ChunkSize:         defaultRAGChunkSize,
@@ -368,6 +397,9 @@ func (c *Config) migrate(_ context.Context) {
 	if c.RAG.Provider == "" {
 		c.RAG.Provider = providerDefault
 	}
+	if c.RAG.Backend == "" {
+		c.RAG.Backend = RAGBackendLocal
+	}
 }
 
 // Validate checks that configuration values are within acceptable ranges.
@@ -392,12 +424,21 @@ func (c *Config) Validate(_ context.Context) error {
 		}
 	}
 	if c.RAG.Enabled {
-		ragProv, ok := c.Providers[c.RAG.Provider]
-		if !ok {
-			return pkgerrors.Errorf("rag.provider %q not found in providers", c.RAG.Provider)
-		}
-		if ragProv.Model == "" {
-			return pkgerrors.Errorf("rag.provider %q has empty model — set providers.%s.model to your embedding model (e.g. nomic-embed-text)", c.RAG.Provider, c.RAG.Provider)
+		switch c.RAG.Backend {
+		case RAGBackendLocal:
+			ragProv, ok := c.Providers[c.RAG.Provider]
+			if !ok {
+				return pkgerrors.Errorf("rag.provider %q not found in providers", c.RAG.Provider)
+			}
+			if ragProv.Model == "" {
+				return pkgerrors.Errorf("rag.provider %q has empty model — set providers.%s.model to your embedding model (e.g. nomic-embed-text)", c.RAG.Provider, c.RAG.Provider)
+			}
+		case RAGBackendMuninn:
+			if c.RAG.Muninn.URL == "" {
+				return pkgerrors.New("rag.muninn.url is required when backend is \"muninn\"")
+			}
+		default:
+			return pkgerrors.Errorf("rag.backend %q is not supported (use \"local\" or \"muninn\")", c.RAG.Backend)
 		}
 	}
 

@@ -11,7 +11,7 @@ import (
 	"strings"
 
 	"github.com/pkg/errors"
-	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/llm"
 )
 
 const (
@@ -38,7 +38,7 @@ type Result struct {
 
 // Run creates the .kodrun/ starter structure and AGENTS.md.
 // Returns an error if AGENTS.md already exists.
-func Run(ctx context.Context, workDir string, client *ollama.Client, model string) (*Result, error) {
+func Run(ctx context.Context, workDir string, client llm.Client, model string) (*Result, error) {
 	agentsPath := filepath.Join(workDir, "AGENTS.md")
 	if _, err := os.Stat(agentsPath); err == nil {
 		return nil, errors.New("AGENTS.md already exists")
@@ -103,7 +103,7 @@ func Run(ctx context.Context, workDir string, client *ollama.Client, model strin
 }
 
 // generateAgentsMD collects project context and asks the LLM to produce AGENTS.md.
-func generateAgentsMD(ctx context.Context, workDir string, client *ollama.Client, model string) (string, error) {
+func generateAgentsMD(ctx context.Context, workDir string, client llm.Client, model string) (string, error) {
 	projectCtx := collectProjectContext(ctx, workDir)
 
 	prompt := `Analyze the following Go project information and generate an AGENTS.md file.
@@ -121,9 +121,9 @@ Output ONLY the markdown content for AGENTS.md, starting with "# AGENTS.md". Be 
 Project information:
 ` + projectCtx
 
-	resp, err := client.ChatSync(ctx, &ollama.ChatRequest{
+	resp, err := client.ChatSync(ctx, &llm.ChatRequest{
 		Model: model,
-		Messages: []ollama.Message{
+		Messages: []llm.Message{
 			{Role: "user", Content: prompt},
 		},
 	})

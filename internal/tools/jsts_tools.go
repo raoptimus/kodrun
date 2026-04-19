@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/llm"
 )
 
 const defaultArgsDesc = "Additional arguments"
@@ -21,12 +21,12 @@ type jstsTool struct {
 	description string
 	command     string
 	defaultArgs []string
-	schema      ollama.JSONSchema
+	schema      llm.JSONSchema
 }
 
-func (t *jstsTool) Name() string              { return t.name }
-func (t *jstsTool) Description() string       { return t.description }
-func (t *jstsTool) Schema() ollama.JSONSchema { return t.schema }
+func (t *jstsTool) Name() string           { return t.name }
+func (t *jstsTool) Description() string    { return t.description }
+func (t *jstsTool) Schema() llm.JSONSchema { return t.schema }
 
 func (t *jstsTool) Execute(ctx context.Context, params map[string]any) (*ToolResult, error) {
 	const extraArgsCap = 4
@@ -75,13 +75,13 @@ func (t *jstsTool) Execute(ctx context.Context, params map[string]any) (*ToolRes
 	}, nil
 }
 
-func jstsToolSchema(argsDesc string) ollama.JSONSchema {
+func jstsToolSchema(argsDesc string) llm.JSONSchema {
 	if argsDesc == "" {
 		argsDesc = defaultArgsDesc
 	}
-	return ollama.JSONSchema{
+	return llm.JSONSchema{
 		Type: "object",
-		Properties: map[string]ollama.JSONSchema{
+		Properties: map[string]llm.JSONSchema{
 			"args": {Type: "string", Description: argsDesc},
 		},
 	}

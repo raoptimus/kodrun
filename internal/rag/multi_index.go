@@ -5,8 +5,11 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/llm"
 )
+
+// Compile-time assertion: *MultiIndex satisfies Backend.
+var _ Backend = (*MultiIndex)(nil)
 
 // commonKey is the subdirectory used for the single on-disk sub-index.
 // The name is preserved for backward compatibility with existing index
@@ -31,7 +34,7 @@ type MultiIndex struct {
 }
 
 // NewMultiIndex creates a new MultiIndex rooted at basePath.
-func NewMultiIndex(client *ollama.Client, model, basePath string) *MultiIndex {
+func NewMultiIndex(client llm.Client, model, basePath string) *MultiIndex {
 	return &MultiIndex{
 		basePath: basePath,
 		common:   NewIndex(client, model, filepath.Join(basePath, commonKey)),

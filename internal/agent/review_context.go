@@ -97,8 +97,9 @@ func prefetchPackageStructures(ctx context.Context, reg *tools.Registry, workDir
 }
 
 // buildPerFileRAGMap runs RAG search for each file and returns
-// map[filePath]->formatted RAG block.
-func buildPerFileRAGMap(ctx context.Context, ragIndex tools.RAGSearcher, files []string, topK int) map[string]string {
+// map[filePath]->formatted RAG block. lang is the detected project language
+// used to include embedded language standards (e.g. go_common_mistakes).
+func buildPerFileRAGMap(ctx context.Context, ragIndex tools.RAGSearcher, files []string, topK int, lang string) map[string]string {
 	if ragIndex == nil || topK <= 0 {
 		return nil
 	}
@@ -131,6 +132,27 @@ func buildPerFileRAGMap(ctx context.Context, ragIndex tools.RAGSearcher, files [
 			result[f] = formatRAGResults(results)
 		}
 	}
+
+	// Append embedded language-standard results to every file's block.
+	var embeddedResults []rag.SearchResult
+	for _, name := range rag.EmbeddedDocNames(lang) {
+		results, err := ragIndex.Search(ctx, name, ragRuleTopK)
+		if err != nil {
+			continue
+		}
+		embeddedResults = append(embeddedResults, results...)
+	}
+	if len(embeddedResults) > 0 {
+		embeddedBlock := formatRAGResults(embeddedResults)
+		for _, f := range files {
+			if existing, ok := result[f]; ok {
+				result[f] = existing + embeddedBlock
+			} else {
+				result[f] = embeddedBlock
+			}
+		}
+	}
+
 	return result
 }
 
@@ -181,7 +203,7 @@ func buildPerFileReviewPrompt(filePath, fileContent, ragBlock, depSignatures str
 
 	b.WriteString("## Reminders\n")
 	b.WriteString("- Line numbers come from the file content above.\n")
-	b.WriteString("- Format: path:LINE — SEVERITY — description — FIX: suggestion\n")
+	b.WriteString("- Format: multi-line block starting with `path:LINE — SEVERITY`, then WHAT/WHY/FIX/BEFORE/AFTER/RULES fields\n")
 	b.WriteString("- If no issues found, output exactly: NO_ISSUES\n")
 
 	return b.String()
@@ -202,7 +224,7 @@ func buildArchReviewPrompt(projectStructure, archSnippets string) string {
 	b.WriteString("\n\n")
 
 	b.WriteString("## Reminders\n")
-	b.WriteString("- Format: path/to/package — SEVERITY — description — FIX: suggestion\n")
+	b.WriteString("- Format: multi-line block starting with `path/to/package — SEVERITY`, then WHAT/WHY/FIX/RULES fields\n")
 	b.WriteString("- If no issues found, output exactly: NO_ISSUES\n")
 
 	return b.String()

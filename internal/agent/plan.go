@@ -135,7 +135,7 @@ var planPathRe = regexp.MustCompile(`\b([\w./-]+\.(?:go|md|yaml|yml|json|py|ts|t
 //     emit when forced into JSON.
 //  3. Any object with a "context" field — render the context and dump
 //     remaining fields as a fallback.
-func RenderExtractorOutput(raw string) string {
+func RenderExtractorOutput(raw, lang string) string {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
 		return raw
@@ -170,7 +170,7 @@ func RenderExtractorOutput(raw string) string {
 	wrote := false
 	// Shape 1: canonical "steps".
 	if stepsRaw, ok := generic["steps"].([]any); ok && len(stepsRaw) > 0 {
-		b.WriteString("## Plan\n")
+		b.WriteString(planLabel(lang, "tasks"))
 		for i, s := range stepsRaw {
 			renderStep(&b, i+1, s)
 		}
@@ -179,7 +179,7 @@ func RenderExtractorOutput(raw string) string {
 	// Shape 2: free-form "plan".
 	if !wrote {
 		if planRaw, ok := generic["plan"].([]any); ok && len(planRaw) > 0 {
-			b.WriteString("## Plan\n")
+			b.WriteString(planLabel(lang, "tasks"))
 			for i, item := range planRaw {
 				renderStep(&b, i+1, item)
 			}
@@ -191,17 +191,37 @@ func RenderExtractorOutput(raw string) string {
 		// at least nothing is lost.
 		return raw
 	}
+
+	// Affected files section.
+	if filesRaw, ok := generic["affected_files"].([]any); ok && len(filesRaw) > 0 {
+		b.WriteString(planLabel(lang, "affected"))
+		for _, f := range filesRaw {
+			if s, ok := f.(string); ok && s != "" {
+				fmt.Fprintf(&b, "- %s\n", s)
+			}
+		}
+	}
+
+	// Verification section.
+	if verRaw, ok := generic["verification"].([]any); ok && len(verRaw) > 0 {
+		b.WriteString(planLabel(lang, "verification"))
+		for _, v := range verRaw {
+			if s, ok := v.(string); ok && s != "" {
+				fmt.Fprintf(&b, "- [ ] %s\n", s)
+			}
+		}
+	}
+
 	return strings.TrimRight(b.String(), "\n") + "\n"
 }
 
-// renderStep renders a single plan item as a markdown bullet. The item can be
-// a string (already formatted) or an object with title/description fields.
+// renderStep renders a single plan item as a markdown block. The item can be
+// a string (legacy format), a structured finding object (file/line/severity/what/...),
+// or a structurer step object (title/files/rationale).
 func renderStep(b *strings.Builder, idx int, item any) {
 	switch v := item.(type) {
 	case string:
 		line := strings.TrimSpace(v)
-		// If the string already starts with "<n>." keep it as-is to avoid
-		// double-numbering.
 		if hasLeadingNumber(line) {
 			b.WriteString(line)
 		} else {
@@ -209,6 +229,14 @@ func renderStep(b *strings.Builder, idx int, item any) {
 		}
 		b.WriteByte('\n')
 	case map[string]any:
+		// Detect structured finding format (has "file" + "severity" + "what").
+		if file := firstString(v, "file"); file != "" {
+			if what := firstString(v, "what"); what != "" {
+				renderFindingStep(b, idx, v)
+				return
+			}
+		}
+		// Fallback: structurer step format (title/files/rationale).
 		title := firstString(v, "title", "task", "name", "description", "text")
 		fmt.Fprintf(b, "%d. %s", idx, title)
 		if files, ok := v["files"].([]any); ok && len(files) > 0 {
@@ -228,6 +256,45 @@ func renderStep(b *strings.Builder, idx int, item any) {
 		b.WriteByte('\n')
 	default:
 		fmt.Fprintf(b, "%d. %v\n", idx, v)
+	}
+}
+
+// renderFindingStep renders a structured finding object as a multi-line block.
+func renderFindingStep(b *strings.Builder, idx int, v map[string]any) {
+	file := firstString(v, "file")
+	severity := firstString(v, "severity")
+	lineNo := 0
+	if ln, ok := v["line"].(float64); ok {
+		lineNo = int(ln)
+	}
+
+	fmt.Fprintf(b, "\n### %d. %s:%d [%s]\n\n", idx, file, lineNo, severity)
+
+	if what := firstString(v, "what"); what != "" {
+		fmt.Fprintf(b, "- **What:** %s\n", what)
+	}
+	if why := firstString(v, "why"); why != "" {
+		fmt.Fprintf(b, "- **Why:** %s\n", why)
+	}
+	if fix := firstString(v, "fix"); fix != "" {
+		fmt.Fprintf(b, "- **Fix:** %s\n", fix)
+	}
+	if before := firstString(v, "before"); before != "" {
+		fmt.Fprintf(b, "- **Before:** %s\n", before)
+	}
+	if after := firstString(v, "after"); after != "" {
+		fmt.Fprintf(b, "- **After:** %s\n", after)
+	}
+	if rulesRaw, ok := v["rules"].([]any); ok && len(rulesRaw) > 0 {
+		parts := make([]string, 0, len(rulesRaw))
+		for _, r := range rulesRaw {
+			if s, ok := r.(string); ok && s != "" {
+				parts = append(parts, s)
+			}
+		}
+		if len(parts) > 0 {
+			fmt.Fprintf(b, "- **Rules:** %s\n", strings.Join(parts, ", "))
+		}
 	}
 }
 

@@ -5,7 +5,7 @@ import (
 )
 
 func TestSystemPromptForRole_Planner(t *testing.T) {
-	prompt := systemPromptForRole(RolePlanner, "en", "", []string{"read_file", "grep"})
+	prompt := systemPromptForRole(RolePlanner, "en", "", "", []string{"read_file", "grep"})
 
 	if !contains(prompt, "PLANNER") {
 		t.Error("planner prompt should mention PLANNER")
@@ -19,7 +19,7 @@ func TestSystemPromptForRole_Planner(t *testing.T) {
 }
 
 func TestSystemPromptForRole_Executor(t *testing.T) {
-	prompt := systemPromptForRole(RoleExecutor, "ru", "", []string{"write_file", "edit_file", "go_build"})
+	prompt := systemPromptForRole(RoleExecutor, "ru", "", "", []string{"write_file", "edit_file", "go_build"})
 
 	if !contains(prompt, "EXECUTOR") {
 		t.Error("executor prompt should mention EXECUTOR")
@@ -33,7 +33,7 @@ func TestSystemPromptForRole_Executor(t *testing.T) {
 }
 
 func TestSystemPromptForRole_Reviewer(t *testing.T) {
-	prompt := systemPromptForRole(RoleReviewer, "en", "## Rules\n- rule1", []string{"read_file"})
+	prompt := systemPromptForRole(RoleReviewer, "en", "", "## Rules\n- rule1", []string{"read_file"})
 
 	if !contains(prompt, "REVIEWER") {
 		t.Error("reviewer prompt should mention REVIEWER")
@@ -48,7 +48,7 @@ func TestSystemPromptForRole_Reviewer(t *testing.T) {
 
 func TestSystemPromptForRole_WithRuleCatalog(t *testing.T) {
 	catalog := "## Project Rules\n- Use Go 1.25+\n- Follow conventions"
-	prompt := systemPromptForRole(RolePlanner, "en", catalog, nil)
+	prompt := systemPromptForRole(RolePlanner, "en", "", catalog, nil)
 
 	if !contains(prompt, "Project Rules") {
 		t.Error("prompt should include rule catalog")

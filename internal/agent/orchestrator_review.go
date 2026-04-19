@@ -47,14 +47,18 @@ func (o *Orchestrator) RunCodeReview(ctx context.Context, files []string, allSni
 	o.emitPhase("reviewing")
 
 	// Phase 0: Preparation.
-	o.emit(&Event{Type: EventAgent, Message: fmt.Sprintf("▸ Preparing context for %d files...", len(files))})
+	if o.verbose {
+		o.emit(&Event{Type: EventAgent, Message: fmt.Sprintf("▸ Preparing context for %d files...", len(files))})
+	}
 
 	modulePath := readModulePath(o.workDir)
 	depStructures := prefetchPackageStructures(ctx, o.reg, o.workDir, files, modulePath)
-	ragMap := buildPerFileRAGMap(ctx, o.ragIndex, files, reviewRAGTopK)
+	ragMap := buildPerFileRAGMap(ctx, o.ragIndex, files, reviewRAGTopK, o.progLang())
 	reviewCache := NewReviewCache(o.workDir)
 
-	o.emit(&Event{Type: EventAgent, Message: fmt.Sprintf("▸ Prefetched %d package structures, %d RAG blocks", len(depStructures), len(ragMap))})
+	if o.verbose {
+		o.emit(&Event{Type: EventAgent, Message: fmt.Sprintf("▸ Prefetched %d package structures, %d RAG blocks", len(depStructures), len(ragMap))})
+	}
 
 	// Phase 1: Per-file review (parallel).
 	const reviewGroupID = "code-review"
@@ -88,8 +92,15 @@ func (o *Orchestrator) RunCodeReview(ctx context.Context, files []string, allSni
 				Message: fmt.Sprintf("Reviewing(%s) [%d/%d]", filePath, i+1, len(files)),
 			})
 
+			fileCtx := reviewCtx
+			if o.specialistTimeout > 0 {
+				var cancel context.CancelFunc
+				fileCtx, cancel = context.WithTimeout(reviewCtx, o.specialistTimeout)
+				defer cancel()
+			}
+
 			specStart := time.Now()
-			r := o.reviewSingleFile(reviewCtx, filePath, ragMap[filePath], modulePath, depStructures, reviewCache, reviewGroupID)
+			r := o.reviewSingleFile(fileCtx, filePath, ragMap[filePath], modulePath, depStructures, reviewCache, reviewGroupID)
 			r.duration = time.Since(specStart)
 			results[i] = r
 
@@ -102,7 +113,9 @@ func (o *Orchestrator) RunCodeReview(ctx context.Context, files []string, allSni
 	wg.Wait()
 
 	// Phase 2: Architecture review (single call).
-	o.emit(&Event{Type: EventAgent, Message: "▸ Running architecture review..."})
+	if o.verbose {
+		o.emit(&Event{Type: EventAgent, Message: "▸ Running architecture review..."})
+	}
 	archResult := o.reviewArchitecture(ctx, depStructures, allSnippets, reviewGroupID)
 
 	o.emit(&Event{Type: EventGroupEnd, GroupID: reviewGroupID})
@@ -170,19 +183,23 @@ func (o *Orchestrator) RunCodeReview(ctx context.Context, files []string, allSni
 		return nil
 	}
 
-	o.emit(&Event{Type: EventAgent, Message: "▸ Merging reviewer findings..."})
-	finalPlan := mergeSpecialistFindings(allResults)
+	if o.verbose {
+		o.emit(&Event{Type: EventAgent, Message: "▸ Merging reviewer findings..."})
+	}
+	finalPlan := mergeSpecialistFindings(allResults, o.language)
 	if finalPlan == "" {
 		o.emit(&Event{Type: EventAgent, Message: "⚠ No strict finding lines parsed — showing raw reports."})
 		finalPlan = strings.Join(sections, "\n\n---\n\n")
 	}
 
-	o.emit(&Event{Type: EventAgent, Message: "▸ Extracting structured plan..."})
+	if o.verbose {
+		o.emit(&Event{Type: EventAgent, Message: "▸ Extracting structured plan..."})
+	}
 	extracted, err := o.runExtractor(ctx, finalPlan)
 	if err != nil {
 		o.emit(&Event{Type: EventError, Message: fmt.Sprintf("Extractor failed, using raw merge: %v", err)})
 	} else {
-		finalPlan = RenderExtractorOutput(extracted)
+		finalPlan = RenderExtractorOutput(extracted, o.language)
 	}
 
 	return o.confirmAndExecute(ctx, finalPlan, "Code review completed")
@@ -201,6 +218,7 @@ func (o *Orchestrator) reviewSingleFile(
 	if err != nil {
 		return reviewResult{role: RoleCodeReviewer, err: fmt.Errorf("read %s: %w", filePath, err)}
 	}
+	o.emit(&Event{Type: EventTool, Tool: "read_file", Message: filePath, GroupID: groupID, Success: true})
 	fileContent := res.Output
 
 	// Build dependency signatures.
@@ -219,7 +237,7 @@ func (o *Orchestrator) reviewSingleFile(
 
 	cacheKey := ReviewCacheKey(filePath, modTime, ragBlock, depSigs)
 	if findings, ok := cache.Get(cacheKey); ok {
-		o.emit(&Event{Type: EventTool, Tool: "cache_hit", Message: filePath, GroupID: groupID})
+		o.emit(&Event{Type: EventTool, Tool: "read_file", Message: filePath, GroupID: groupID, CacheHit: true})
 		return reviewResult{role: RoleCodeReviewer, text: findings}
 	}
 
@@ -229,7 +247,7 @@ func (o *Orchestrator) reviewSingleFile(
 	ag := o.newAgent(RoleCodeReviewer, o.maxRevIter)
 	ag.SetTaskLabel("")
 	ag.SetGroupID(groupID)
-	sysPrompt := systemPromptForRole(RoleCodeReviewer, o.language, o.ruleCatalog, nil, o.hasSnippets, o.hasRAG)
+	sysPrompt := systemPromptForRole(RoleCodeReviewer, o.language, o.progLang(), o.ruleCatalog, nil, o.hasSnippets, o.hasRAG)
 	ag.InitWithPrompt(sysPrompt)
 
 	if err := ag.Send(ctx, prompt); err != nil && !errors.Is(err, ErrMaxIterations) {
@@ -275,13 +293,20 @@ func (o *Orchestrator) reviewArchitecture(ctx context.Context, depStructures map
 
 	prompt := buildArchReviewPrompt(structBuf.String(), archSnippetsBuf.String())
 
+	archCtx := ctx
+	if o.specialistTimeout > 0 {
+		var cancel context.CancelFunc
+		archCtx, cancel = context.WithTimeout(ctx, o.specialistTimeout)
+		defer cancel()
+	}
+
 	ag := o.newAgent(RoleArchReviewer, o.maxRevIter)
 	ag.SetTaskLabel("")
 	ag.SetGroupID(groupID)
-	sysPrompt := systemPromptForRole(RoleArchReviewer, o.language, o.ruleCatalog, nil, o.hasSnippets, o.hasRAG)
+	sysPrompt := systemPromptForRole(RoleArchReviewer, o.language, o.progLang(), o.ruleCatalog, nil, o.hasSnippets, o.hasRAG)
 	ag.InitWithPrompt(sysPrompt)
 
-	if err := ag.Send(ctx, prompt); err != nil && !errors.Is(err, ErrMaxIterations) {
+	if err := ag.Send(archCtx, prompt); err != nil && !errors.Is(err, ErrMaxIterations) {
 		return reviewResult{role: RoleArchReviewer, err: err, stats: ag.Stats()}
 	}
 

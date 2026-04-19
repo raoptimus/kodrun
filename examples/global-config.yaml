@@ -7,11 +7,24 @@
 # project-level .kodrun.yaml because they depend on the project's models and
 # workload. See examples/kodrun.yaml for the full reference.
 
+# Legacy `ollama:` section still works for backward compatibility.
+# For new setups prefer `providers:` (see examples/kodrun.yaml).
 ollama:
   base_url: "http://localhost:11434"
   model: "qwen3-coder:30b"
   timeout: 600s
   context_size: 32768
+
+# Multi-provider setup (overrides `ollama:` above when present):
+# providers:
+#   default:
+#     # type: ollama (default) | openai
+#     # api_key: ""
+#     base_url: "http://localhost:11434"
+#     model: "qwen3-coder:30b"
+#     timeout: 5m
+#     context_size: 32768
+#     temperature: 0.7
 
 agent:
   max_iterations: 100
@@ -30,3 +43,7 @@ agent:
   max_tool_workers: 4
   max_parallel_tasks: 1
   max_replans: 2
+
+tui:
+  # Maximum conversation history entries (default 100).
+  max_history: 100

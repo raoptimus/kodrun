@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/llm"
 )
 
 // ListDirTool lists files in a directory.
@@ -25,10 +25,10 @@ func NewListDirTool(workDir string, forbidden []string) *ListDirTool {
 func (t *ListDirTool) Name() string        { return "list_dir" }
 func (t *ListDirTool) Description() string { return "List files and directories in a path" }
 
-func (t *ListDirTool) Schema() ollama.JSONSchema {
-	return ollama.JSONSchema{
+func (t *ListDirTool) Schema() llm.JSONSchema {
+	return llm.JSONSchema{
 		Type: "object",
-		Properties: map[string]ollama.JSONSchema{
+		Properties: map[string]llm.JSONSchema{
 			"path":      {Type: "string", Description: "Directory path relative to work directory"},
 			"recursive": {Type: "string", Description: "If 'true', list recursively", Enum: []string{"true", "false"}},
 		},

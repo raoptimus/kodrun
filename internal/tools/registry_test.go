@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/llm"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -13,13 +13,13 @@ import (
 type stubTool struct {
 	name   string
 	desc   string
-	schema ollama.JSONSchema
+	schema llm.JSONSchema
 	execFn func(ctx context.Context, params map[string]any) (*ToolResult, error)
 }
 
 func (s *stubTool) Name() string              { return s.name }
 func (s *stubTool) Description() string       { return s.desc }
-func (s *stubTool) Schema() ollama.JSONSchema { return s.schema }
+func (s *stubTool) Schema() llm.JSONSchema { return s.schema }
 func (s *stubTool) Execute(ctx context.Context, params map[string]any) (*ToolResult, error) {
 	if s.execFn != nil {
 		return s.execFn(ctx, params)

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/llm"
 	"github.com/raoptimus/kodrun/internal/tools"
 )
 
@@ -23,7 +23,7 @@ const (
 func setupIntegrationOrchestrator(t *testing.T) *Orchestrator {
 	t.Helper()
 
-	client := ollama.NewClient(testOllamaURL, testTimeout)
+	client := llm.NewClient(testOllamaURL, testTimeout)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 

@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/llm"
 )
 
 const extBash = "bash"
@@ -30,10 +30,10 @@ func (t *FileStatTool) Description() string {
 	return "Get file metadata (size, lines, modified date) without reading contents"
 }
 
-func (t *FileStatTool) Schema() ollama.JSONSchema {
-	return ollama.JSONSchema{
+func (t *FileStatTool) Schema() llm.JSONSchema {
+	return llm.JSONSchema{
 		Type: "object",
-		Properties: map[string]ollama.JSONSchema{
+		Properties: map[string]llm.JSONSchema{
 			"path": {Type: "string", Description: "File path relative to work directory"},
 		},
 		Required: []string{"path"},

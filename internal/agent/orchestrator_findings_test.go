@@ -63,6 +63,57 @@ func TestParseSpecialistFindings(t *testing.T) {
 				{file: "f.go", line: 5, severity: "minor", body: "real"},
 			},
 		},
+		{
+			name: "legacy body with FIX separator",
+			in:   "a.go:10 — blocker — bad name — FIX: rename to good",
+			want: []specialistFinding{{
+				file: "a.go", line: 10, severity: "blocker",
+				body: "bad name", fix: "rename to good",
+			}},
+		},
+		{
+			name: "multi-line block format",
+			in: strings.Join([]string{
+				"a.go:10 — blocker",
+				"WHAT: bad variable name",
+				"WHY: violates naming convention",
+				"FIX: rename x to count",
+				"BEFORE: `x := 0`",
+				"AFTER: `count := 0`",
+				"RULES: naming, variables",
+			}, "\n"),
+			want: []specialistFinding{{
+				file: "a.go", line: 10, severity: "blocker",
+				body: "bad variable name", why: "violates naming convention",
+				fix: "rename x to count", before: "`x := 0`", after: "`count := 0`",
+				ruleNames: []string{"naming", "variables"},
+			}},
+		},
+		{
+			name: "multi-line block minimal (WHAT + FIX only)",
+			in: strings.Join([]string{
+				"b.go:5 — major",
+				"WHAT: missing error check",
+				"FIX: add if err != nil check",
+			}, "\n"),
+			want: []specialistFinding{{
+				file: "b.go", line: 5, severity: "major",
+				body: "missing error check", fix: "add if err != nil check",
+			}},
+		},
+		{
+			name: "mixed old and new format",
+			in: strings.Join([]string{
+				"a.go:1 — minor — old style finding",
+				"b.go:2 — major",
+				"WHAT: new style finding",
+				"FIX: do something",
+			}, "\n"),
+			want: []specialistFinding{
+				{file: "a.go", line: 1, severity: "minor", body: "old style finding"},
+				{file: "b.go", line: 2, severity: "major", body: "new style finding", fix: "do something"},
+			},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -75,10 +126,48 @@ func TestParseSpecialistFindings(t *testing.T) {
 					got[i].line != tc.want[i].line ||
 					got[i].severity != tc.want[i].severity ||
 					got[i].body != tc.want[i].body {
-					t.Errorf("item %d: got %+v, want %+v", i, got[i], tc.want[i])
+					t.Errorf("item %d: got file=%q line=%d sev=%q body=%q, want file=%q line=%d sev=%q body=%q",
+						i, got[i].file, got[i].line, got[i].severity, got[i].body,
+						tc.want[i].file, tc.want[i].line, tc.want[i].severity, tc.want[i].body)
+				}
+				if got[i].fix != tc.want[i].fix {
+					t.Errorf("item %d: got fix=%q, want fix=%q", i, got[i].fix, tc.want[i].fix)
+				}
+				if got[i].why != tc.want[i].why {
+					t.Errorf("item %d: got why=%q, want why=%q", i, got[i].why, tc.want[i].why)
+				}
+				if got[i].before != tc.want[i].before {
+					t.Errorf("item %d: got before=%q, want before=%q", i, got[i].before, tc.want[i].before)
+				}
+				if got[i].after != tc.want[i].after {
+					t.Errorf("item %d: got after=%q, want after=%q", i, got[i].after, tc.want[i].after)
+				}
+				if len(got[i].ruleNames) != len(tc.want[i].ruleNames) {
+					t.Errorf("item %d: got ruleNames=%v, want ruleNames=%v", i, got[i].ruleNames, tc.want[i].ruleNames)
 				}
 			}
 		})
+	}
+}
+
+func TestSplitBodyAndFix(t *testing.T) {
+	cases := []struct {
+		in       string
+		wantBody string
+		wantFix  string
+	}{
+		{"bad name — FIX: rename", "bad name", "rename"},
+		{"bad name – FIX: rename", "bad name", "rename"},
+		{"bad name - FIX: rename", "bad name", "rename"},
+		{"no fix here", "no fix here", ""},
+		{"has — but not FIX", "has — but not FIX", ""},
+	}
+	for _, tc := range cases {
+		body, fix := splitBodyAndFix(tc.in)
+		if body != tc.wantBody || fix != tc.wantFix {
+			t.Errorf("splitBodyAndFix(%q) = (%q, %q), want (%q, %q)",
+				tc.in, body, fix, tc.wantBody, tc.wantFix)
+		}
 	}
 }
 
@@ -87,12 +176,12 @@ func TestMergeSpecialistFindings_SortAndFormat(t *testing.T) {
 		{role: RoleReviewer, text: "b.go:20 — minor — z\na.go:10 — blocker — x"},
 		{role: RoleArchReviewer, text: "a.go:5 — major — y"},
 	}
-	out := mergeSpecialistFindings(results)
+	out := mergeSpecialistFindings(results, "en")
 	if out == "" {
 		t.Fatal("expected non-empty plan")
 	}
-	if !strings.HasPrefix(out, "## Plan") {
-		t.Errorf("expected ## Plan header, got:\n%s", out)
+	if !strings.Contains(out, "## Tasks") {
+		t.Errorf("expected tasks section header, got:\n%s", out)
 	}
 	// Ordering: blocker < major < minor; within severity by file:line.
 	blockerIdx := strings.Index(out, "blocker")
@@ -102,6 +191,49 @@ func TestMergeSpecialistFindings_SortAndFormat(t *testing.T) {
 		t.Errorf("severity order wrong (blocker=%d major=%d minor=%d)\n%s",
 			blockerIdx, majorIdx, minorIdx, out)
 	}
+	// New sections.
+	if !strings.Contains(out, "## Affected files") {
+		t.Errorf("expected affected files section, got:\n%s", out)
+	}
+	if !strings.Contains(out, "## Post-execution verification") {
+		t.Errorf("expected verification section, got:\n%s", out)
+	}
+}
+
+func TestMergeSpecialistFindings_MultiLineFormat(t *testing.T) {
+	results := []reviewResult{
+		{role: RoleCodeReviewer, text: strings.Join([]string{
+			"a.go:10 — blocker",
+			"WHAT: bad name",
+			"WHY: violates convention",
+			"FIX: rename to good",
+			"BEFORE: `bad`",
+			"AFTER: `good`",
+			"RULES: naming",
+		}, "\n")},
+	}
+	out := mergeSpecialistFindings(results, "en")
+	if !strings.Contains(out, "### 1.") {
+		t.Errorf("expected ### heading, got:\n%s", out)
+	}
+	if !strings.Contains(out, "- **What:** bad name") {
+		t.Errorf("expected What field, got:\n%s", out)
+	}
+	if !strings.Contains(out, "- **Why:** violates convention") {
+		t.Errorf("expected Why field, got:\n%s", out)
+	}
+	if !strings.Contains(out, "- **Fix:** rename to good") {
+		t.Errorf("expected Fix field, got:\n%s", out)
+	}
+	if !strings.Contains(out, "- **Before:** `bad`") {
+		t.Errorf("expected Before field, got:\n%s", out)
+	}
+	if !strings.Contains(out, "- **After:** `good`") {
+		t.Errorf("expected After field, got:\n%s", out)
+	}
+	if !strings.Contains(out, "- **Rules:** naming") {
+		t.Errorf("expected Rules field, got:\n%s", out)
+	}
 }
 
 func TestMergeSpecialistFindings_AllLGTM(t *testing.T) {
@@ -109,7 +241,7 @@ func TestMergeSpecialistFindings_AllLGTM(t *testing.T) {
 		{role: RoleReviewer, text: "LGTM"},
 		{role: RoleArchReviewer, text: ""},
 	}
-	if out := mergeSpecialistFindings(results); out != "" {
+	if out := mergeSpecialistFindings(results, "en"); out != "" {
 		t.Errorf("expected empty, got %q", out)
 	}
 }
@@ -119,7 +251,7 @@ func TestMergeSpecialistFindings_AllNoIssues(t *testing.T) {
 		{role: RoleReviewer, text: "NO_ISSUES"},
 		{role: RoleArchReviewer, text: "NO_ISSUES"},
 	}
-	if out := mergeSpecialistFindings(results); out != "" {
+	if out := mergeSpecialistFindings(results, "en"); out != "" {
 		t.Errorf("expected empty, got %q", out)
 	}
 }
@@ -128,7 +260,7 @@ func TestMergeSpecialistFindings_UnparsedFallback(t *testing.T) {
 	results := []reviewResult{
 		{role: RoleReviewer, text: "Something bad somewhere\nAnother concern"},
 	}
-	out := mergeSpecialistFindings(results)
+	out := mergeSpecialistFindings(results, "en")
 	if !strings.Contains(out, "(unstructured)") {
 		t.Errorf("expected unstructured fallback entries, got:\n%s", out)
 	}
@@ -146,13 +278,13 @@ func TestMergeSpecialistFindings_DedupSameBodyDifferentLines(t *testing.T) {
 			"f_test.go:40 — major — context.Background() in tests",
 		}, "\n")},
 	}
-	out := mergeSpecialistFindings(results)
+	out := mergeSpecialistFindings(results, "en")
 	// Should produce exactly 1 finding with grouped lines.
-	lines := countPlanLines(out)
+	lines := countPlanFindings(out)
 	if lines != 1 {
-		t.Errorf("expected 1 grouped finding, got %d plan lines:\n%s", lines, out)
+		t.Errorf("expected 1 grouped finding, got %d findings:\n%s", lines, out)
 	}
-	if !strings.Contains(out, "строки:") {
+	if !strings.Contains(out, "lines:") {
 		t.Errorf("expected grouped lines marker, got:\n%s", out)
 	}
 	if !strings.Contains(out, "10") && !strings.Contains(out, "25") && !strings.Contains(out, "40") {
@@ -166,10 +298,10 @@ func TestMergeSpecialistFindings_DedupSameBodyDifferentSpecialists(t *testing.T)
 		{role: RoleCodeReviewer, text: "a.go:10 — major — missing error check"},
 		{role: RoleArchReviewer, text: "a.go:10 — major — missing error check"},
 	}
-	out := mergeSpecialistFindings(results)
-	lines := countPlanLines(out)
+	out := mergeSpecialistFindings(results, "en")
+	lines := countPlanFindings(out)
 	if lines != 1 {
-		t.Errorf("expected 1 merged finding, got %d plan lines:\n%s", lines, out)
+		t.Errorf("expected 1 merged finding, got %d findings:\n%s", lines, out)
 	}
 	// Both roles should appear in the output.
 	if !strings.Contains(out, string(RoleCodeReviewer)) {
@@ -190,16 +322,16 @@ func TestMergeSpecialistFindings_DedupCombined(t *testing.T) {
 		}, "\n")},
 		{role: RoleArchReviewer, text: "f.go:10 — major — bad pattern"},
 	}
-	out := mergeSpecialistFindings(results)
-	lines := countPlanLines(out)
+	out := mergeSpecialistFindings(results, "en")
+	lines := countPlanFindings(out)
 	if lines != 1 {
-		t.Errorf("expected 1 combined finding, got %d plan lines:\n%s", lines, out)
+		t.Errorf("expected 1 combined finding, got %d findings:\n%s", lines, out)
 	}
 	if !strings.Contains(out, string(RoleCodeReviewer)) ||
 		!strings.Contains(out, string(RoleArchReviewer)) {
 		t.Errorf("expected both roles in output:\n%s", out)
 	}
-	if !strings.Contains(out, "строки:") {
+	if !strings.Contains(out, "lines:") {
 		t.Errorf("expected grouped lines in output:\n%s", out)
 	}
 }
@@ -212,10 +344,10 @@ func TestMergeSpecialistFindings_DifferentBodiesNotMerged(t *testing.T) {
 			"a.go:10 — minor — magic number",
 		}, "\n")},
 	}
-	out := mergeSpecialistFindings(results)
-	lines := countPlanLines(out)
+	out := mergeSpecialistFindings(results, "en")
+	lines := countPlanFindings(out)
 	if lines != 2 {
-		t.Errorf("expected 2 findings (different bodies), got %d plan lines:\n%s", lines, out)
+		t.Errorf("expected 2 findings (different bodies), got %d findings:\n%s", lines, out)
 	}
 }
 
@@ -225,13 +357,34 @@ func TestMergeSpecialistFindings_SeverityUpgrade(t *testing.T) {
 		{role: RoleCodeReviewer, text: "a.go:10 — major — race condition"},
 		{role: RoleReviewer, text: "a.go:10 — blocker — race condition"},
 	}
-	out := mergeSpecialistFindings(results)
-	lines := countPlanLines(out)
+	out := mergeSpecialistFindings(results, "en")
+	lines := countPlanFindings(out)
 	if lines != 1 {
-		t.Errorf("expected 1 merged finding, got %d plan lines:\n%s", lines, out)
+		t.Errorf("expected 1 merged finding, got %d findings:\n%s", lines, out)
 	}
 	if !strings.Contains(out, "blocker") {
 		t.Errorf("expected blocker severity (highest), got:\n%s", out)
+	}
+}
+
+func TestMergeSpecialistFindings_RuleNamesMerge(t *testing.T) {
+	results := []reviewResult{
+		{role: RoleCodeReviewer, text: strings.Join([]string{
+			"a.go:10 — major",
+			"WHAT: bad pattern",
+			"FIX: fix it",
+			"RULES: naming",
+		}, "\n")},
+		{role: RoleArchReviewer, text: strings.Join([]string{
+			"a.go:10 — major",
+			"WHAT: bad pattern",
+			"FIX: fix it",
+			"RULES: error-wrapping",
+		}, "\n")},
+	}
+	out := mergeSpecialistFindings(results, "en")
+	if !strings.Contains(out, "naming") || !strings.Contains(out, "error-wrapping") {
+		t.Errorf("expected merged rule names, got:\n%s", out)
 	}
 }
 
@@ -267,12 +420,12 @@ func TestIsNoIssues(t *testing.T) {
 	}
 }
 
-// countPlanLines counts numbered lines (findings) in the plan output.
-func countPlanLines(plan string) int {
+// countPlanFindings counts ### headings (findings) in the plan output.
+func countPlanFindings(plan string) int {
 	count := 0
 	for _, line := range strings.Split(plan, "\n") {
 		line = strings.TrimSpace(line)
-		if len(line) > 0 && line[0] >= '1' && line[0] <= '9' {
+		if strings.HasPrefix(line, "### ") {
 			count++
 		}
 	}

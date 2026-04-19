@@ -12,7 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/llm"
+	ollamabackend "github.com/raoptimus/kodrun/internal/llm/ollama"
 	"github.com/raoptimus/kodrun/internal/rules"
 	"github.com/raoptimus/kodrun/internal/tools"
 )
@@ -41,7 +42,7 @@ func TestAgent_SendPassesNumCtxAndRules(t *testing.T) {
 
 	// Mock Ollama server
 	var mu sync.Mutex
-	var captured []ollama.ChatRequest
+	var captured []llm.ChatRequest
 
 	callCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -50,7 +51,7 @@ func TestAgent_SendPassesNumCtxAndRules(t *testing.T) {
 			return
 		}
 
-		var req ollama.ChatRequest
+		var req llm.ChatRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -64,20 +65,27 @@ func TestAgent_SendPassesNumCtxAndRules(t *testing.T) {
 
 		w.Header().Set("Content-Type", "application/x-ndjson")
 
-		var resp ollama.ChatResponse
-		resp.Model = "test-model"
-		resp.Done = true
-		resp.PromptEvalCount = 100
-		resp.EvalCount = 50
+		resp := struct {
+			Model           string      `json:"model"`
+			Message         llm.Message `json:"message"`
+			Done            bool        `json:"done"`
+			PromptEvalCount int         `json:"prompt_eval_count,omitempty"`
+			EvalCount       int         `json:"eval_count,omitempty"`
+		}{
+			Model:           "test-model",
+			Done:            true,
+			PromptEvalCount: 100,
+			EvalCount:       50,
+		}
 
 		if call == 0 {
 			// First call: return a tool call to write_file
-			resp.Message = ollama.Message{
+			resp.Message = llm.Message{
 				Role: "assistant",
-				ToolCalls: []ollama.ToolCall{
+				ToolCalls: []llm.ToolCall{
 					{
 						ID: "call_1",
-						Function: ollama.ToolCallFunc{
+						Function: llm.ToolCallFunc{
 							Name: "write_file",
 							Arguments: map[string]any{
 								"path":    "main.go",
@@ -89,7 +97,7 @@ func TestAgent_SendPassesNumCtxAndRules(t *testing.T) {
 			}
 		} else {
 			// Second call: return text response to end the loop
-			resp.Message = ollama.Message{
+			resp.Message = llm.Message{
 				Role:    "assistant",
 				Content: "Done. Created main.go with an HTTP server.",
 			}
@@ -102,7 +110,7 @@ func TestAgent_SendPassesNumCtxAndRules(t *testing.T) {
 	defer server.Close()
 
 	// Build agent
-	client := ollama.NewClient(server.URL, 30*time.Second)
+	client := ollamabackend.New(server.URL, 30*time.Second)
 	reg := tools.NewRegistry()
 	reg.Register(tools.NewWriteFileTool(workDir, nil))
 
@@ -169,7 +177,7 @@ func TestAgent_SendPassesNumCtxAndRules(t *testing.T) {
 	}
 
 	// Check project context (AGENTS.md) is injected in first user message
-	var userMsg ollama.Message
+	var userMsg llm.Message
 	for _, msg := range captured[0].Messages {
 		if msg.Role == "user" {
 			userMsg = msg

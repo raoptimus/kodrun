@@ -3,7 +3,7 @@ package agent
 import (
 	"testing"
 
-	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/llm"
 	"github.com/stretchr/testify/require"
 )
 
@@ -88,14 +88,14 @@ func TestParseTextToolCall_EditFile_Successfully(t *testing.T) {
 	tests := []struct {
 		name     string
 		content  string
-		wantCall *ollama.ToolCall
+		wantCall *llm.ToolCall
 	}{
 		{
 			name:    "standard edit_file with old_str and new_str",
 			content: "edit_file\npath: internal/app/api/application.go\nold_str: type Application struct {\n    logger *logrus.Logger\n}\nnew_str: type Application struct {\n    logger *logrus.Logger\n    server *http.Server\n}",
-			wantCall: &ollama.ToolCall{
+			wantCall: &llm.ToolCall{
 				ID: "synth_0",
-				Function: ollama.ToolCallFunc{
+				Function: llm.ToolCallFunc{
 					Name: "edit_file",
 					Arguments: map[string]any{
 						"path":    "internal/app/api/application.go",
@@ -108,9 +108,9 @@ func TestParseTextToolCall_EditFile_Successfully(t *testing.T) {
 		{
 			name:    "edit_file with only new_str",
 			content: "edit_file\npath: internal/app/handler.go\nnew_str: func Handle() error {\n    return nil\n}",
-			wantCall: &ollama.ToolCall{
+			wantCall: &llm.ToolCall{
 				ID: "synth_0",
-				Function: ollama.ToolCallFunc{
+				Function: llm.ToolCallFunc{
 					Name: "edit_file",
 					Arguments: map[string]any{
 						"path":    "internal/app/handler.go",
@@ -122,9 +122,9 @@ func TestParseTextToolCall_EditFile_Successfully(t *testing.T) {
 		{
 			name:    "edit_file with multiline indented values",
 			content: "edit_file\npath: pkg/service/svc.go\nold_str: func (s *Service) Run() {\n\treturn\n}\nnew_str: func (s *Service) Run() error {\n\tif err := s.init(); err != nil {\n\t\treturn err\n\t}\n\treturn nil\n}",
-			wantCall: &ollama.ToolCall{
+			wantCall: &llm.ToolCall{
 				ID: "synth_0",
-				Function: ollama.ToolCallFunc{
+				Function: llm.ToolCallFunc{
 					Name: "edit_file",
 					Arguments: map[string]any{
 						"path":    "pkg/service/svc.go",
@@ -137,9 +137,9 @@ func TestParseTextToolCall_EditFile_Successfully(t *testing.T) {
 		{
 			name:    "edit_file preceded by text on earlier lines",
 			content: "I will make the following change:\n\nedit_file\npath: main.go\nold_str: fmt.Println(\"hello\")\nnew_str: fmt.Println(\"world\")",
-			wantCall: &ollama.ToolCall{
+			wantCall: &llm.ToolCall{
 				ID: "synth_0",
-				Function: ollama.ToolCallFunc{
+				Function: llm.ToolCallFunc{
 					Name: "edit_file",
 					Arguments: map[string]any{
 						"path":    "main.go",
@@ -164,14 +164,14 @@ func TestParseTextToolCall_WriteFile_Successfully(t *testing.T) {
 	tests := []struct {
 		name     string
 		content  string
-		wantCall *ollama.ToolCall
+		wantCall *llm.ToolCall
 	}{
 		{
 			name:    "standard write_file with content",
 			content: "write_file\npath: internal/app/new_file.go\ncontent: package app\n\nfunc New() {}",
-			wantCall: &ollama.ToolCall{
+			wantCall: &llm.ToolCall{
 				ID: "synth_0",
-				Function: ollama.ToolCallFunc{
+				Function: llm.ToolCallFunc{
 					Name: "write_file",
 					Arguments: map[string]any{
 						"path":    "internal/app/new_file.go",

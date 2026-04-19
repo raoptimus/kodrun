@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/llm"
 	"github.com/raoptimus/kodrun/internal/rag"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -110,7 +110,7 @@ func TestGoToolSchema_DefaultProps_Successfully(t *testing.T) {
 }
 
 func TestGoToolSchema_ExtraProps_Successfully(t *testing.T) {
-	extra := map[string]ollama.JSONSchema{
+	extra := map[string]llm.JSONSchema{
 		"run": {Type: "string", Description: "test run"},
 	}
 

@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -54,6 +55,85 @@ func TestPathAllowed_RespectsWhitelist(t *testing.T) {
 	}
 	if a.pathAllowed("internal/secret/keys.go") {
 		t.Error("expected non-whitelisted path to be denied")
+	}
+}
+
+func TestRenderExtractorOutput_WithAffectedFilesAndVerification(t *testing.T) {
+	input := `{
+		"context": "Fix naming issues",
+		"plan": ["a.go:10 — blocker — rename func"],
+		"affected_files": ["a.go", "b.go"],
+		"verification": ["make build", "make lint", "make test-unit"]
+	}`
+	out := RenderExtractorOutput(input, "en")
+	if !strings.Contains(out, "## Affected files") {
+		t.Errorf("expected affected files section, got:\n%s", out)
+	}
+	if !strings.Contains(out, "- a.go") || !strings.Contains(out, "- b.go") {
+		t.Errorf("expected file list, got:\n%s", out)
+	}
+	if !strings.Contains(out, "## Post-execution verification") {
+		t.Errorf("expected verification section, got:\n%s", out)
+	}
+	if !strings.Contains(out, "- [ ] make build") {
+		t.Errorf("expected verification items, got:\n%s", out)
+	}
+}
+
+func TestRenderExtractorOutput_WithoutOptionalSections(t *testing.T) {
+	input := `{
+		"context": "Fix issues",
+		"plan": ["a.go:10 — blocker — fix it"]
+	}`
+	out := RenderExtractorOutput(input, "en")
+	if strings.Contains(out, "Affected files") {
+		t.Errorf("should not have affected files section without data, got:\n%s", out)
+	}
+	if strings.Contains(out, "verification") {
+		t.Errorf("should not have verification section without data, got:\n%s", out)
+	}
+}
+
+func TestRenderExtractorOutput_StructuredPlanItems(t *testing.T) {
+	input := `{
+		"context": "Fix naming issues",
+		"plan": [
+			{
+				"file": "cmd/main.go",
+				"line": 67,
+				"severity": "blocker",
+				"what": "Опечатка в имени функции InitStandartLogger",
+				"why": "Код не скомпилируется",
+				"fix": "Заменить InitStandartLogger на InitStandardLogger",
+				"before": "logger.InitStandartLogger()",
+				"after": "logger.InitStandardLogger()",
+				"rules": ["naming"]
+			}
+		],
+		"affected_files": ["cmd/main.go"],
+		"verification": ["make build"]
+	}`
+	out := RenderExtractorOutput(input, "ru")
+	if !strings.Contains(out, "### 1. cmd/main.go:67 [blocker]") {
+		t.Errorf("expected structured heading, got:\n%s", out)
+	}
+	if !strings.Contains(out, "- **What:** Опечатка в имени функции") {
+		t.Errorf("expected What field, got:\n%s", out)
+	}
+	if !strings.Contains(out, "- **Why:** Код не скомпилируется") {
+		t.Errorf("expected Why field, got:\n%s", out)
+	}
+	if !strings.Contains(out, "- **Fix:** Заменить") {
+		t.Errorf("expected Fix field, got:\n%s", out)
+	}
+	if !strings.Contains(out, "- **Before:**") {
+		t.Errorf("expected Before field, got:\n%s", out)
+	}
+	if !strings.Contains(out, "- **After:**") {
+		t.Errorf("expected After field, got:\n%s", out)
+	}
+	if !strings.Contains(out, "- **Rules:** naming") {
+		t.Errorf("expected Rules field, got:\n%s", out)
 	}
 }
 

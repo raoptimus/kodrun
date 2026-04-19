@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/llm"
 	"github.com/raoptimus/kodrun/internal/rag"
 )
 
@@ -20,12 +20,12 @@ type goTool struct {
 	description string
 	command     string
 	defaultArgs []string
-	schema      ollama.JSONSchema
+	schema      llm.JSONSchema
 }
 
-func (t *goTool) Name() string              { return t.name }
-func (t *goTool) Description() string       { return t.description }
-func (t *goTool) Schema() ollama.JSONSchema { return t.schema }
+func (t *goTool) Name() string           { return t.name }
+func (t *goTool) Description() string    { return t.description }
+func (t *goTool) Schema() llm.JSONSchema { return t.schema }
 
 func (t *goTool) Execute(ctx context.Context, params map[string]any) (*ToolResult, error) {
 	const extraArgsCap = 4
@@ -122,15 +122,15 @@ func isForbiddenFlag(flag string) bool {
 	return false
 }
 
-func goToolSchema(extraProps map[string]ollama.JSONSchema) ollama.JSONSchema {
-	props := map[string]ollama.JSONSchema{
+func goToolSchema(extraProps map[string]llm.JSONSchema) llm.JSONSchema {
+	props := map[string]llm.JSONSchema{
 		"packages": {Type: "string", Description: "Go packages (default: ./...)"},
 		"flags":    {Type: "string", Description: "Additional flags"},
 	}
 	for k, v := range extraProps {
 		props[k] = v
 	}
-	return ollama.JSONSchema{
+	return llm.JSONSchema{
 		Type:       "object",
 		Properties: props,
 	}
@@ -156,7 +156,7 @@ func NewGoTestTool(workDir string) *goTool {
 		description: "Run go test",
 		command:     "go",
 		defaultArgs: []string{"test"},
-		schema: goToolSchema(map[string]ollama.JSONSchema{
+		schema: goToolSchema(map[string]llm.JSONSchema{
 			"run": {Type: "string", Description: "Test name pattern (-run)"},
 		}),
 	}
@@ -182,9 +182,9 @@ func NewGoFmtTool(workDir string) *goTool {
 		description: "Run gofmt -w on files",
 		command:     "gofmt",
 		defaultArgs: []string{"-w"},
-		schema: ollama.JSONSchema{
+		schema: llm.JSONSchema{
 			Type: "object",
-			Properties: map[string]ollama.JSONSchema{
+			Properties: map[string]llm.JSONSchema{
 				"path": {Type: "string", Description: "File or directory to format (default: .)"},
 			},
 		},
@@ -199,7 +199,7 @@ func NewGoLintTool(workDir string) *goTool {
 		description: "Run golangci-lint",
 		command:     "golangci-lint",
 		defaultArgs: []string{"run"},
-		schema: goToolSchema(map[string]ollama.JSONSchema{
+		schema: goToolSchema(map[string]llm.JSONSchema{
 			"config": {Type: "string", Description: "Path to lint config"},
 		}),
 	}
@@ -213,9 +213,9 @@ func NewGoModTidyTool(workDir string) *goTool {
 		description: "Run go mod tidy",
 		command:     "go",
 		defaultArgs: []string{"mod", "tidy"},
-		schema: ollama.JSONSchema{
+		schema: llm.JSONSchema{
 			Type:       "object",
-			Properties: map[string]ollama.JSONSchema{},
+			Properties: map[string]llm.JSONSchema{},
 		},
 	}
 }
@@ -228,9 +228,9 @@ func NewGoGetTool(workDir string) *goTool {
 		description: "Run go get to add or update a dependency",
 		command:     "go",
 		defaultArgs: []string{"get"},
-		schema: ollama.JSONSchema{
+		schema: llm.JSONSchema{
 			Type: "object",
-			Properties: map[string]ollama.JSONSchema{
+			Properties: map[string]llm.JSONSchema{
 				"packages": {Type: "string", Description: "Package path(s) to install, e.g. github.com/pkg/errors@latest"},
 			},
 			Required: []string{"packages"},
@@ -267,9 +267,9 @@ func NewGoDocTool(workDir string, indexer GoDocIndexer) *goDocTool {
 			description: "Run go doc to view/index package documentation, or search previously indexed Go docs by query",
 			command:     "go",
 			defaultArgs: []string{"doc"},
-			schema: ollama.JSONSchema{
+			schema: llm.JSONSchema{
 				Type: "object",
-				Properties: map[string]ollama.JSONSchema{
+				Properties: map[string]llm.JSONSchema{
 					"packages": {Type: "string", Description: "Package or symbol to get documentation for, e.g. fmt.Println or encoding/json.Decoder"},
 					"flags":    {Type: "string", Description: "Additional flags, e.g. -all for full docs"},
 					"query":    {Type: "string", Description: "Semantic search query over previously indexed Go docs, e.g. 'format string verbs' or 'json decoder options'"},
@@ -404,10 +404,10 @@ type BashTool struct {
 func (t *BashTool) Name() string        { return extBash }
 func (t *BashTool) Description() string { return "Execute a shell command" }
 
-func (t *BashTool) Schema() ollama.JSONSchema {
-	return ollama.JSONSchema{
+func (t *BashTool) Schema() llm.JSONSchema {
+	return llm.JSONSchema{
 		Type: "object",
-		Properties: map[string]ollama.JSONSchema{
+		Properties: map[string]llm.JSONSchema{
 			"command": {Type: "string", Description: "Shell command to execute"},
 		},
 		Required: []string{"command"},

@@ -4,7 +4,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/llm"
 	"github.com/raoptimus/kodrun/internal/tools"
 )
 
@@ -72,7 +72,7 @@ var textToolCallKeys = []string{"path:", "old_str:", "new_str:", "content:"}
 //	path: <value>
 //	old_str: <value — may span multiple lines>
 //	new_str: <value — may span multiple lines>
-func parseTextToolCall(content string) *ollama.ToolCall {
+func parseTextToolCall(content string) *llm.ToolCall {
 	lines := strings.Split(content, "\n")
 
 	// Find the tool name line.
@@ -158,9 +158,9 @@ func parseTextToolCall(content string) *ollama.ToolCall {
 		args["content"] = c
 	}
 
-	return &ollama.ToolCall{
+	return &llm.ToolCall{
 		ID: "synth_0",
-		Function: ollama.ToolCallFunc{
+		Function: llm.ToolCallFunc{
 			Name:      toolName,
 			Arguments: args,
 		},

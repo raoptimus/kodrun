@@ -10,7 +10,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/llm"
 )
 
 // GrepTool searches for a pattern in files.
@@ -27,10 +27,10 @@ func NewGrepTool(workDir string, forbidden []string) *GrepTool {
 func (t *GrepTool) Name() string        { return "grep" }
 func (t *GrepTool) Description() string { return "Search for a regex pattern in files" }
 
-func (t *GrepTool) Schema() ollama.JSONSchema {
-	return ollama.JSONSchema{
+func (t *GrepTool) Schema() llm.JSONSchema {
+	return llm.JSONSchema{
 		Type: "object",
-		Properties: map[string]ollama.JSONSchema{
+		Properties: map[string]llm.JSONSchema{
 			"pattern":   {Type: "string", Description: "Regex pattern to search for"},
 			"path":      {Type: "string", Description: "File or directory to search in"},
 			"recursive": {Type: "string", Description: "If 'true', search recursively", Enum: []string{"true", "false"}},

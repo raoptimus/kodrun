@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/llm"
 	"github.com/raoptimus/kodrun/internal/tools"
 )
 
@@ -16,7 +16,7 @@ type ToolAdapter struct {
 	mcpName      string // original tool name on the MCP server
 	registryName string // "mcp_<server>_<tool>"
 	description  string
-	schema       ollama.JSONSchema
+	schema       llm.JSONSchema
 }
 
 // NewToolAdapter creates a tool adapter that proxies calls to an MCP server.
@@ -31,9 +31,9 @@ func NewToolAdapter(client *Client, serverName string, def MCPToolDef) *ToolAdap
 	}
 }
 
-func (a *ToolAdapter) Name() string              { return a.registryName }
-func (a *ToolAdapter) Description() string       { return a.description }
-func (a *ToolAdapter) Schema() ollama.JSONSchema { return a.schema }
+func (a *ToolAdapter) Name() string           { return a.registryName }
+func (a *ToolAdapter) Description() string    { return a.description }
+func (a *ToolAdapter) Schema() llm.JSONSchema { return a.schema }
 
 // Execute calls the MCP tool and converts the result to ToolResult.
 func (a *ToolAdapter) Execute(ctx context.Context, params map[string]any) (*tools.ToolResult, error) {
@@ -67,13 +67,13 @@ func formatContent(blocks []ContentBlock) string {
 	return sb.String()
 }
 
-// convertSchema converts an MCP JSON Schema (map[string]any) to ollama.JSONSchema.
-func convertSchema(raw map[string]any) ollama.JSONSchema {
+// convertSchema converts an MCP JSON Schema (map[string]any) to llm.JSONSchema.
+func convertSchema(raw map[string]any) llm.JSONSchema {
 	if raw == nil {
-		return ollama.JSONSchema{Type: "object"}
+		return llm.JSONSchema{Type: "object"}
 	}
 
-	s := ollama.JSONSchema{}
+	s := llm.JSONSchema{}
 
 	if t, ok := raw["type"].(string); ok {
 		s.Type = t
@@ -83,7 +83,7 @@ func convertSchema(raw map[string]any) ollama.JSONSchema {
 	}
 
 	if props, ok := raw["properties"].(map[string]any); ok {
-		s.Properties = make(map[string]ollama.JSONSchema, len(props))
+		s.Properties = make(map[string]llm.JSONSchema, len(props))
 		for key, val := range props {
 			if propMap, ok := val.(map[string]any); ok {
 				s.Properties[key] = convertSchema(propMap)

@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/llm"
 )
 
 const (
@@ -51,12 +51,12 @@ type Index struct {
 	entries []IndexEntry
 	path    string
 	model   string
-	client  *ollama.Client
+	client  llm.Client
 	updated time.Time
 }
 
 // NewIndex creates a new RAG index.
-func NewIndex(client *ollama.Client, model, indexPath string) *Index {
+func NewIndex(client llm.Client, model, indexPath string) *Index {
 	return &Index{
 		client: client,
 		model:  model,
@@ -233,11 +233,11 @@ func (idx *Index) BuildWithProgress(ctx context.Context, chunks []Chunk, progres
 		// flaky network/timeout does not abort the whole Build, leaving the
 		// on-disk snapshot stale. maxEmbedRetries attempts is enough to ride
 		// out brief blips while still failing fast on hard errors.
-		var resp *ollama.EmbedResponse
+		var resp *llm.EmbedResponse
 		var attemptErrs []error
 		for attempt := 1; attempt <= maxEmbedRetries; attempt++ {
 			var err error
-			resp, err = idx.client.Embed(ctx, ollama.EmbedRequest{
+			resp, err = idx.client.Embed(ctx, llm.EmbedRequest{
 				Model:    idx.model,
 				Input:    inputs,
 				Truncate: true,
@@ -319,7 +319,7 @@ func (idx *Index) Search(ctx context.Context, query string, topK int) ([]SearchR
 		return nil, nil
 	}
 
-	resp, err := idx.client.Embed(ctx, ollama.EmbedRequest{
+	resp, err := idx.client.Embed(ctx, llm.EmbedRequest{
 		Model:    idx.model,
 		Input:    []string{truncateInput(query, maxEmbedInputBytes)},
 		Truncate: true,

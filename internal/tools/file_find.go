@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/llm"
 )
 
 // FindFilesTool finds files matching a glob pattern.
@@ -24,10 +24,10 @@ func NewFindFilesTool(workDir string, forbidden []string) *FindFilesTool {
 func (t *FindFilesTool) Name() string        { return "find_files" }
 func (t *FindFilesTool) Description() string { return "Find files matching a glob pattern" }
 
-func (t *FindFilesTool) Schema() ollama.JSONSchema {
-	return ollama.JSONSchema{
+func (t *FindFilesTool) Schema() llm.JSONSchema {
+	return llm.JSONSchema{
 		Type: "object",
-		Properties: map[string]ollama.JSONSchema{
+		Properties: map[string]llm.JSONSchema{
 			"pattern": {Type: "string", Description: "Glob pattern (e.g. '**/*.go')"},
 			"root":    {Type: "string", Description: "Root directory for search (default: work dir)"},
 		},

@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/llm"
 	"github.com/raoptimus/kodrun/internal/snippets"
 )
 
@@ -63,14 +63,14 @@ func (t *SnippetTool) Description() string {
 		"Pass file paths to match against snippet globs. Actions: match (default), list, tags."
 }
 
-func (t *SnippetTool) Schema() ollama.JSONSchema {
-	stringArray := &ollama.JSONSchema{
+func (t *SnippetTool) Schema() llm.JSONSchema {
+	stringArray := &llm.JSONSchema{
 		Type:  "array",
-		Items: &ollama.JSONSchema{Type: "string"},
+		Items: &llm.JSONSchema{Type: "string"},
 	}
-	return ollama.JSONSchema{
+	return llm.JSONSchema{
 		Type: "object",
-		Properties: map[string]ollama.JSONSchema{
+		Properties: map[string]llm.JSONSchema{
 			"action":   {Type: "string", Description: "match (default), list, or tags", Enum: []string{snippetActionMatch, "list", "tags"}},
 			"paths":    {Type: "array", Description: "File paths to match against snippet globs", Items: stringArray.Items},
 			"tags":     {Type: "array", Description: "Filter snippets by tags", Items: stringArray.Items},

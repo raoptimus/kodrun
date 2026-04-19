@@ -5,6 +5,13 @@ import (
 	"strings"
 )
 
+// progLang constants used in system prompt generation.
+const (
+	progLangGo     = "go"
+	progLangPython = "python"
+	progLangJSTS   = "jsts"
+)
+
 // Role identifies a sub-agent's purpose in the orchestrator pipeline.
 type Role string
 
@@ -49,13 +56,18 @@ func taskLabelForRole(role Role) string {
 }
 
 // systemPromptForRole generates a role-specific system prompt for a sub-agent.
+// progLang is the detected project programming language (e.g. "go", "python", "jsts", or "").
 // Optional bool flags: hasSnippets, hasRAG.
-func systemPromptForRole(role Role, lang, ruleCatalog string, toolNames []string, flags ...bool) string {
+func systemPromptForRole(role Role, lang, progLang, ruleCatalog string, toolNames []string, flags ...bool) string {
 	snippetsEnabled := len(flags) > 0 && flags[0]
 	ragEnabled := len(flags) > 1 && flags[1]
 	var b strings.Builder
 
-	b.WriteString("You are KodRun, a Go programming assistant.\n")
+	if progLang != "" {
+		fmt.Fprintf(&b, "You are KodRun, a %s programming assistant.\n", progLang)
+	} else {
+		b.WriteString("You are KodRun, a programming assistant.\n")
+	}
 	ln := langName(lang)
 	if ln != langEnglish {
 		fmt.Fprintf(&b, "IMPORTANT: ALL your responses MUST be in %s. This is mandatory.\n", ln)
@@ -80,13 +92,16 @@ func systemPromptForRole(role Role, lang, ruleCatalog string, toolNames []string
 
 	switch role {
 	case RolePlanner:
+		ltc := langToolsForLang(progLang)
 		b.WriteString("You are the PLANNER agent.\n")
 		b.WriteString("Your job is to analyze the task and create a detailed, actionable plan.\n\n")
 		b.WriteString("CRITICAL WORKFLOW:\n")
 		b.WriteString("- If the task text contains file paths (e.g. `path/to/file.go:42`), your VERY FIRST tool calls MUST be read_file on those exact files. Do NOT call list_dir, find_files, or any other tool before reading the referenced files.\n")
 		b.WriteString("- Only after reading the referenced files, read additional files if the code references imports or types you need to understand.\n\n")
 		b.WriteString("Guidelines:\n")
-		b.WriteString("- Use `go_structure(path)` to quickly see file/package outline (types, functions, constants with line numbers) before reading full files with read_file — this saves context\n")
+		if ltc.structureTool != "" {
+			fmt.Fprintf(&b, "- Use `%s(path)` to quickly see file/package outline (types, functions, constants with line numbers) before reading full files with read_file — this saves context\n", ltc.structureTool)
+		}
 		b.WriteString("- Read and analyze the relevant code using read-only tools\n")
 		b.WriteString("- Identify all files that need changes\n")
 		b.WriteString("- Create a numbered step-by-step plan\n")
@@ -94,23 +109,24 @@ func systemPromptForRole(role Role, lang, ruleCatalog string, toolNames []string
 		b.WriteString("- Describe concrete issues found, not vague suggestions\n")
 		b.WriteString("- Do NOT write code or generate code blocks\n")
 		b.WriteString("- Be concise and actionable\n")
-		b.WriteString("- Use idiomatic Go, Go best practices and project conventions\n")
+		fmt.Fprintf(&b, "- %s\n", ltc.bestPractices)
 		b.WriteString("- When you find existing code that demonstrates the correct pattern for a change, note it as: EXAMPLE: path/to/file.go:LINE — short reason. Place EXAMPLE lines immediately after the step they belong to.\n")
 		fmt.Fprintf(&b, "- Always respond in %s\n", langName(lang))
 		if ragEnabled {
 			b.WriteString("\nIMPORTANT — Project rules and conventions (from RAG):\n")
-			b.WriteString("The task context includes MANDATORY RULES marked [MANDATORY PROJECT RULES] and GO STANDARDS marked [GO STANDARDS].\n")
+			fmt.Fprintf(&b, "The task context includes MANDATORY RULES marked [MANDATORY PROJECT RULES] and %s marked [%s].\n", ltc.standardsLabel, ltc.standardsLabel)
 			b.WriteString("These are NOT suggestions — they are REQUIREMENTS. Treat violations as bugs.\n")
-			b.WriteString("Examples: naming conventions (getter=Owner not GetOwner), error wrapping, context.Context as first arg, etc.\n")
+			b.WriteString("Examples: naming conventions, error wrapping, proper use of language idioms, etc.\n")
 			b.WriteString("You MUST check every code change against ALL provided rules. Include violations in your plan.\n")
 			b.WriteString("You may call search_docs for additional targeted searches if needed.\n")
 		} else if snippetsEnabled {
 			b.WriteString("\nIMPORTANT — Code conventions check:\n")
-			b.WriteString("BEFORE creating the plan, you MUST call snippets(paths=[<list of all .go files you read>])\n")
+			b.WriteString("BEFORE creating the plan, you MUST call snippets(paths=[<list of all source files you read>])\n")
 			b.WriteString("to get the project's code conventions. Include violations of these conventions in your plan.\n")
 		}
 
 	case RoleExecutor:
+		ltc := langToolsForLang(progLang)
 		b.WriteString("You are the EXECUTOR agent.\n")
 		b.WriteString("Your job is to IMPLEMENT an approved plan by writing/editing code.\n\n")
 		b.WriteString("CRITICAL RULES:\n")
@@ -125,16 +141,24 @@ func systemPromptForRole(role Role, lang, ruleCatalog string, toolNames []string
 		b.WriteString("- Follow the plan exactly, step by step\n")
 		b.WriteString("- Use edit_file for small changes, write_file for new files\n")
 		b.WriteString("- After each step, confirm what was done\n")
-		b.WriteString("- Run go_build after changes to verify compilation\n")
-		b.WriteString("- Run go_lint to check style\n")
-		b.WriteString("- Run go_test to verify correctness\n")
-		b.WriteString("- When go_build fails, fix the COMPILATION ERROR (wrong import, typo, missing function) — do NOT revert your changes. Reverting the plan changes is NEVER acceptable. If you cannot fix the error after 3 attempts, output `REPLAN: <reason>`.\n")
+		if ltc.buildTool != "" {
+			fmt.Fprintf(&b, "- Run %s after changes to verify compilation\n", ltc.buildTool)
+		}
+		if ltc.lintTool != "" {
+			fmt.Fprintf(&b, "- Run %s to check style\n", ltc.lintTool)
+		}
+		if ltc.testTool != "" {
+			fmt.Fprintf(&b, "- Run %s to verify correctness\n", ltc.testTool)
+		}
+		if ltc.buildTool != "" {
+			fmt.Fprintf(&b, "- When %s fails, fix the COMPILATION ERROR (wrong import, typo, missing function) — do NOT revert your changes. Reverting the plan changes is NEVER acceptable. If you cannot fix the error after 3 attempts, output `REPLAN: <reason>`.\n", ltc.buildTool)
+		}
 		fmt.Fprintf(&b, "- Always respond in %s\n", langName(lang))
 		if ragEnabled {
 			b.WriteString("\nIMPORTANT — Project rules and conventions (from RAG):\n")
-			b.WriteString("The task context includes MANDATORY RULES marked [MANDATORY PROJECT RULES] and GO STANDARDS marked [GO STANDARDS].\n")
+			fmt.Fprintf(&b, "The task context includes MANDATORY RULES marked [MANDATORY PROJECT RULES] and %s marked [%s].\n", ltc.standardsLabel, ltc.standardsLabel)
 			b.WriteString("These are REQUIREMENTS, not suggestions. Apply them to every line you write.\n")
-			b.WriteString("Examples: getter naming (Owner not GetOwner), error wrapping with pkg/errors, context.Context as first arg.\n")
+			b.WriteString("Examples: naming conventions, error wrapping, proper use of language idioms.\n")
 			b.WriteString("You may call search_docs for additional targeted searches if needed.\n")
 		} else if snippetsEnabled {
 			b.WriteString("\nIMPORTANT — Code conventions:\n")
@@ -143,11 +167,12 @@ func systemPromptForRole(role Role, lang, ruleCatalog string, toolNames []string
 		}
 
 	case RoleReviewer:
+		ltc := langToolsForLang(progLang)
 		b.WriteString("You are the REVIEWER agent.\n")
 		b.WriteString("Your job is to review changes made by the executor.\n\n")
 		if ragEnabled {
 			b.WriteString("IMPORTANT — Project rules and conventions (from RAG):\n")
-			b.WriteString("The task context includes MANDATORY RULES marked [MANDATORY PROJECT RULES], GO STANDARDS marked [GO STANDARDS], and CODE TEMPLATES marked [CODE TEMPLATES].\n")
+			fmt.Fprintf(&b, "The task context includes MANDATORY RULES marked [MANDATORY PROJECT RULES], %s marked [%s], and CODE TEMPLATES marked [CODE TEMPLATES].\n", ltc.standardsLabel, ltc.standardsLabel)
 			b.WriteString("ALL of these are REQUIREMENTS. Flag every violation as a bug with file:line reference.\n")
 			b.WriteString("CODE TEMPLATES define how specific patterns (validation, error handling, constructors, etc.) MUST be implemented in this project.\n")
 			b.WriteString("If changed code does something that a CODE TEMPLATE covers, the code MUST follow that template. Deviations are bugs.\n")
@@ -160,7 +185,7 @@ func systemPromptForRole(role Role, lang, ruleCatalog string, toolNames []string
 		b.WriteString("Guidelines:\n")
 		b.WriteString("- Read the changed files using read-only tools\n")
 		b.WriteString("- Check for bugs, logic errors, and edge cases\n")
-		b.WriteString("- Check for Go best practices and project conventions\n")
+		fmt.Fprintf(&b, "- Check for %s best practices and project conventions\n", ltc.displayName)
 		b.WriteString("- Check for security issues\n")
 		b.WriteString("- Verify error handling\n")
 		b.WriteString("- If changes look good, say so clearly\n")
@@ -177,22 +202,39 @@ func systemPromptForRole(role Role, lang, ruleCatalog string, toolNames []string
 		b.WriteString("{\n")
 		b.WriteString("  \"context\": \"<one-paragraph summary of the overall situation and goal>\",\n")
 		b.WriteString("  \"plan\": [\n")
-		b.WriteString("    \"<relative/path/to/file.ext:LINE — SEVERITY — what must change and why>\",\n")
-		b.WriteString("    \"...\"\n")
-		b.WriteString("  ]\n")
+		b.WriteString("    {\n")
+		b.WriteString("      \"file\": \"<relative/path/to/file.ext>\",\n")
+		b.WriteString("      \"line\": <integer>,\n")
+		b.WriteString("      \"severity\": \"blocker\" | \"major\" | \"minor\",\n")
+		b.WriteString("      \"what\": \"<short description of the problem>\",\n")
+		b.WriteString("      \"why\": \"<why this must be fixed>\",\n")
+		b.WriteString("      \"fix\": \"<concrete fix suggestion>\",\n")
+		b.WriteString("      \"before\": \"<existing code snippet (optional)>\",\n")
+		b.WriteString("      \"after\": \"<corrected code snippet (optional)>\",\n")
+		b.WriteString("      \"rules\": [\"<rule name>\", ...]\n")
+		b.WriteString("    }\n")
+		b.WriteString("  ],\n")
+		b.WriteString("  \"affected_files\": [\"<relative/path/to/file.ext>\", ...],\n")
+		b.WriteString("  \"verification\": [\"<verification step, e.g. 'make build', 'make lint', 'make test-unit'>\", ...]\n")
 		b.WriteString("}\n\n")
 		b.WriteString("STRICT RULES:\n")
 		b.WriteString("- Output ONLY the JSON object. No markdown, no code fences, no comments, no explanations before/after.\n")
-		b.WriteString("- Every `plan` item MUST start with `path:LINE — ` (real file and line from the analysis).\n")
+		b.WriteString("- Every plan item MUST have `file`, `line`, `severity`, `what`, and `fix` fields.\n")
+		b.WriteString("- `why`, `before`, `after`, `rules` are optional — include only when relevant.\n")
+		b.WriteString("- `before`/`after` should be short inline code (single expression or statement).\n")
 		b.WriteString("- SEVERITY ∈ {blocker, major, minor}. Use `blocker` for compilation errors, data corruption, security holes; `major` for bugs and serious convention violations; `minor` for small cleanups.\n")
-		b.WriteString("- Describe WHAT must change and WHY (convention, bug, template mismatch, etc.). Not vague `check X` or `verify Y`.\n")
+		b.WriteString("- Describe WHAT must change concisely. Describe WHY separately.\n")
 		b.WriteString("- Do NOT add items not present in the original analysis. Do NOT invent issues.\n")
 		b.WriteString("- Deduplicate: if the same file:line appears in multiple reviewer sections with the same issue, emit it once.\n")
-		b.WriteString("- Group by file: if multiple issues affect the same file, emit ONE plan item per file with the lowest line number. Concatenate ALL findings for that file into the description — do NOT drop any details. Use semicolons to separate individual changes within the description.\n")
+		b.WriteString("- Group by file: if multiple issues affect the same file, emit ONE plan item per file with the lowest line number. Put all findings for that file in the `what` field, separated by semicolons.\n")
 		b.WriteString("- Sort `plan` by file path, then by line number.\n")
-		b.WriteString("- Do NOT include code blocks, patches, or diffs inside the strings.\n")
+		b.WriteString("- `affected_files` — list ALL unique file paths mentioned in `plan` items.\n")
+		b.WriteString("- `verification` — list concrete shell commands to verify correctness (e.g. `make build`, `make lint`, `make test-unit`). Include at least build and lint.\n")
 		b.WriteString("- If the original analysis found no real issues, output exactly: {\"context\": \"LGTM — no issues found\", \"plan\": []}\n")
-		fmt.Fprintf(&b, "- The `context` field and every `plan` entry MUST be written in %s.\n", langName(lang))
+		if lang == progLangGo {
+			b.WriteString("- DROP findings that contradict idiomatic Go conventions (Effective Go, Go Code Review Comments). For example, redundant nil/zero-value checks after error handling are false positives — the (T, error) contract guarantees T is valid when err == nil.\n")
+		}
+		fmt.Fprintf(&b, "- The `context` field and all text fields MUST be written in %s.\n", langName(lang))
 		b.WriteString("\nReturn ONLY the JSON object.\n")
 
 	case RoleStructurer:
@@ -255,6 +297,56 @@ func systemPromptForRole(role Role, lang, ruleCatalog string, toolNames []string
 	return b.String()
 }
 
+// langToolHints holds language-specific tool names and labels for system prompts.
+type langToolHints struct {
+	structureTool  string // e.g. "go_structure"; "" when unavailable
+	buildTool      string // e.g. "go_build", "tsc", "python_run"
+	lintTool       string // e.g. "go_lint", "eslint", "ruff"
+	testTool       string // e.g. "go_test", "npm_test", "pytest"
+	standardsLabel string // e.g. "GO STANDARDS", "JS/TS STANDARDS"
+	bestPractices  string // e.g. "Use idiomatic Go, Go best practices..."
+	displayName    string // e.g. "Go", "Python", "JavaScript/TypeScript"
+}
+
+func langToolsForLang(progLang string) langToolHints {
+	switch progLang {
+	case progLangGo:
+		return langToolHints{
+			structureTool:  "go_structure",
+			buildTool:      "go_build",
+			lintTool:       "go_lint",
+			testTool:       "go_test",
+			standardsLabel: "GO STANDARDS",
+			bestPractices:  "Use idiomatic Go, Go best practices and project conventions",
+			displayName:    "Go",
+		}
+	case progLangPython:
+		return langToolHints{
+			buildTool:      "python_run",
+			lintTool:       "ruff",
+			testTool:       "pytest",
+			standardsLabel: "PYTHON STANDARDS",
+			bestPractices:  "Use idiomatic Python, PEP 8, and project conventions",
+			displayName:    "Python",
+		}
+	case progLangJSTS:
+		return langToolHints{
+			buildTool:      "tsc",
+			lintTool:       "eslint",
+			testTool:       "npm_test",
+			standardsLabel: "JS/TS STANDARDS",
+			bestPractices:  "Use idiomatic JavaScript/TypeScript and project conventions",
+			displayName:    "JavaScript/TypeScript",
+		}
+	default:
+		return langToolHints{
+			standardsLabel: "PROJECT STANDARDS",
+			bestPractices:  "Use idiomatic code, best practices and project conventions",
+			displayName:    "language",
+		}
+	}
+}
+
 // reviewChecks returns named sets of review checks used by code and
 // architecture reviewer prompts.
 func reviewChecks(lang string) map[string][]string {
@@ -297,7 +389,7 @@ func reviewChecks(lang string) map[string][]string {
 			"No duplication of existing utilities — flag cases where an existing helper should be reused.",
 		},
 		"architecture": {
-			"Changes fit the documented architecture (AGENTS.md, architecture/overview RAG chunks).",
+			"Changes fit the documented architecture (project rules, architecture/overview RAG chunks).",
 			"Forbidden cross-layer dependencies, skipping abstractions, leaking implementation details upward.",
 			"Missing or mis-placed components (e.g. business logic in transport layer, transport in domain).",
 			"Impact on system-wide concerns: transactions, error propagation across layers, extensibility points.",
@@ -332,8 +424,20 @@ func codeReviewerPrompt(lang string) string {
 	b.WriteByte('\n')
 
 	b.WriteString("Output format (STRICT):\n")
-	b.WriteString("- For every real issue: `path/to/file:LINE — SEVERITY — short description — FIX: concrete fix suggestion`.\n")
-	b.WriteString("- SEVERITY ∈ {blocker, major, minor}. No prose outside these lines.\n")
+	b.WriteString("- For every real issue use a multi-line block:\n")
+	b.WriteString("```\n")
+	b.WriteString("path/to/file:LINE — SEVERITY\n")
+	b.WriteString("WHAT: short description of the problem\n")
+	b.WriteString("WHY: why this must be fixed\n")
+	b.WriteString("FIX: concrete fix suggestion\n")
+	b.WriteString("BEFORE: `existing code`\n")
+	b.WriteString("AFTER: `corrected code`\n")
+	b.WriteString("RULES: comma-separated rule names\n")
+	b.WriteString("```\n")
+	b.WriteString("- WHAT and FIX are mandatory. WHY, BEFORE, AFTER, RULES are optional — include only when relevant.\n")
+	b.WriteString("- BEFORE/AFTER should be short inline code (single expression or statement), not multi-line blocks.\n")
+	b.WriteString("- RULES must reference ONLY rule names that appear in the 'Available project rules' list above. If no matching rule exists, omit the RULES line entirely. NEVER invent rule names.\n")
+	b.WriteString("- SEVERITY ∈ {blocker, major, minor}. No prose outside these blocks.\n")
 	b.WriteString("- If you find nothing, output exactly: `NO_ISSUES`.\n")
 	b.WriteString("- Be strict: flag only real issues, not style preferences or speculation.\n")
 	b.WriteString("- Do NOT produce Summary / Verdict / Cross-cutting sections.\n")
@@ -369,8 +473,17 @@ func archReviewerPrompt(lang string) string {
 	b.WriteByte('\n')
 
 	b.WriteString("Output format (STRICT):\n")
-	b.WriteString("- For every real issue: `path/to/package — SEVERITY — short description — FIX: concrete suggestion`.\n")
-	b.WriteString("- SEVERITY ∈ {blocker, major, minor}. No prose outside these lines.\n")
+	b.WriteString("- For every real issue use a multi-line block:\n")
+	b.WriteString("```\n")
+	b.WriteString("path/to/package — SEVERITY\n")
+	b.WriteString("WHAT: short description of the problem\n")
+	b.WriteString("WHY: why this must be fixed\n")
+	b.WriteString("FIX: concrete suggestion\n")
+	b.WriteString("RULES: comma-separated rule names\n")
+	b.WriteString("```\n")
+	b.WriteString("- WHAT and FIX are mandatory. WHY, RULES are optional — include only when relevant.\n")
+	b.WriteString("- RULES must reference ONLY rule names that appear in the 'Available project rules' list above. If no matching rule exists, omit the RULES line entirely. NEVER invent rule names.\n")
+	b.WriteString("- SEVERITY ∈ {blocker, major, minor}. No prose outside these blocks.\n")
 	b.WriteString("- If you find nothing, output exactly: `NO_ISSUES`.\n")
 	b.WriteString("- Focus on structural and architectural issues only — not code-level bugs.\n")
 	b.WriteString("- Do NOT produce Summary / Verdict / Cross-cutting sections.\n")

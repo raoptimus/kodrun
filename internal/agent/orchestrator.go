@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/llm"
 	"github.com/raoptimus/kodrun/internal/projectlang"
 	"github.com/raoptimus/kodrun/internal/rag"
 	"github.com/raoptimus/kodrun/internal/rules"
@@ -43,18 +43,18 @@ const (
 
 // Orchestrator coordinates sub-agents in a Plan → Execute → Review pipeline.
 type Orchestrator struct {
-	client      *ollama.Client
+	client      llm.Client
 	model       string
 	reg         *tools.Registry
 	workDir     string
 	contextSize int
 	// Optional dedicated client/model for the executor role.
 	// When nil/empty, the orchestrator falls back to client/model/contextSize.
-	execClient      *ollama.Client
+	execClient      llm.Client
 	execModel       string
 	execContextSize int
 	// Optional dedicated extractor wiring (Block 5: planner/extractor split).
-	extractorClient      *ollama.Client
+	extractorClient      llm.Client
 	extractorModel       string
 	extractorContextSize int
 	extractorTemperature float64
@@ -87,6 +87,7 @@ type Orchestrator struct {
 	verbose           bool
 
 	cachedProjectFiles string
+	lastPlannerTask    string
 
 	// stepRAGBundles is populated once at the start of runPlanDAG and read
 	// by runStep. Sharing the per-step RAG payload across the DAG run avoids
@@ -115,7 +116,7 @@ type OrchestratorConfig struct {
 	// Optional dedicated executor wiring. When ExecutorClient is nil
 	// or ExecutorModel is empty, the orchestrator reuses the main client/model
 	// for the executor role.
-	ExecutorClient      *ollama.Client
+	ExecutorClient      llm.Client
 	ExecutorModel       string
 	ExecutorContextSize int
 
@@ -123,7 +124,7 @@ type OrchestratorConfig struct {
 	// with deterministic settings (Temperature=0, Format="json") to coerce
 	// structured output. When ExtractorClient is nil or ExtractorModel is
 	// empty, the orchestrator reuses the main client/model.
-	ExtractorClient      *ollama.Client
+	ExtractorClient      llm.Client
 	ExtractorModel       string
 	ExtractorContextSize int
 	ExtractorTemperature float64
@@ -154,7 +155,7 @@ type OrchestratorConfig struct {
 
 // NewOrchestrator creates a new orchestrator.
 func NewOrchestrator(
-	client *ollama.Client,
+	client llm.Client,
 	model string,
 	reg *tools.Registry,
 	workDir string,
@@ -225,6 +226,15 @@ func (o *Orchestrator) emit(e *Event) {
 }
 
 // Run executes the full Plan → Execute → (Review) pipeline.
+// progLang returns the detected project programming language as a string,
+// or "" if unknown.
+func (o *Orchestrator) progLang() string {
+	if o.langState == nil {
+		return ""
+	}
+	return string(o.langState.Current())
+}
+
 // ensureLanguageDetected re-runs project language detection if it is still
 // unknown and lazily registers the matching language-specific tools.
 func (o *Orchestrator) ensureLanguageDetected() {
@@ -321,38 +331,9 @@ func (o *Orchestrator) confirmAndExecute(ctx context.Context, plan, doneMsg stri
 	// Confirm before execution (3-option dialog)
 	autoAccept := false
 	if o.planConfirm != nil {
-		cr := o.planConfirm(plan)
-		switch cr.Action {
-		case PlanDeny:
-			o.emit(&Event{Type: EventAgent, Message: "Execution cancelled by user."})
-			o.emit(&Event{Type: EventModeChange, Message: "plan"})
-			o.emit(&Event{Type: EventDone, Message: doneMsg})
-			return nil
-		case PlanAutoAccept:
-			autoAccept = true
-		case PlanManualApprove:
-			// keep confirmFn as-is
-		case PlanAugment:
-			// Re-run planner with feedback
-			o.emit(&Event{Type: EventAgent, Message: "▸ Revising plan..."})
-			o.emit(&Event{Type: EventGroupStart, Message: "Revise(plan)"})
-
-			revised, err := o.runPlannerRevision(ctx, plan, cr.Augment)
-
-			o.emit(&Event{Type: EventGroupEnd})
-
-			if err != nil {
-				return errors.WithMessage(err, "planner revision")
-			}
-			if revised == "" {
-				return errors.New("planner revision produced empty plan")
-			}
-			plan = revised
-			o.emit(&Event{Type: EventAgent, Message: plan})
-
-			// Ask again after revision
-			cr2 := o.planConfirm(plan)
-			switch cr2.Action {
+		for {
+			cr := o.planConfirm(plan)
+			switch cr.Action {
 			case PlanDeny:
 				o.emit(&Event{Type: EventAgent, Message: "Execution cancelled by user."})
 				o.emit(&Event{Type: EventModeChange, Message: "plan"})
@@ -361,13 +342,28 @@ func (o *Orchestrator) confirmAndExecute(ctx context.Context, plan, doneMsg stri
 			case PlanAutoAccept:
 				autoAccept = true
 			case PlanManualApprove:
-				// keep confirmFn
+				// keep confirmFn as-is
 			case PlanAugment:
-				o.emit(&Event{Type: EventAgent, Message: "Execution cancelled (too many revisions)."})
-				o.emit(&Event{Type: EventModeChange, Message: "plan"})
-				o.emit(&Event{Type: EventDone, Message: doneMsg})
-				return nil
+				o.emit(&Event{Type: EventAgent, Message: "▸ Revising plan..."})
+				o.emit(&Event{Type: EventGroupStart, Message: "Revise(plan)"})
+
+				revised, err := o.runPlannerRevision(ctx, plan, cr.Augment)
+
+				o.emit(&Event{Type: EventGroupEnd})
+
+				if err != nil {
+					return errors.WithMessage(err, "planner revision")
+				}
+				if revised == "" {
+					return errors.New("planner revision produced empty plan")
+				}
+				plan = revised
+				o.emit(&Event{Type: EventAgent, Message: plan})
+
+				continue
 			}
+
+			break
 		}
 	}
 
@@ -388,7 +384,7 @@ func (o *Orchestrator) confirmAndExecute(ctx context.Context, plan, doneMsg stri
 		confirmForExec = o.confirmFn
 	}
 
-	execStats, err := o.runExecutor(execCtx, plan, confirmForExec)
+	execStats, err := o.runExecutor(execCtx, plan, confirmForExec, autoAccept)
 	if err != nil {
 		return errors.WithMessage(err, "executor")
 	}
@@ -417,7 +413,7 @@ func (o *Orchestrator) confirmAndExecute(ctx context.Context, plan, doneMsg stri
 		// If reviewer found issues, run one more executor pass.
 		if feedback != "" {
 			o.emit(&Event{Type: EventAgent, Message: "▸ Applying review feedback..."})
-			if _, err := o.runExecutor(execCtx, feedback, o.confirmFn); err != nil {
+			if _, err := o.runExecutor(execCtx, feedback, o.confirmFn, false); err != nil {
 				return errors.WithMessage(err, "executor (review fix)")
 			}
 		}
@@ -479,7 +475,7 @@ func (o *Orchestrator) extractPlan(ctx context.Context, rawPlan string) (string,
 	// Local models often return JSON even when the prompt asks for markdown
 	// (e.g. when format=json is forced at the API level). Re-render to a
 	// readable form so the user does not see raw JSON.
-	return RenderExtractorOutput(extracted), nil
+	return RenderExtractorOutput(extracted, o.language), nil
 }
 
 // runPlannerPrefetch reads all project files programmatically and injects them into the prompt.
@@ -487,7 +483,7 @@ func (o *Orchestrator) runPlannerPrefetch(ctx context.Context, task string) (str
 	codeContext := o.collectProjectFiles()
 
 	ag := o.newAgent(RolePlanner, o.maxPlanIter)
-	prompt := systemPromptForRole(RolePlanner, o.language, o.ruleCatalog, ag.reg.NamesFiltered(readOnlyTools), o.hasSnippets, o.hasRAG)
+	prompt := systemPromptForRole(RolePlanner, o.language, o.progLang(), o.ruleCatalog, ag.reg.NamesFiltered(readOnlyTools), o.hasSnippets, o.hasRAG)
 	ag.InitWithPrompt(prompt)
 
 	ragContext := o.ragPrefetch(ctx, task)
@@ -495,6 +491,7 @@ func (o *Orchestrator) runPlannerPrefetch(ctx context.Context, task string) (str
 	if ragContext != "" {
 		userMsg = ragContext + "\n" + userMsg
 	}
+	o.lastPlannerTask = userMsg
 	if err := ag.Send(ctx, userMsg); err != nil && !errors.Is(err, ErrMaxIterations) {
 		return "", err
 	}
@@ -588,7 +585,7 @@ func (o *Orchestrator) doCollectProjectFiles() string {
 
 func (o *Orchestrator) runPlannerOnce(ctx context.Context, task string) (plan string, toolCalls int, err error) {
 	ag := o.newAgent(RolePlanner, o.maxPlanIter)
-	prompt := systemPromptForRole(RolePlanner, o.language, o.ruleCatalog, ag.reg.NamesFiltered(readOnlyTools), o.hasSnippets, o.hasRAG)
+	prompt := systemPromptForRole(RolePlanner, o.language, o.progLang(), o.ruleCatalog, ag.reg.NamesFiltered(readOnlyTools), o.hasSnippets, o.hasRAG)
 	ag.InitWithPrompt(prompt)
 
 	enrichedTask := task
@@ -600,6 +597,7 @@ func (o *Orchestrator) runPlannerOnce(ctx context.Context, task string) (plan st
 	if hint := buildFileHint(enrichedTask); hint != "" {
 		enrichedTask = hint + "\n" + enrichedTask
 	}
+	o.lastPlannerTask = enrichedTask
 	if err := ag.Send(ctx, enrichedTask); err != nil && !errors.Is(err, ErrMaxIterations) {
 		return "", 0, err
 	}
@@ -607,11 +605,11 @@ func (o *Orchestrator) runPlannerOnce(ctx context.Context, task string) (plan st
 	return ag.LastPlan(), ag.Stats().ToolCalls, nil
 }
 
-// buildFileHint extracts .go file paths mentioned in the task and returns
+// buildFileHint extracts source file paths mentioned in the task and returns
 // an instruction telling the planner to read those files first. Returns ""
 // if no paths are found.
 func buildFileHint(task string) string {
-	matches := goFilePathRe.FindAllStringSubmatch(task, -1)
+	matches := sourceFilePathRe.FindAllStringSubmatch(task, -1)
 	if len(matches) == 0 {
 		return ""
 	}
@@ -636,12 +634,12 @@ func buildFileHint(task string) string {
 	)
 }
 
-// validatePlanPaths extracts .go file paths from the plan and checks they exist.
+// validatePlanPaths extracts source file paths from the plan and checks they exist.
 // Returns list of non-existent paths.
-var goFilePathRe = regexp.MustCompile(`\b([\w./-]+\.go)(?::\d+)?`)
+var sourceFilePathRe = regexp.MustCompile(`\b([\w./-]+\.(?:go|py|ts|tsx|js|jsx))(?::\d+)?`)
 
 func (o *Orchestrator) validatePlanPaths(plan string) []string {
-	matches := goFilePathRe.FindAllStringSubmatch(plan, -1)
+	matches := sourceFilePathRe.FindAllStringSubmatch(plan, -1)
 	if len(matches) == 0 {
 		return nil
 	}
@@ -735,10 +733,22 @@ func validatePlanQuality(plan string) []string {
 
 func (o *Orchestrator) runPlannerRevision(ctx context.Context, plan, feedback string) (string, error) {
 	ag := o.newAgent(RolePlanner, o.maxPlanIter)
-	prompt := systemPromptForRole(RolePlanner, o.language, o.ruleCatalog, ag.reg.NamesFiltered(readOnlyTools), o.hasSnippets, o.hasRAG)
+	prompt := systemPromptForRole(RolePlanner, o.language, o.progLang(), o.ruleCatalog, ag.reg.NamesFiltered(readOnlyTools), o.hasSnippets, o.hasRAG)
 	ag.InitWithPrompt(prompt)
 
-	task := fmt.Sprintf("Revise the following plan based on user feedback.\n\nOriginal plan:\n%s\n\nUser feedback:\n%s\n\nProvide an updated plan.", plan, feedback)
+	var task string
+	if o.lastPlannerTask != "" {
+		task = fmt.Sprintf(
+			"Revise the following plan based on user feedback.\n\n"+
+				"Original task:\n%s\n\n"+
+				"Current plan:\n%s\n\n"+
+				"User feedback:\n%s\n\n"+
+				"Provide an updated plan that addresses the feedback while staying true to the original task.",
+			o.lastPlannerTask, plan, feedback,
+		)
+	} else {
+		task = fmt.Sprintf("Revise the following plan based on user feedback.\n\nCurrent plan:\n%s\n\nUser feedback:\n%s\n\nProvide an updated plan.", plan, feedback)
+	}
 	if ragContext := o.ragPrefetch(ctx, feedback); ragContext != "" {
 		task = ragContext + "\n" + task
 	}
@@ -761,7 +771,7 @@ func (o *Orchestrator) runPlannerRevision(ctx context.Context, plan, feedback st
 // the execution to the orchestrator's executor sub-agent.
 func (o *Orchestrator) RunExecutor(ctx context.Context, plan string, confirmFn ConfirmFunc) error {
 	o.emit(&Event{Type: EventModeChange, Message: "edit"})
-	stats, err := o.runExecutor(ctx, plan, confirmFn)
+	stats, err := o.runExecutor(ctx, plan, confirmFn, false)
 	if err != nil {
 		return errors.WithMessage(err, "executor")
 	}
@@ -770,7 +780,7 @@ func (o *Orchestrator) RunExecutor(ctx context.Context, plan string, confirmFn C
 	return nil
 }
 
-func (o *Orchestrator) runExecutor(ctx context.Context, plan string, confirmFn ConfirmFunc) (SessionStats, error) {
+func (o *Orchestrator) runExecutor(ctx context.Context, plan string, confirmFn ConfirmFunc, autoAccept bool) (SessionStats, error) {
 	// Always attempt to structure the plan into a JSON DAG. maxParallelTasks
 	// controls only the number of concurrent workers, not whether we use the
 	// DAG path. This ensures every step gets its own clean sub-agent context
@@ -784,7 +794,7 @@ func (o *Orchestrator) runExecutor(ctx context.Context, plan string, confirmFn C
 			Type:    EventAgent,
 			Message: fmt.Sprintf("Executing plan as DAG: %d steps, max %d parallel", len(structured.Steps), parallel),
 		})
-		return o.runPlanDAG(ctx, structured, parallel, confirmFn)
+		return o.runPlanDAG(ctx, structured, parallel, confirmFn, autoAccept)
 	}
 
 	// Fallback: structurer unavailable or returned empty plan. Use single
@@ -797,7 +807,7 @@ func (o *Orchestrator) runExecutor(ctx context.Context, plan string, confirmFn C
 	o.emit(&Event{Type: EventGroupEnd})
 
 	ag := o.newAgent(RoleExecutor, o.maxExecIter)
-	prompt := systemPromptForRole(RoleExecutor, o.language, o.ruleCatalog, ag.reg.Names(), o.hasSnippets, o.hasRAG)
+	prompt := systemPromptForRole(RoleExecutor, o.language, o.progLang(), o.ruleCatalog, ag.reg.Names(), o.hasSnippets, o.hasRAG)
 	ag.InitWithPrompt(prompt)
 	ag.SetConfirmFunc(confirmFn)
 
@@ -814,7 +824,12 @@ func (o *Orchestrator) runExecutor(ctx context.Context, plan string, confirmFn C
 		})
 	}
 
-	execTask := fmt.Sprintf("## Source Code (already read — do NOT call read_file or list_dir)\n%s\n## Approved Plan\n\n%s\n\n---\nImplement each step by calling edit_file/write_file. After all changes run go_build, go_lint, go_test.", codeContext, plan)
+	ltc := langToolsForLang(o.progLang())
+	verifyHint := ""
+	if ltc.buildTool != "" {
+		verifyHint = fmt.Sprintf(" After all changes run %s, %s, %s.", ltc.buildTool, ltc.lintTool, ltc.testTool)
+	}
+	execTask := fmt.Sprintf("## Source Code (already read — do NOT call read_file or list_dir)\n%s\n## Approved Plan\n\n%s\n\n---\nImplement each step by calling edit_file/write_file.%s", codeContext, plan, verifyHint)
 	if ragContext := o.ragPrefetchBySteps(ctx, plan); ragContext != "" {
 		execTask = ragContext + "\n" + execTask
 	}
@@ -836,7 +851,7 @@ func (o *Orchestrator) runExecutor(ctx context.Context, plan string, confirmFn C
 
 func (o *Orchestrator) runReviewer(ctx context.Context, plan string, execStats *SessionStats) (string, error) {
 	ag := o.newAgent(RoleReviewer, o.maxRevIter)
-	prompt := systemPromptForRole(RoleReviewer, o.language, o.ruleCatalog, ag.reg.NamesFiltered(readOnlyTools), o.hasSnippets, o.hasRAG)
+	prompt := systemPromptForRole(RoleReviewer, o.language, o.progLang(), o.ruleCatalog, ag.reg.NamesFiltered(readOnlyTools), o.hasSnippets, o.hasRAG)
 	ag.InitWithPrompt(prompt)
 
 	reviewTask := fmt.Sprintf(
@@ -877,7 +892,14 @@ func (o *Orchestrator) newAgent(role Role, maxIter int) *Agent {
 	ag.SetMaxToolWorkers(maxToolWorkersDefault)
 	ag.SetHasSnippets(o.hasSnippets)
 	ag.SetHasRAG(o.hasRAG)
-	ag.SetTaskLabel(taskLabelForRole(role))
+	switch role {
+	case RolePlanner, RoleExecutor, RoleReviewer:
+		ag.SetTaskLabel(taskLabelForRole(role))
+	default:
+		if o.verbose {
+			ag.SetTaskLabel(taskLabelForRole(role))
+		}
+	}
 	ag.SetVerbose(o.verbose)
 
 	switch role {
@@ -1005,7 +1027,7 @@ func (o *Orchestrator) ragPrefetchForReview(ctx context.Context, task string) st
 	types := entityTypesFromPaths(changed, o.ruleNames)
 
 	// 3. Rule names from .go paths mentioned in the task text.
-	for _, m := range goFilePathRe.FindAllStringSubmatch(task, -1) {
+	for _, m := range sourceFilePathRe.FindAllStringSubmatch(task, -1) {
 		if len(m) >= minRegexMatches {
 			if t := detectEntityTypeFromPath(m[1], o.ruleNames); t != "" && !slices.Contains(types, t) {
 				types = append(types, t)
@@ -1026,6 +1048,16 @@ func (o *Orchestrator) ragPrefetchForReview(ctx context.Context, task string) st
 		if slices.Contains(types, name) {
 			continue // already covered above
 		}
+		if results, err := o.ragIndex.Search(ctx, name, ragRuleTopK); err == nil {
+			add(results)
+		}
+	}
+
+	// 5. Embedded language standards fan-out: search by each embedded
+	//    reference doc name for the detected project language. This ensures
+	//    standards (effective_go, go_common_mistakes, etc.) are reliably
+	//    surfaced even when semantic search on task text misses them.
+	for _, name := range rag.EmbeddedDocNames(o.progLang()) {
 		if results, err := o.ragIndex.Search(ctx, name, ragRuleTopK); err == nil {
 			add(results)
 		}
@@ -1056,6 +1088,21 @@ func (o *Orchestrator) ragPrefetchBySteps(ctx context.Context, plan string) stri
 
 	for _, step := range steps {
 		results, err := o.ragIndex.Search(ctx, step, perStepRAGTopK)
+		if err != nil {
+			continue
+		}
+		for _, r := range results {
+			key := fmt.Sprintf("%s:%d", r.Chunk.FilePath, r.Chunk.StartLine)
+			if !seen[key] {
+				seen[key] = true
+				allResults = append(allResults, r)
+			}
+		}
+	}
+
+	// Embedded language standards fan-out (same as ragPrefetchForReview step 5).
+	for _, name := range rag.EmbeddedDocNames(o.progLang()) {
+		results, err := o.ragIndex.Search(ctx, name, ragRuleTopK)
 		if err != nil {
 			continue
 		}
@@ -1134,7 +1181,7 @@ func (o *Orchestrator) structurePlan(ctx context.Context, markdownPlan string) *
 		}
 
 		ag := o.newAgent(RoleStructurer, structurerMaxIter)
-		prompt := systemPromptForRole(RoleStructurer, o.language, o.ruleCatalog, nil)
+		prompt := systemPromptForRole(RoleStructurer, o.language, o.progLang(), o.ruleCatalog, nil)
 		ag.InitWithPrompt(prompt)
 
 		if err := ag.Send(ctx, task); err != nil && !errors.Is(err, ErrMaxIterations) {
@@ -1166,7 +1213,7 @@ func (o *Orchestrator) structurePlan(ctx context.Context, markdownPlan string) *
 // producing "thinking" text instead of actionable plans.
 func (o *Orchestrator) runExtractor(ctx context.Context, rawAnalysis string) (string, error) {
 	ag := o.newAgent(RoleExtractor, extractorMaxIter)
-	prompt := systemPromptForRole(RoleExtractor, o.language, o.ruleCatalog, nil)
+	prompt := systemPromptForRole(RoleExtractor, o.language, o.progLang(), o.ruleCatalog, nil)
 	ag.InitWithPrompt(prompt)
 
 	task := fmt.Sprintf("Extract a clear, actionable plan from the following analysis:\n\n%s", rawAnalysis)
@@ -1192,15 +1239,21 @@ type reviewResult struct {
 	toolCalls int
 }
 
-// specialistFinding is a parsed line from a specialist's output in the
-// strict `path:LINE — SEVERITY — description` format.
+// specialistFinding is a parsed finding from a specialist's output.
+// Supports both single-line (`path:LINE — SEVERITY — body`) and multi-line
+// block format (header + WHAT/WHY/FIX/BEFORE/AFTER/RULES fields).
 type specialistFinding struct {
-	file     string
-	line     int
-	severity string
-	body     string    // description part after the second separator
-	roles    []Role    // specialists that reported this finding (for dedup)
-	examples []Example // EXAMPLE: continuation lines parsed from reviewer output
+	file      string
+	line      int
+	severity  string
+	body      string    // WHAT: description of the problem
+	why       string    // WHY: rationale for fixing
+	fix       string    // FIX: concrete suggestion
+	before    string    // BEFORE: existing code snippet
+	after     string    // AFTER: corrected code snippet
+	ruleNames []string  // RULES: referenced rule names
+	roles     []Role    // specialists that reported this finding (for dedup)
+	examples  []Example // EXAMPLE: continuation lines parsed from reviewer output
 }
 
 // severityRank orders findings: blocker first, then major, then minor.
@@ -1223,14 +1276,40 @@ var specialistFindingRe = regexp.MustCompile(
 	`(?i)^[\s\-*>0-9.)]*\**\s*([\w./\\-]+?):(\d+)\**\s*[—–\-:]+\s*\**(blocker|major|minor)\**\s*[—–\-:]+\s*(.+?)\**$`,
 )
 
+// specialistFindingHeaderRe captures the header of a multi-line finding block:
+// path:LINE — SEVERITY (no body on the same line).
+var specialistFindingHeaderRe = regexp.MustCompile(
+	`(?i)^[\s\-*>0-9.)]*\**\s*([\w./\\-]+?):(\d+)\**\s*[—–\-:]+\s*\**(blocker|major|minor)\**\s*$`,
+)
+
+// findingFieldRe captures structured fields (WHAT/WHY/FIX/BEFORE/AFTER/RULES)
+// from continuation lines of a multi-line finding block.
+var findingFieldRe = regexp.MustCompile(
+	`(?i)^\s*\**\s*(WHAT|WHY|FIX|BEFORE|AFTER|RULES)\s*:\s*\**\s*(.+)$`,
+)
+
 // exampleLineRe captures EXAMPLE: continuation lines from specialist output.
 // Format: EXAMPLE: path/to/file.go:LINE — reason
 var exampleLineRe = regexp.MustCompile(
 	`(?i)^\s*EXAMPLE:\s*([\w./\\-]+?):(\d+)\s*[—–\-]\s*(.+)$`,
 )
 
-// parseSpecialistFindings extracts strict finding lines from a specialist's
-// raw output. Non-matching lines (headers, prose) are ignored. EXAMPLE:
+// splitBodyAndFix splits a legacy single-line body that contains both
+// description and fix suggestion separated by "— FIX:".
+func splitBodyAndFix(body string) (description, fix string) {
+	upper := strings.ToUpper(body)
+	for _, sep := range []string{" — FIX: ", " – FIX: ", " - FIX: "} {
+		idx := strings.Index(upper, sep)
+		if idx >= 0 {
+			return strings.TrimSpace(body[:idx]), strings.TrimSpace(body[idx+len(sep):])
+		}
+	}
+	return body, ""
+}
+
+// parseSpecialistFindings extracts findings from a specialist's raw output.
+// Supports both multi-line block format (header + WHAT/WHY/FIX/... fields)
+// and legacy single-line format. Non-matching lines are ignored. EXAMPLE:
 // continuation lines are attached to the immediately preceding finding.
 func parseSpecialistFindings(text string, role Role) []specialistFinding {
 	lines := strings.Split(text, "\n")
@@ -1255,6 +1334,43 @@ func parseSpecialistFindings(text string, role Role) []specialistFinding {
 			}
 			continue
 		}
+		// Try structured field continuation (WHAT/WHY/FIX/BEFORE/AFTER/RULES).
+		if fm := findingFieldRe.FindStringSubmatch(line); fm != nil {
+			if len(out) > 0 {
+				last := &out[len(out)-1]
+				val := strings.TrimSpace(fm[2])
+				switch strings.ToUpper(fm[1]) {
+				case "WHAT":
+					last.body = val
+				case "WHY":
+					last.why = val
+				case "FIX":
+					last.fix = val
+				case "BEFORE":
+					last.before = val
+				case "AFTER":
+					last.after = val
+				case "RULES":
+					last.ruleNames = parseRuleNames(val)
+				}
+			}
+			continue
+		}
+		// Try multi-line header: file:LINE — SEVERITY (no body).
+		if hm := specialistFindingHeaderRe.FindStringSubmatch(line); hm != nil {
+			lineNo, err := strconv.Atoi(hm[2])
+			if err != nil {
+				continue
+			}
+			out = append(out, specialistFinding{
+				file:     hm[1],
+				line:     lineNo,
+				severity: strings.ToLower(hm[3]),
+				roles:    []Role{role},
+			})
+			continue
+		}
+		// Fallback: legacy single-line format.
 		m := specialistFindingRe.FindStringSubmatch(line)
 		if m == nil {
 			continue
@@ -1263,15 +1379,57 @@ func parseSpecialistFindings(text string, role Role) []specialistFinding {
 		if err != nil {
 			continue
 		}
+		desc, fixPart := splitBodyAndFix(strings.TrimSpace(m[4]))
 		out = append(out, specialistFinding{
 			file:     m[1],
 			line:     lineNo,
 			severity: strings.ToLower(m[3]),
-			body:     strings.TrimSpace(m[4]),
+			body:     desc,
+			fix:      fixPart,
 			roles:    []Role{role},
 		})
 	}
 	return out
+}
+
+// parseRuleNames splits a comma-separated list of rule names.
+func parseRuleNames(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// mergeField keeps the longer non-empty value.
+func mergeField(dst *string, src string) {
+	if src == "" {
+		return
+	}
+	if *dst == "" || len(src) > len(*dst) {
+		*dst = src
+	}
+}
+
+// mergeRuleNames returns the union of two rule name slices.
+func mergeRuleNames(dst, src []string) []string {
+	for _, s := range src {
+		found := false
+		for _, d := range dst {
+			if d == s {
+				found = true
+				break
+			}
+		}
+		if !found {
+			dst = append(dst, s)
+		}
+	}
+	return dst
 }
 
 // mergeExamples appends examples from src into dst, deduplicating by file+line.
@@ -1310,7 +1468,7 @@ func isNoIssues(text string) bool {
 // deduplicates (same file + same description → merge roles and group lines),
 // sorts by severity then file, and renders as a markdown plan. Returns "" if
 // no strict lines were parsed (caller should fall back to raw concatenation).
-func mergeSpecialistFindings(results []reviewResult) string {
+func mergeSpecialistFindings(results []reviewResult, lang string) string {
 	var all []specialistFinding
 	var unparsed []specialistFinding
 	for i := range results {
@@ -1372,6 +1530,12 @@ func mergeSpecialistFindings(results []reviewResult) string {
 			if severityRank(f.severity) < severityRank(existing.severity) {
 				existing.severity = f.severity
 			}
+			// Merge structured fields: keep longer/non-empty.
+			mergeField(&existing.why, f.why)
+			mergeField(&existing.fix, f.fix)
+			mergeField(&existing.before, f.before)
+			mergeField(&existing.after, f.after)
+			existing.ruleNames = mergeRuleNames(existing.ruleNames, f.ruleNames)
 			// Merge examples from duplicate findings.
 			existing.examples = mergeExamples(existing.examples, f.examples)
 		} else {
@@ -1400,7 +1564,8 @@ func mergeSpecialistFindings(results []reviewResult) string {
 	}
 	byGroup := make(map[groupKey]*lineGroup)
 	var groupOrder []groupKey
-	for _, f := range deduped {
+	for idx := range deduped {
+		f := &deduped[idx]
 		key := groupKey{file: f.file, sev: f.severity, body: normalizeBody(f.body)}
 		if g, ok := byGroup[key]; ok {
 			g.lines = append(g.lines, f.line)
@@ -1417,10 +1582,16 @@ func mergeSpecialistFindings(results []reviewResult) string {
 					g.finding.roles = append(g.finding.roles, r)
 				}
 			}
+			// Merge structured fields.
+			mergeField(&g.finding.why, f.why)
+			mergeField(&g.finding.fix, f.fix)
+			mergeField(&g.finding.before, f.before)
+			mergeField(&g.finding.after, f.after)
+			g.finding.ruleNames = mergeRuleNames(g.finding.ruleNames, f.ruleNames)
 			// Merge examples.
 			g.finding.examples = mergeExamples(g.finding.examples, f.examples)
 		} else {
-			g := &lineGroup{finding: f, lines: []int{f.line}}
+			g := &lineGroup{finding: *f, lines: []int{f.line}}
 			byGroup[key] = g
 			groupOrder = append(groupOrder, key)
 		}
@@ -1439,7 +1610,7 @@ func mergeSpecialistFindings(results []reviewResult) string {
 			for i, l := range g.lines {
 				lineStrs[i] = strconv.Itoa(l)
 			}
-			f.body = f.body + " (строки: " + strings.Join(lineStrs, ", ") + ")"
+			f.body = f.body + planLabel(lang, "lines") + strings.Join(lineStrs, ", ") + ")"
 		}
 		grouped = append(grouped, f)
 	}
@@ -1456,19 +1627,78 @@ func mergeSpecialistFindings(results []reviewResult) string {
 	})
 
 	var b strings.Builder
-	b.WriteString("## Plan\n\n")
-	for i, f := range grouped {
+
+	// --- Section 1: Tasks ---
+	b.WriteString(planLabel(lang, "tasks2"))
+	for i := range grouped {
+		f := &grouped[i]
 		var roleStrs []string
 		for _, r := range f.roles {
 			roleStrs = append(roleStrs, string(r))
 		}
 		roles := strings.Join(roleStrs, ", ")
-		fmt.Fprintf(&b, "%d. %s:%d — %s — %s [%s]\n", i+1, f.file, f.line, f.severity, f.body, roles)
-		for _, ex := range f.examples {
-			fmt.Fprintf(&b, "   EXAMPLE: %s:%d — %s\n", ex.File, ex.Line, ex.Note)
+
+		fmt.Fprintf(&b, "### %d. %s:%d [%s]\n\n", i+1, f.file, f.line, f.severity)
+		if f.body != "" {
+			fmt.Fprintf(&b, "- **What:** %s\n", f.body)
 		}
+		if f.why != "" {
+			fmt.Fprintf(&b, "- **Why:** %s\n", f.why)
+		}
+		if f.fix != "" {
+			fmt.Fprintf(&b, "- **Fix:** %s\n", f.fix)
+		}
+		if f.before != "" {
+			fmt.Fprintf(&b, "- **Before:** %s\n", f.before)
+		}
+		if f.after != "" {
+			fmt.Fprintf(&b, "- **After:** %s\n", f.after)
+		}
+		if len(f.ruleNames) > 0 {
+			fmt.Fprintf(&b, "- **Rules:** %s\n", strings.Join(f.ruleNames, ", "))
+		}
+		for _, ex := range f.examples {
+			fmt.Fprintf(&b, "- **Example:** %s:%d — %s\n", ex.File, ex.Line, ex.Note)
+		}
+		fmt.Fprintf(&b, "- *Reviewers: %s*\n\n", roles)
 	}
+
+	// --- Section 2: Affected files ---
+	affectedFiles := collectAffectedFiles(grouped)
+	if len(affectedFiles) > 0 {
+		b.WriteString(planLabel(lang, "affected2"))
+		for _, af := range affectedFiles {
+			fmt.Fprintf(&b, "- %s\n", af)
+		}
+		b.WriteByte('\n')
+	}
+
+	// --- Section 3: Verification ---
+	b.WriteString(planLabel(lang, "verification2"))
+	fmt.Fprintf(&b, "- [ ] %s (`make build`)\n", planLabel(lang, "build"))
+	fmt.Fprintf(&b, "- [ ] %s (`make lint`)\n", planLabel(lang, "lint"))
+	fmt.Fprintf(&b, "- [ ] %s (`make test-unit`)\n", planLabel(lang, "test"))
+
 	return strings.TrimRight(b.String(), "\n")
+}
+
+// collectAffectedFiles extracts unique file paths from grouped findings,
+// sorted alphabetically. Skips "(unstructured)" placeholder entries.
+func collectAffectedFiles(findings []specialistFinding) []string {
+	seen := make(map[string]struct{})
+	for i := range findings {
+		f := findings[i].file
+		if f == "" || f == "(unstructured)" {
+			continue
+		}
+		seen[f] = struct{}{}
+	}
+	out := make([]string, 0, len(seen))
+	for f := range seen {
+		out = append(out, f)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func truncateTask(s string, maxLen int) string {

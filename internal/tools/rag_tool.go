@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/llm"
 	"github.com/raoptimus/kodrun/internal/rag"
 )
 
@@ -31,10 +31,10 @@ func (t *RAGSearchTool) Description() string {
 	return "Search project files using semantic similarity (RAG). Use for finding relevant code, docs, or examples."
 }
 
-func (t *RAGSearchTool) Schema() ollama.JSONSchema {
-	return ollama.JSONSchema{
+func (t *RAGSearchTool) Schema() llm.JSONSchema {
+	return llm.JSONSchema{
 		Type: "object",
-		Properties: map[string]ollama.JSONSchema{
+		Properties: map[string]llm.JSONSchema{
 			"query": {Type: "string", Description: "Search query describing what you're looking for"},
 		},
 		Required: []string{"query"},

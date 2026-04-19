@@ -59,7 +59,7 @@ func TestSystemPromptForRole_ContainsAssistantIdentity_Successfully(t *testing.T
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := systemPromptForRole(tt.role, "en", "", nil)
+			got := systemPromptForRole(tt.role, "en", "", "", nil)
 			assert.Contains(t, got, "You are KodRun")
 		})
 	}
@@ -68,7 +68,7 @@ func TestSystemPromptForRole_ContainsAssistantIdentity_Successfully(t *testing.T
 func TestSystemPromptForRole_NonEnglishIncludesLanguageDirective_Successfully(t *testing.T) {
 	t.Parallel()
 
-	got := systemPromptForRole(RolePlanner, "ru", "", nil)
+	got := systemPromptForRole(RolePlanner, "ru", "", "", nil)
 
 	assert.Contains(t, got, "Russian")
 	assert.Contains(t, got, "IMPORTANT: ALL your responses MUST be in Russian")
@@ -77,7 +77,7 @@ func TestSystemPromptForRole_NonEnglishIncludesLanguageDirective_Successfully(t 
 func TestSystemPromptForRole_EnglishOmitsLanguageDirective_Successfully(t *testing.T) {
 	t.Parallel()
 
-	got := systemPromptForRole(RolePlanner, "en", "", nil)
+	got := systemPromptForRole(RolePlanner, "en", "", "", nil)
 
 	assert.NotContains(t, got, "IMPORTANT: ALL your responses MUST be in English")
 }
@@ -86,7 +86,7 @@ func TestSystemPromptForRole_IncludesRuleCatalog_Successfully(t *testing.T) {
 	t.Parallel()
 
 	catalog := "## Rules\n- Use context.Context\n"
-	got := systemPromptForRole(RoleExecutor, "en", catalog, nil)
+	got := systemPromptForRole(RoleExecutor, "en", "", catalog, nil)
 
 	assert.Contains(t, got, catalog)
 }
@@ -95,7 +95,7 @@ func TestSystemPromptForRole_IncludesToolNames_Successfully(t *testing.T) {
 	t.Parallel()
 
 	tools := []string{"read_file", "write_file", "bash"}
-	got := systemPromptForRole(RoleExecutor, "en", "", tools)
+	got := systemPromptForRole(RoleExecutor, "en", "", "", tools)
 
 	assert.Contains(t, got, "Available tools: read_file, write_file, bash")
 }
@@ -103,7 +103,7 @@ func TestSystemPromptForRole_IncludesToolNames_Successfully(t *testing.T) {
 func TestSystemPromptForRole_PlannerWithSnippets_Successfully(t *testing.T) {
 	t.Parallel()
 
-	got := systemPromptForRole(RolePlanner, "en", "", nil, true)
+	got := systemPromptForRole(RolePlanner, "en", "", "", nil, true)
 
 	assert.Contains(t, got, "snippets")
 	assert.Contains(t, got, "IMPORTANT")
@@ -112,7 +112,7 @@ func TestSystemPromptForRole_PlannerWithSnippets_Successfully(t *testing.T) {
 func TestSystemPromptForRole_PlannerWithRAG_Successfully(t *testing.T) {
 	t.Parallel()
 
-	got := systemPromptForRole(RolePlanner, "en", "", nil, false, true)
+	got := systemPromptForRole(RolePlanner, "en", "", "", nil, false, true)
 
 	assert.Contains(t, got, "MANDATORY RULES")
 	assert.Contains(t, got, "search_docs")
@@ -121,7 +121,7 @@ func TestSystemPromptForRole_PlannerWithRAG_Successfully(t *testing.T) {
 func TestSystemPromptForRole_ExecutorContainsRole_Successfully(t *testing.T) {
 	t.Parallel()
 
-	got := systemPromptForRole(RoleExecutor, "en", "", nil)
+	got := systemPromptForRole(RoleExecutor, "en", "", "", nil)
 
 	assert.Contains(t, got, "You are the EXECUTOR agent")
 	assert.Contains(t, got, "IMPLEMENT an approved plan")
@@ -130,7 +130,7 @@ func TestSystemPromptForRole_ExecutorContainsRole_Successfully(t *testing.T) {
 func TestSystemPromptForRole_ReviewerContainsRole_Successfully(t *testing.T) {
 	t.Parallel()
 
-	got := systemPromptForRole(RoleReviewer, "en", "", nil)
+	got := systemPromptForRole(RoleReviewer, "en", "", "", nil)
 
 	assert.Contains(t, got, "You are the REVIEWER agent")
 }
@@ -138,7 +138,7 @@ func TestSystemPromptForRole_ReviewerContainsRole_Successfully(t *testing.T) {
 func TestSystemPromptForRole_ExtractorContainsJSONSchema_Successfully(t *testing.T) {
 	t.Parallel()
 
-	got := systemPromptForRole(RoleExtractor, "en", "", nil)
+	got := systemPromptForRole(RoleExtractor, "en", "", "", nil)
 
 	assert.Contains(t, got, "PLAN EXTRACTOR")
 	assert.Contains(t, got, `"context"`)
@@ -148,7 +148,7 @@ func TestSystemPromptForRole_ExtractorContainsJSONSchema_Successfully(t *testing
 func TestSystemPromptForRole_StructurerContainsJSONSchema_Successfully(t *testing.T) {
 	t.Parallel()
 
-	got := systemPromptForRole(RoleStructurer, "en", "", nil)
+	got := systemPromptForRole(RoleStructurer, "en", "", "", nil)
 
 	assert.Contains(t, got, "PLAN STRUCTURER")
 	assert.Contains(t, got, `"steps"`)
@@ -158,7 +158,7 @@ func TestSystemPromptForRole_StructurerContainsJSONSchema_Successfully(t *testin
 func TestSystemPromptForRole_ResponseClassifierContainsSchema_Successfully(t *testing.T) {
 	t.Parallel()
 
-	got := systemPromptForRole(RoleResponseClassifier, "en", "", nil)
+	got := systemPromptForRole(RoleResponseClassifier, "en", "", "", nil)
 
 	assert.Contains(t, got, "RESPONSE CLASSIFIER")
 	assert.Contains(t, got, `"kind"`)

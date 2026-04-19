@@ -11,7 +11,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/llm"
 )
 
 // goStructureTool extracts the structural outline of Go source files
@@ -26,10 +26,10 @@ func (t *goStructureTool) Description() string {
 	return "Show Go file/package structure: types (with fields), interfaces, functions, constants, variables — with line numbers. Like go doc but for any .go file."
 }
 
-func (t *goStructureTool) Schema() ollama.JSONSchema {
-	return ollama.JSONSchema{
+func (t *goStructureTool) Schema() llm.JSONSchema {
+	return llm.JSONSchema{
 		Type: "object",
-		Properties: map[string]ollama.JSONSchema{
+		Properties: map[string]llm.JSONSchema{
 			"path":          {Type: "string", Description: "Path to a .go file or directory (package)"},
 			"exported_only": {Type: "boolean", Description: "Show only exported symbols (default: false)"},
 			"comments":      {Type: "boolean", Description: "Include doc comments (default: false)"},

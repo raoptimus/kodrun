@@ -26,10 +26,13 @@ import (
 	"github.com/raoptimus/kodrun/internal/agent"
 	"github.com/raoptimus/kodrun/internal/config"
 	"github.com/raoptimus/kodrun/internal/kodruninit"
+	"github.com/raoptimus/kodrun/internal/llm"
+	_ "github.com/raoptimus/kodrun/internal/llm/ollama"
+	_ "github.com/raoptimus/kodrun/internal/llm/openai"
 	"github.com/raoptimus/kodrun/internal/mcp"
-	"github.com/raoptimus/kodrun/internal/ollama"
 	"github.com/raoptimus/kodrun/internal/projectlang"
 	"github.com/raoptimus/kodrun/internal/rag"
+	"github.com/raoptimus/kodrun/internal/ragdb/muninn"
 	"github.com/raoptimus/kodrun/internal/rules"
 	"github.com/raoptimus/kodrun/internal/runner"
 	"github.com/raoptimus/kodrun/internal/snippets"
@@ -156,16 +159,16 @@ type agentSetup struct {
 	reg           *tools.Registry
 	loader        *rules.Loader
 	snippetLoader *snippets.Loader
-	ragIndex      *rag.MultiIndex
+	ragIndex      rag.Backend
 	godocIndexer  tools.GoDocIndexer
 	langState     *projectlang.State
 	mcpMgr        *mcp.Manager
-	client        *ollama.Client
+	client        llm.Client
 }
 
 func setupAgent(ctx context.Context, cfg *config.Config, scope rules.Scope) agentSetup {
 	chatProv := cfg.ChatProvider()
-	chatClient := ollama.NewClient(chatProv.BaseURL, chatProv.Timeout)
+	chatClient := newLLMClient(&chatProv)
 
 	loader := rules.NewLoader(flags.workDir, cfg.Rules.MaxRefSize)
 	if err := loader.Load(ctx); err != nil {
@@ -191,28 +194,36 @@ func setupAgent(ctx context.Context, cfg *config.Config, scope rules.Scope) agen
 
 	// RAG setup (may use a different provider) — must happen before tool
 	// registration so the godoc indexer can be wired into go_doc.
-	var ragIndex *rag.MultiIndex
+	var ragIndex rag.Backend
 	var godocIndexer tools.GoDocIndexer // nil when RAG is disabled
 	if cfg.RAG.Enabled {
-		indexPath := cfg.RAG.IndexPath
-		if !filepath.IsAbs(indexPath) {
-			indexPath = filepath.Join(flags.workDir, indexPath)
+		switch cfg.RAG.Backend {
+		case config.RAGBackendMuninn:
+			ragIndex = muninn.NewBackend(&muninn.Options{
+				URL:   cfg.RAG.Muninn.URL,
+				Vault: cfg.RAG.Muninn.Vault,
+			})
+		default: // "local"
+			indexPath := cfg.RAG.IndexPath
+			if !filepath.IsAbs(indexPath) {
+				indexPath = filepath.Join(flags.workDir, indexPath)
+			}
+			ragProv := cfg.RAGProvider()
+			ragClient := newLLMClient(&ragProv)
+			ragIndex = rag.NewMultiIndex(ragClient, ragProv.Model, indexPath)
+			// Legacy per-language sub-indexes (go/python/jsts) are no longer
+			// used — RAG indexes only project conventions, which are not
+			// partitioned by language. Remove any leftover directories from
+			// earlier kodrun versions so stale code chunks cannot survive.
+			cleanupLegacyLangDirs(indexPath)
 		}
-		ragProv := cfg.RAGProvider()
-		ragClient := ollama.NewClient(ragProv.BaseURL, ragProv.Timeout)
-		ragIndex = rag.NewMultiIndex(ragClient, ragProv.Model, indexPath)
-		// Legacy per-language sub-indexes (go/python/jsts) are no longer
-		// used — RAG indexes only project conventions, which are not
-		// partitioned by language. Remove any leftover directories from
-		// earlier kodrun versions so stale code chunks cannot survive.
-		cleanupLegacyLangDirs(indexPath)
 		if err := ragIndex.LoadCommon(); err != nil {
 			slog.Warn("RAG common index load failed", "error", err)
 		}
 		if err := ragIndex.LoadGodoc(); err != nil {
 			slog.Warn("RAG godoc index load failed", "error", err)
 		}
-		godocIndexer = ragIndex.GodocIndexer()
+		godocIndexer = &rag.BackendGodocAdapter{B: ragIndex}
 	}
 
 	reg := tools.NewRegistry()
@@ -230,7 +241,7 @@ func setupAgent(ctx context.Context, cfg *config.Config, scope rules.Scope) agen
 	{
 		var webIndexer tools.WebIndexer
 		if ragIndex != nil {
-			webIndexer = ragIndex.WebIndexer()
+			webIndexer = &rag.BackendWebAdapter{B: ragIndex}
 		}
 		topK := cfg.RAG.TopK
 		if topK <= 0 {
@@ -803,10 +814,12 @@ func runRoot(ctx context.Context, cmd *cli.Command) error {
 						diffArgs = append(diffArgs, a)
 					}
 				}
-				if packageScope != "" {
-					emit(&agent.Event{Type: agent.EventAgent, Message: fmt.Sprintf("Collecting diff for code review (scope: %s)...", packageScope)})
-				} else {
-					emit(&agent.Event{Type: agent.EventAgent, Message: "Collecting diff for code review..."})
+				if flags.verbose {
+					if packageScope != "" {
+						emit(&agent.Event{Type: agent.EventAgent, Message: fmt.Sprintf("Collecting diff for code review (scope: %s)...", packageScope)})
+					} else {
+						emit(&agent.Event{Type: agent.EventAgent, Message: "Collecting diff for code review..."})
+					}
 				}
 				diffOut, err := gitDiff(ctx, flags.workDir, diffArgs)
 				if err != nil {
@@ -826,7 +839,7 @@ func runRoot(ctx context.Context, cmd *cli.Command) error {
 					emit(&agent.Event{Type: agent.EventDone})
 					return
 				}
-				runCodeReview(taskCtx, flags.workDir, &cfg, client, chatProv, reg, ag, emit, planConfirmFn, stepConfirmFn, ruleCatalog, ragIndex, godocIndexer, langState, loader, snippetLoader)
+				runCodeReview(taskCtx, flags.workDir, &cfg, client, &chatProv, reg, ag, emit, planConfirmFn, stepConfirmFn, ruleCatalog, ragIndex, godocIndexer, langState, loader, snippetLoader)
 				return
 			}
 
@@ -835,7 +848,7 @@ func runRoot(ctx context.Context, cmd *cli.Command) error {
 				if len(parts) > 1 {
 					orchTask = parts[1]
 				}
-				orch := newOrchestrator(client, chatProv, reg, &cfg, emit, ag.GetConfirmFunc(), planConfirmFn, stepConfirmFn, ruleCatalog, ragIndex, godocIndexer, langState, loader)
+				orch := newOrchestrator(client, &chatProv, reg, &cfg, emit, ag.GetConfirmFunc(), planConfirmFn, stepConfirmFn, ruleCatalog, ragIndex, godocIndexer, langState, loader)
 				err := orch.Run(taskCtx, orchTask)
 				if err != nil && taskCtx.Err() == nil {
 					emit(&agent.Event{Type: agent.EventError, Message: err.Error()})
@@ -861,7 +874,7 @@ func runRoot(ctx context.Context, cmd *cli.Command) error {
 				}
 				emit(e)
 			})
-			orch := newOrchestrator(client, chatProv, reg, &cfg, wrappedEmit, ag.GetConfirmFunc(), planConfirmFn, stepConfirmFn, ruleCatalog, ragIndex, godocIndexer, langState, loader)
+			orch := newOrchestrator(client, &chatProv, reg, &cfg, wrappedEmit, ag.GetConfirmFunc(), planConfirmFn, stepConfirmFn, ruleCatalog, ragIndex, godocIndexer, langState, loader)
 			if err := orch.Run(taskCtx, task); err != nil && taskCtx.Err() == nil {
 				emit(&agent.Event{Type: agent.EventError, Message: err.Error()})
 			}
@@ -909,7 +922,7 @@ func runRoot(ctx context.Context, cmd *cli.Command) error {
 		thinkClient := client
 		thinkModel := chatProv.Model
 		if cfg.Agent.ThinkingProvider != "" && cfg.Agent.ThinkingProvider != cfg.Agent.Provider {
-			thinkClient = ollama.NewClient(thinkProv.BaseURL, thinkProv.Timeout)
+			thinkClient = newLLMClient(&thinkProv)
 			thinkModel = thinkProv.Model
 		}
 
@@ -945,7 +958,7 @@ func runRoot(ctx context.Context, cmd *cli.Command) error {
 				confirmFn = ag.GetConfirmFunc()
 			}
 			emit(&agent.Event{Type: agent.EventAgent, Message: "▸ Executing approved plan..."})
-			orch := newOrchestrator(client, chatProv, reg, &cfg, emit, confirmFn, planConfirmFn, stepConfirmFn, ruleCatalog, ragIndex, godocIndexer, langState, loader)
+			orch := newOrchestrator(client, &chatProv, reg, &cfg, emit, confirmFn, planConfirmFn, stepConfirmFn, ruleCatalog, ragIndex, godocIndexer, langState, loader)
 			if err := orch.RunExecutor(taskCtx, responseText, confirmFn); err != nil && taskCtx.Err() == nil {
 				emit(&agent.Event{Type: agent.EventError, Message: err.Error()})
 			}
@@ -1235,7 +1248,7 @@ func isSourceCodePath(path string) bool {
 }
 
 // runCodeReview handles the orchestrator-driven code review pipeline.
-func runCodeReview(ctx context.Context, workDir string, cfg *config.Config, client *ollama.Client, chatProv config.ProviderConfig, reg *tools.Registry, ag *agent.Agent, emit agent.EventHandler, planConfirmFn agent.PlanConfirmFunc, stepConfirmFn agent.StepConfirmFunc, ruleCatalog string, ragIndex tools.RAGSearcher, godocIndexer tools.GoDocIndexer, langState *projectlang.State, loader *rules.Loader, snippetLoader *snippets.Loader) {
+func runCodeReview(ctx context.Context, workDir string, cfg *config.Config, client llm.Client, chatProv *config.ProviderConfig, reg *tools.Registry, ag *agent.Agent, emit agent.EventHandler, planConfirmFn agent.PlanConfirmFunc, stepConfirmFn agent.StepConfirmFunc, ruleCatalog string, ragIndex tools.RAGSearcher, godocIndexer tools.GoDocIndexer, langState *projectlang.State, loader *rules.Loader, snippetLoader *snippets.Loader) {
 	sourceFiles := findAllSourceFiles(workDir)
 	if len(sourceFiles) == 0 {
 		emit(&agent.Event{Type: agent.EventAgent, Message: "No source files found."})
@@ -1258,7 +1271,7 @@ func runCodeReview(ctx context.Context, workDir string, cfg *config.Config, clie
 	}
 }
 
-func newOrchestrator(client *ollama.Client, chatProv config.ProviderConfig, reg *tools.Registry, cfg *config.Config, emit agent.EventHandler, confirmFn agent.ConfirmFunc, planConfirmFn agent.PlanConfirmFunc, stepConfirmFn agent.StepConfirmFunc, ruleCatalog string, ragIndex tools.RAGSearcher, godocIndexer tools.GoDocIndexer, langState *projectlang.State, rulesLoader *rules.Loader) *agent.Orchestrator {
+func newOrchestrator(client llm.Client, chatProv *config.ProviderConfig, reg *tools.Registry, cfg *config.Config, emit agent.EventHandler, confirmFn agent.ConfirmFunc, planConfirmFn agent.PlanConfirmFunc, stepConfirmFn agent.StepConfirmFunc, ruleCatalog string, ragIndex tools.RAGSearcher, godocIndexer tools.GoDocIndexer, langState *projectlang.State, rulesLoader *rules.Loader) *agent.Orchestrator {
 	// Resolve thinking/executor providers (fallback to chat provider).
 	thinkProv := cfg.ThinkingProvider()
 	execProv := cfg.ExecutorProvider()
@@ -1271,7 +1284,7 @@ func newOrchestrator(client *ollama.Client, chatProv config.ProviderConfig, reg 
 	primaryModel := chatProv.Model
 	primaryCtx := chatProv.ContextSize
 	if cfg.Agent.ThinkingProvider != "" && cfg.Agent.ThinkingProvider != cfg.Agent.Provider {
-		primaryClient = ollama.NewClient(thinkProv.BaseURL, thinkProv.Timeout)
+		primaryClient = newLLMClient(&thinkProv)
 		primaryModel = thinkProv.Model
 		primaryCtx = thinkProv.ContextSize
 	}
@@ -1279,12 +1292,12 @@ func newOrchestrator(client *ollama.Client, chatProv config.ProviderConfig, reg 
 	// Executor client: only build a separate one when the executor provider
 	// is explicitly configured and differs from the primary.
 	var (
-		execClient  *ollama.Client
+		execClient  llm.Client
 		execModel   string
 		execCtxSize int
 	)
 	if cfg.Agent.ExecutorProvider != "" {
-		execClient = ollama.NewClient(execProv.BaseURL, execProv.Timeout)
+		execClient = newLLMClient(&execProv)
 		execModel = execProv.Model
 		execCtxSize = execProv.ContextSize
 	}
@@ -1293,7 +1306,7 @@ func newOrchestrator(client *ollama.Client, chatProv config.ProviderConfig, reg 
 	// Temperature=0 + Format=json overlay automatically. We always build a
 	// dedicated client for it so chat-mode generation parameters do not leak.
 	extractorProv := cfg.ExtractorProvider()
-	extractorClient := ollama.NewClient(extractorProv.BaseURL, extractorProv.Timeout)
+	extractorClient := newLLMClient(&extractorProv)
 	if cfg.Agent.ExtractorProvider == "" {
 		// Reuse the chat client connection when no dedicated provider is set
 		// to avoid spawning extra HTTP clients against the same backend.
@@ -1403,7 +1416,7 @@ func initCmd() *cli.Command {
 				return err
 			}
 			chatProv := cfg.ChatProvider()
-			client := ollama.NewClient(chatProv.BaseURL, chatProv.Timeout)
+			client := newLLMClient(&chatProv)
 			fmt.Println("Scanning project and generating AGENTS.md via LLM...")
 			res, err := kodruninit.Run(ctx, flags.workDir, client, chatProv.Model)
 			if err != nil {
@@ -1418,7 +1431,7 @@ func initCmd() *cli.Command {
 	}
 }
 
-func formatContext(history []ollama.Message) string {
+func formatContext(history []llm.Message) string {
 	var b strings.Builder
 	for i, msg := range history {
 		role := strings.ToUpper(msg.Role)
@@ -1478,7 +1491,7 @@ func runGoTool(ctx context.Context, toolName string, args []string) error {
 	if !success && cfg.Agent.AutoFix && !flags.noFix {
 		fmt.Println("\n[auto-fix] Attempting to fix errors...")
 		chatProv := cfg.ChatProvider()
-		client := ollama.NewClient(chatProv.BaseURL, chatProv.Timeout)
+		client := newLLMClient(&chatProv)
 		fixer := runner.NewFixer(ctx, client, chatProv.Model, reg, maxFixAttempts)
 		fixed, err := fixer.Fix(ctx, toolName, result.Output, func(msg string) {
 			fmt.Println(msg)
@@ -1508,4 +1521,18 @@ func cleanupLegacyLangDirs(basePath string) {
 	for _, lang := range []string{"go", "python", "jsts"} {
 		_ = os.RemoveAll(filepath.Join(basePath, lang))
 	}
+}
+
+func newLLMClient(prov *config.ProviderConfig) llm.Client {
+	c, err := llm.NewClient(llm.ProviderConfig{
+		Type:    prov.Type,
+		APIKey:  prov.APIKey,
+		BaseURL: prov.BaseURL,
+		Timeout: prov.Timeout,
+	})
+	if err != nil {
+		slog.Error("failed to create LLM client", "type", prov.Type, "error", err)
+		os.Exit(1)
+	}
+	return c
 }

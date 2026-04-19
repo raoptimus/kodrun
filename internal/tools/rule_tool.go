@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/llm"
 	"github.com/raoptimus/kodrun/internal/rules"
 )
 
@@ -24,10 +24,10 @@ func (t *RuleTool) Description() string {
 	return "Get full content of a project rule with referenced documentation"
 }
 
-func (t *RuleTool) Schema() ollama.JSONSchema {
-	return ollama.JSONSchema{
+func (t *RuleTool) Schema() llm.JSONSchema {
+	return llm.JSONSchema{
 		Type: "object",
-		Properties: map[string]ollama.JSONSchema{
+		Properties: map[string]llm.JSONSchema{
 			"name": {Type: "string", Description: "Rule name from the catalog (e.g. service, model, repository)"},
 		},
 		Required: []string{"name"},

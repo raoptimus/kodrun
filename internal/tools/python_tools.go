@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/llm"
 )
 
 // pythonTool is the base for Python ecosystem command tools.
@@ -19,12 +19,12 @@ type pythonTool struct {
 	description string
 	command     string
 	defaultArgs []string
-	schema      ollama.JSONSchema
+	schema      llm.JSONSchema
 }
 
-func (t *pythonTool) Name() string              { return t.name }
-func (t *pythonTool) Description() string       { return t.description }
-func (t *pythonTool) Schema() ollama.JSONSchema { return t.schema }
+func (t *pythonTool) Name() string           { return t.name }
+func (t *pythonTool) Description() string    { return t.description }
+func (t *pythonTool) Schema() llm.JSONSchema { return t.schema }
 
 func (t *pythonTool) Execute(ctx context.Context, params map[string]any) (*ToolResult, error) {
 	const extraArgsCap = 4
@@ -73,13 +73,13 @@ func (t *pythonTool) Execute(ctx context.Context, params map[string]any) (*ToolR
 	}, nil
 }
 
-func pythonToolSchema(argsDesc string) ollama.JSONSchema {
+func pythonToolSchema(argsDesc string) llm.JSONSchema {
 	if argsDesc == "" {
 		argsDesc = "Additional arguments"
 	}
-	return ollama.JSONSchema{
+	return llm.JSONSchema{
 		Type: "object",
-		Properties: map[string]ollama.JSONSchema{
+		Properties: map[string]llm.JSONSchema{
 			"args": {Type: "string", Description: argsDesc},
 		},
 	}

@@ -7,14 +7,14 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/llm"
 )
 
 // Tool is the interface for all agent tools.
 type Tool interface {
 	Name() string
 	Description() string
-	Schema() ollama.JSONSchema
+	Schema() llm.JSONSchema
 	Execute(ctx context.Context, params map[string]any) (*ToolResult, error)
 }
 
@@ -222,14 +222,14 @@ type PathResolver interface {
 }
 
 // ToolDefs returns Ollama tool definitions for all registered tools.
-func (r *Registry) ToolDefs() []ollama.ToolDef {
+func (r *Registry) ToolDefs() []llm.ToolDef {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	defs := make([]ollama.ToolDef, 0, len(r.tools))
+	defs := make([]llm.ToolDef, 0, len(r.tools))
 	for _, t := range r.tools {
-		defs = append(defs, ollama.ToolDef{
+		defs = append(defs, llm.ToolDef{
 			Type: "function",
-			Function: ollama.ToolFuncDef{
+			Function: llm.ToolFuncDef{
 				Name:        t.Name(),
 				Description: t.Description(),
 				Parameters:  t.Schema(),
@@ -252,15 +252,15 @@ func (r *Registry) Names() []string {
 }
 
 // ToolDefsFiltered returns tool definitions only for tools in the allowed set.
-func (r *Registry) ToolDefsFiltered(allowed map[string]bool) []ollama.ToolDef {
+func (r *Registry) ToolDefsFiltered(allowed map[string]bool) []llm.ToolDef {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	defs := make([]ollama.ToolDef, 0, len(allowed))
+	defs := make([]llm.ToolDef, 0, len(allowed))
 	for _, t := range r.tools {
 		if allowed[t.Name()] {
-			defs = append(defs, ollama.ToolDef{
+			defs = append(defs, llm.ToolDef{
 				Type: "function",
-				Function: ollama.ToolFuncDef{
+				Function: llm.ToolFuncDef{
 					Name:        t.Name(),
 					Description: t.Description(),
 					Parameters:  t.Schema(),

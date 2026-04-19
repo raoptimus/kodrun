@@ -7,7 +7,7 @@ import (
 
 	"github.com/pkg/errors"
 
-	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/llm"
 	"github.com/raoptimus/kodrun/internal/rules"
 )
 
@@ -23,7 +23,7 @@ import (
 // reported as a normal completion to the DAG runner.
 func (o *Orchestrator) runStep(ctx context.Context, step *Step, confirmFn ConfirmFunc) (SessionStats, error) {
 	ag := o.newAgent(RoleExecutor, o.maxExecIter)
-	prompt := systemPromptForRole(RoleExecutor, o.language, o.ruleCatalog, ag.reg.Names(), o.hasSnippets, o.hasRAG)
+	prompt := systemPromptForRole(RoleExecutor, o.language, o.progLang(), o.ruleCatalog, ag.reg.Names(), o.hasSnippets, o.hasRAG)
 	ag.InitWithPrompt(prompt)
 	ag.SetConfirmFunc(confirmFn)
 
@@ -129,4 +129,4 @@ func (o *Orchestrator) perStepRAG(ctx context.Context, step *Step) string {
 
 // Compile-time guard so unused-import linters do not strip the ollama import
 // when this file is the only consumer.
-var _ = ollama.Message{}
+var _ = llm.Message{}

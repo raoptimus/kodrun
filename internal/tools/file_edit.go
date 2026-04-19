@@ -6,7 +6,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/llm"
 )
 
 const editDiffMaxLines = 30 // max lines in edit tool diff output
@@ -25,10 +25,10 @@ func NewEditFileTool(workDir string, forbiddenPatterns []string) *EditFileTool {
 func (t *EditFileTool) Name() string        { return "edit_file" }
 func (t *EditFileTool) Description() string { return "Edit a file by replacing old_str with new_str" }
 
-func (t *EditFileTool) Schema() ollama.JSONSchema {
-	return ollama.JSONSchema{
+func (t *EditFileTool) Schema() llm.JSONSchema {
+	return llm.JSONSchema{
 		Type: "object",
-		Properties: map[string]ollama.JSONSchema{
+		Properties: map[string]llm.JSONSchema{
 			"path":    {Type: "string", Description: "File path relative to work directory"},
 			"old_str": {Type: "string", Description: "Text to find and replace"},
 			"new_str": {Type: "string", Description: "Replacement text"},

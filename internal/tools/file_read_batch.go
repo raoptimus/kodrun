@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/llm"
 	"github.com/raoptimus/kodrun/internal/projectlang"
 )
 
@@ -77,10 +77,10 @@ func (t *ReadChangedFilesTool) Description() string {
 		"Use read_file(path) if you need the full content of a specific file."
 }
 
-func (t *ReadChangedFilesTool) Schema() ollama.JSONSchema {
-	return ollama.JSONSchema{
+func (t *ReadChangedFilesTool) Schema() llm.JSONSchema {
+	return llm.JSONSchema{
 		Type:       "object",
-		Properties: map[string]ollama.JSONSchema{},
+		Properties: map[string]llm.JSONSchema{},
 	}
 }
 

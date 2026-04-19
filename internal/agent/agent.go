@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/llm"
 	"github.com/raoptimus/kodrun/internal/projectlang"
 	"github.com/raoptimus/kodrun/internal/tools"
 )
@@ -154,6 +154,9 @@ type Event struct {
 	// InferenceElapsed is the time since inference started.
 	// Set on EventInferenceProgress events.
 	InferenceElapsed time.Duration
+	// InferenceContent carries accumulated LLM output since the last progress event.
+	// Set on EventInferenceProgress events for the transcript view.
+	InferenceContent string
 }
 
 // SessionStats accumulates statistics for the current task execution.
@@ -256,10 +259,10 @@ const (
 
 // Agent orchestrates the LLM-tool loop.
 type Agent struct {
-	client              *ollama.Client
+	client              llm.Client
 	model               string
 	reg                 *tools.Registry
-	history             []ollama.Message
+	history             []llm.Message
 	maxIter             int
 	workDir             string
 	onEvent             EventHandler
@@ -340,7 +343,7 @@ type Agent struct {
 }
 
 // New creates a new Agent.
-func New(client *ollama.Client, model string, reg *tools.Registry, maxIter int, workDir string, contextSize int) *Agent {
+func New(client llm.Client, model string, reg *tools.Registry, maxIter int, workDir string, contextSize int) *Agent {
 	return &Agent{
 		client:      client,
 		model:       model,
@@ -434,6 +437,15 @@ func (a *Agent) SetLanguageState(s *projectlang.State) {
 // LanguageState returns the configured language state, or nil.
 func (a *Agent) LanguageState() *projectlang.State {
 	return a.langState
+}
+
+// currentProgLang returns the detected project programming language as a string,
+// or "" if unknown.
+func (a *Agent) currentProgLang() string {
+	if a.langState == nil {
+		return ""
+	}
+	return string(a.langState.Current())
 }
 
 // ToolRegistry exposes the tool registry for callers that need to register
@@ -589,7 +601,7 @@ func (a *Agent) EnterEditWithPlan() {
 	a.mode = ModeEdit
 	a.think = false
 	systemPrompt := a.buildSystemPrompt()
-	a.history = []ollama.Message{
+	a.history = []llm.Message{
 		{Role: "system", Content: systemPrompt},
 		{Role: "user", Content: fmt.Sprintf("Execute the following approved plan:\n\n%s\n\nImplement each step. Confirm plan steps as you go. Always respond in %s.", a.lastPlan, langName(a.language))},
 	}
@@ -611,7 +623,7 @@ func (a *Agent) SessionID() string {
 
 // LoadFromSession restores agent state from a saved session.
 func (a *Agent) LoadFromSession(s *Session) {
-	a.history = make([]ollama.Message, len(s.Messages))
+	a.history = make([]llm.Message, len(s.Messages))
 	copy(a.history, s.Messages)
 
 	switch s.Mode {
@@ -676,7 +688,7 @@ func (a *Agent) Init(ruleCatalog string) {
 	systemPrompt := a.buildSystemPrompt()
 	a.projectContext = a.buildProjectContext()
 	a.contextInjected = false
-	a.history = []ollama.Message{
+	a.history = []llm.Message{
 		{Role: "system", Content: systemPrompt},
 	}
 	a.ctxMgr = NewContextManager(a.contextSize, a.client, a.model)
@@ -692,7 +704,7 @@ func (a *Agent) Init(ruleCatalog string) {
 func (a *Agent) InitWithPrompt(systemPrompt string) {
 	a.projectContext = a.buildProjectContext()
 	a.contextInjected = false
-	a.history = []ollama.Message{
+	a.history = []llm.Message{
 		{Role: "system", Content: systemPrompt},
 	}
 	a.ctxMgr = NewContextManager(a.contextSize, a.client, a.model)
@@ -702,7 +714,7 @@ func (a *Agent) InitWithPrompt(systemPrompt string) {
 // ClearHistory resets conversation history, keeping the system prompt.
 func (a *Agent) ClearHistory() {
 	systemPrompt := a.buildSystemPrompt()
-	a.history = []ollama.Message{
+	a.history = []llm.Message{
 		{Role: "system", Content: systemPrompt},
 	}
 	a.contextInjected = false
@@ -737,8 +749,8 @@ func (a *Agent) Compact(ctx context.Context, instructions string) error {
 }
 
 // History returns a copy of the current conversation history.
-func (a *Agent) History() []ollama.Message {
-	h := make([]ollama.Message, len(a.history))
+func (a *Agent) History() []llm.Message {
+	h := make([]llm.Message, len(a.history))
 	copy(h, a.history)
 	return h
 }
@@ -784,7 +796,7 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 		userContent = "[Project context]\n" + a.projectContext + "\n\n[Task]\n" + userContent
 		a.contextInjected = true
 	}
-	a.history = append(a.history, ollama.Message{Role: "user", Content: userContent})
+	a.history = append(a.history, llm.Message{Role: "user", Content: userContent})
 	a.stats.reset()
 	a.planBuf.Reset()
 	a.editNudges = 0
@@ -850,17 +862,21 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 			opts["temperature"] = a.temperature
 		}
 		var lastProgressEmit time.Time
-		progressCb := func(tokensSoFar int) {
+		var contentBuf strings.Builder
+		progressCb := func(tokensSoFar int, content string) {
+			contentBuf.WriteString(content)
 			if time.Since(lastProgressEmit) >= inferenceProgressInterval {
 				a.emit(&Event{
 					Type:             EventInferenceProgress,
 					InferenceTokens:  tokensSoFar,
 					InferenceElapsed: time.Since(iterStart),
+					InferenceContent: contentBuf.String(),
 				})
+				contentBuf.Reset()
 				lastProgressEmit = time.Now()
 			}
 		}
-		resp, err := a.client.ChatSyncWithCallback(ctx, &ollama.ChatRequest{
+		resp, err := a.client.ChatSyncWithCallback(ctx, &llm.ChatRequest{
 			Model:    a.model,
 			Messages: a.history,
 			Tools:    a.toolDefsForMode(),
@@ -868,6 +884,18 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 			Format:   a.format,
 		}, progressCb)
 		llmDuration := time.Since(iterStart)
+
+		// Flush remaining streaming content that didn't hit the throttle interval.
+		if contentBuf.Len() > 0 {
+			a.emit(&Event{
+				Type:             EventInferenceProgress,
+				InferenceTokens:  resp.EvalCount,
+				InferenceElapsed: llmDuration,
+				InferenceContent: contentBuf.String(),
+			})
+			contentBuf.Reset()
+		}
+
 		if err != nil {
 			a.emit(&Event{Type: EventError, Message: err.Error()})
 			return errors.WithMessage(err, "chat")
@@ -900,7 +928,7 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 		}
 
 		// Add assistant response to history
-		msg := ollama.Message{
+		msg := llm.Message{
 			Role:      "assistant",
 			Content:   resp.Content,
 			ToolCalls: resp.ToolCalls,
@@ -919,10 +947,10 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 					// Replace the text-only assistant message (appended above)
 					// with one carrying the synthetic tool call so the
 					// subsequent tool-result message has a matching ToolCallID.
-					a.history[len(a.history)-1] = ollama.Message{
+					a.history[len(a.history)-1] = llm.Message{
 						Role:      "assistant",
 						Content:   "",
-						ToolCalls: []ollama.ToolCall{*synth},
+						ToolCalls: []llm.ToolCall{*synth},
 					}
 					a.toolCallCount++
 					a.executeSingle(ctx, *synth)
@@ -938,7 +966,7 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 			if a.mode == ModeEdit && a.editNudges < maxEditNudges && looksLikeMarkdownPlan(resp.Content) {
 				a.editNudges++
 				a.emit(&Event{Type: EventAgent, Message: fmt.Sprintf("Model responded with text instead of tool calls; nudging (%d/%d)...", a.editNudges, maxEditNudges)})
-				a.history = append(a.history, ollama.Message{
+				a.history = append(a.history, llm.Message{
 					Role:    "user",
 					Content: "Stop. You are in EDIT mode. Do NOT describe the changes — apply them now via write_file/edit_file/bash. Begin with the first tool call. Do not explain. Do not output another plan.",
 				})
@@ -955,7 +983,7 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 					a.emit(&Event{Type: EventAgent, Message: fmt.Sprintf(
 						"Model responded without calling any tools; nudging (%d/%d)...",
 						a.planToolNudges, maxPlanToolNudges)})
-					a.history = append(a.history, ollama.Message{
+					a.history = append(a.history, llm.Message{
 						Role:    "user",
 						Content: "You responded without calling any tools. This is FORBIDDEN. Re-read the task above: it contains a file list section with bullet paths. You MUST call file_stat on EACH file from that list. Do NOT guess file paths — use ONLY the paths listed in the task. Start now.",
 					})
@@ -969,7 +997,7 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 					a.emit(&Event{Type: EventAgent, Message: fmt.Sprintf(
 						"Model called file_stat but not read_file; nudging (%d/%d)...",
 						a.readFileNudges, maxReadFileNudges)})
-					a.history = append(a.history, ollama.Message{
+					a.history = append(a.history, llm.Message{
 						Role:    "user",
 						Content: "Good, you called file_stat. Now you MUST call read_file(path) on each file to read its contents. Use the EXACT paths from the file list in the task — do NOT guess or modify paths. You cannot review code without reading it. Call read_file now.",
 					})
@@ -997,8 +1025,8 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 		}
 
 		// Split tool calls into parallel (read-only) and sequential groups.
-		var parallelCalls []ollama.ToolCall
-		var sequentialCalls []ollama.ToolCall
+		var parallelCalls []llm.ToolCall
+		var sequentialCalls []llm.ToolCall
 		for _, tc := range resp.ToolCalls {
 			if a.canRunParallel(tc.Function.Name) {
 				parallelCalls = append(parallelCalls, tc)
@@ -1020,7 +1048,7 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 			// Block destructive tools in plan mode — check BEFORE emitting
 			// the tool event so the TUI never shows a write-tool attempt.
 			if a.isToolBlocked(tc.Function.Name) {
-				a.history = append(a.history, ollama.Message{
+				a.history = append(a.history, llm.Message{
 					Role:       "tool",
 					Content:    fmt.Sprintf("Tool %q is NOT available in analysis mode. Do NOT call write tools. Use ONLY: %s", tc.Function.Name, strings.Join(a.reg.NamesFiltered(readOnlyTools), ", ")),
 					ToolCallID: tc.ID,
@@ -1041,7 +1069,7 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 					cr := a.confirmFn(payload)
 					switch cr.Action {
 					case ConfirmDeny:
-						a.history = append(a.history, ollama.Message{
+						a.history = append(a.history, llm.Message{
 							Role:       "tool",
 							Content:    "Operation denied by user",
 							ToolCallID: tc.ID,
@@ -1053,7 +1081,7 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 					case ConfirmAllowSession:
 						a.permMgr.AllowSession(fp)
 					case ConfirmAugment:
-						a.history = append(a.history, ollama.Message{
+						a.history = append(a.history, llm.Message{
 							Role:       "tool",
 							Content:    fmt.Sprintf("User rejected this call and provided a constraint: %s\nPlease rebuild this %s call accordingly.", cr.Augment, tc.Function.Name),
 							ToolCallID: tc.ID,
@@ -1147,11 +1175,11 @@ func (a *Agent) Run(ctx context.Context, task, ruleCatalog string) error {
 	return a.Send(ctx, task)
 }
 
-func (a *Agent) toolDefsForMode() []ollama.ToolDef {
+func (a *Agent) toolDefsForMode() []llm.ToolDef {
 	if a.toolsDisabled {
 		return nil
 	}
-	var defs []ollama.ToolDef
+	var defs []llm.ToolDef
 	if a.mode == ModeEdit {
 		defs = a.reg.ToolDefs()
 	} else {
@@ -1187,7 +1215,7 @@ func (a *Agent) canRunParallel(toolName string) bool {
 
 // executeParallel runs read-only tool calls concurrently via the worker pool
 // and appends results to history in the original order.
-func (a *Agent) executeParallel(ctx context.Context, calls []ollama.ToolCall) {
+func (a *Agent) executeParallel(ctx context.Context, calls []llm.ToolCall) {
 	tasks := make([]TaskFunc, len(calls))
 	guards := make([]*tools.ToolResult, len(calls))
 	for i, tc := range calls {
@@ -1212,7 +1240,7 @@ func (a *Agent) executeParallel(ctx context.Context, calls []ollama.ToolCall) {
 		tc := calls[i]
 		if tr.Err != nil {
 			a.emit(&Event{Type: EventError, Tool: tc.Function.Name, Message: tr.Err.Error()})
-			a.history = append(a.history, ollama.Message{
+			a.history = append(a.history, llm.Message{
 				Role:       "tool",
 				Content:    "Error: " + tr.Err.Error(),
 				ToolCallID: tc.ID,
@@ -1226,7 +1254,7 @@ func (a *Agent) executeParallel(ctx context.Context, calls []ollama.ToolCall) {
 // guardReadWhitelist returns a synthetic refusal result if the tool call is a
 // read-only file tool targeting a path outside the current allowed-read
 // whitelist. Returns nil when the call is permitted.
-func (a *Agent) guardReadWhitelist(tc ollama.ToolCall) *tools.ToolResult {
+func (a *Agent) guardReadWhitelist(tc llm.ToolCall) *tools.ToolResult {
 	if a.allowedReadPaths == nil {
 		return nil
 	}
@@ -1260,7 +1288,7 @@ func (a *Agent) guardReadWhitelist(tc ollama.ToolCall) *tools.ToolResult {
 }
 
 // executeSingle runs a single tool call and records the result.
-func (a *Agent) executeSingle(ctx context.Context, tc ollama.ToolCall) {
+func (a *Agent) executeSingle(ctx context.Context, tc llm.ToolCall) {
 	if guard := a.guardReadWhitelist(tc); guard != nil {
 		a.emit(&Event{Type: EventTool, Tool: tc.Function.Name, Message: "blocked by whitelist", Success: false})
 		a.emitToolResult(tc, guard, nil)
@@ -1273,7 +1301,7 @@ func (a *Agent) executeSingle(ctx context.Context, tc ollama.ToolCall) {
 	if err != nil {
 		a.emit(&Event{Type: EventError, Tool: tc.Function.Name, Message: err.Error()})
 		// Still add error to history so the model gets feedback.
-		a.history = append(a.history, ollama.Message{
+		a.history = append(a.history, llm.Message{
 			Role:       "tool",
 			Content:    "Error: " + err.Error(),
 			ToolCallID: tc.ID,
@@ -1284,7 +1312,7 @@ func (a *Agent) executeSingle(ctx context.Context, tc ollama.ToolCall) {
 }
 
 // emitToolResult emits an event and appends the tool result to history.
-func (a *Agent) emitToolResult(tc ollama.ToolCall, result *tools.ToolResult, toolErr error) {
+func (a *Agent) emitToolResult(tc llm.ToolCall, result *tools.ToolResult, toolErr error) {
 	success := toolErr == nil
 	// For read-only tools, show detail (path) instead of output content.
 	msg := truncate(result.Output, truncatePreviewLen)
@@ -1345,7 +1373,7 @@ func (a *Agent) emitToolResult(tc ollama.ToolCall, result *tools.ToolResult, too
 	if len(resultContent) > maxToolResultBytes {
 		resultContent = resultContent[:maxToolResultBytes] + "\n... [truncated, total " + fmt.Sprintf("%d", len(result.Output)) + " bytes]"
 	}
-	a.history = append(a.history, ollama.Message{
+	a.history = append(a.history, llm.Message{
 		Role:       "tool",
 		Content:    resultContent,
 		ToolCallID: tc.ID,
@@ -1589,7 +1617,11 @@ func (a *Agent) buildSystemPrompt() string {
 	lang := langName(a.language)
 
 	var b strings.Builder
-	b.WriteString("You are KodRun, a Go programming assistant.\n")
+	if pl := a.currentProgLang(); pl != "" {
+		fmt.Fprintf(&b, "You are KodRun, a %s programming assistant.\n", pl)
+	} else {
+		b.WriteString("You are KodRun, a programming assistant.\n")
+	}
 	fmt.Fprintf(&b, "IMPORTANT: ALL your responses MUST be in %s. This is mandatory.\n\n", lang)
 
 	if a.ruleCatalog != "" {
@@ -1635,10 +1667,10 @@ func (a *Agent) buildSystemPrompt() string {
 	} else {
 		b.WriteString("You are in EDIT mode. EDIT mode is for ACTING on the code, not for describing changes.\n\n")
 		b.WriteString("CRITICAL — Action vs description:\n")
-		b.WriteString("- If the user's input is a TASK to change code (fix, refactor, create, edit, move, restructure, apply plan, implement, ...) you MUST start your response with tool calls (write_file, edit_file, bash, read_file as needed). Do NOT output a markdown plan, do NOT write \"АНАЛИЗ\" or \"ПЛАН ИСПРАВЛЕНИЙ\" sections, do NOT explain what you are about to do — just call the tools.\n")
+		b.WriteString("- If the user's input is a TASK to change code (fix, refactor, create, edit, move, restructure, apply plan, implement, ...) you MUST start your response with tool calls (write_file, edit_file, bash, read_file as needed). Do NOT output a markdown plan, do NOT write \"ANALYSIS\" / \"АНАЛИЗ\" or \"IMPLEMENTATION PLAN\" / \"ПЛАН ИСПРАВЛЕНИЙ\" sections, do NOT explain what you are about to do — just call the tools.\n")
 		b.WriteString("- A textual response without tool calls is allowed ONLY when the user asked a pure question (no action verb). When in doubt, assume it is a task and call tools.\n")
 		b.WriteString("- If you need to read a file before editing it, call read_file as the first tool — that still counts as \"starting with a tool\".\n")
-		b.WriteString("- If the user pasted a numbered plan, your job is to EXECUTE it, not to rewrite it back. Skip directly to the first edit_file/write_file. Do not produce a \"План исправлений\" of your own.\n")
+		b.WriteString("- If the user pasted a numbered plan, your job is to EXECUTE it, not to rewrite it back. Skip directly to the first edit_file/write_file. Do not produce an \"Implementation plan\" / \"План исправлений\" of your own.\n")
 		b.WriteString("- PLAN mode is the place for descriptions. EDIT mode is for actions. Stay in your lane.\n\n")
 		b.WriteString("Available tools: " + strings.Join(a.reg.Names(), ", ") + "\n\n")
 		b.WriteString("Guidelines:\n")

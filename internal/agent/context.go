@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/llm"
 )
 
 const (
@@ -23,7 +23,7 @@ type ContextManager struct {
 	maxTokens int
 	keepFirst int
 	keepLast  int
-	client    *ollama.Client
+	client    llm.Client
 	model     string
 	language  string
 }
@@ -34,7 +34,7 @@ func (cm *ContextManager) SetLanguage(lang string) {
 }
 
 // NewContextManager creates a new context manager.
-func NewContextManager(maxTokens int, client *ollama.Client, model string) *ContextManager {
+func NewContextManager(maxTokens int, client llm.Client, model string) *ContextManager {
 	return &ContextManager{
 		maxTokens: maxTokens,
 		keepFirst: keepFirstMessages,
@@ -45,7 +45,7 @@ func NewContextManager(maxTokens int, client *ollama.Client, model string) *Cont
 }
 
 // Trim reduces message history if it exceeds the token budget.
-func (cm *ContextManager) Trim(ctx context.Context, messages []ollama.Message) ([]ollama.Message, error) {
+func (cm *ContextManager) Trim(ctx context.Context, messages []llm.Message) ([]llm.Message, error) {
 	estimated := cm.estimateTokens(messages)
 	if estimated <= cm.maxTokens {
 		return messages, nil
@@ -55,11 +55,11 @@ func (cm *ContextManager) Trim(ctx context.Context, messages []ollama.Message) (
 
 // ForceTrim summarizes conversation history regardless of token count.
 // Instructions are optional hints for the summarizer (e.g. "focus on file changes").
-func (cm *ContextManager) ForceTrim(ctx context.Context, messages []ollama.Message, instructions string) ([]ollama.Message, error) {
+func (cm *ContextManager) ForceTrim(ctx context.Context, messages []llm.Message, instructions string) ([]llm.Message, error) {
 	return cm.doTrim(ctx, messages, instructions)
 }
 
-func (cm *ContextManager) doTrim(ctx context.Context, messages []ollama.Message, instructions string) ([]ollama.Message, error) {
+func (cm *ContextManager) doTrim(ctx context.Context, messages []llm.Message, instructions string) ([]llm.Message, error) {
 	if len(messages) <= cm.keepFirst+cm.keepLast {
 		return messages, nil
 	}
@@ -80,15 +80,15 @@ func (cm *ContextManager) doTrim(ctx context.Context, messages []ollama.Message,
 	return cm.buildTrimmed(head, tail, msg), nil
 }
 
-func (cm *ContextManager) buildTrimmed(head, tail []ollama.Message, summaryMsg string) []ollama.Message {
-	result := make([]ollama.Message, 0, len(head)+1+len(tail))
+func (cm *ContextManager) buildTrimmed(head, tail []llm.Message, summaryMsg string) []llm.Message {
+	result := make([]llm.Message, 0, len(head)+1+len(tail))
 	result = append(result, head...)
-	result = append(result, ollama.Message{Role: "user", Content: summaryMsg})
+	result = append(result, llm.Message{Role: "user", Content: summaryMsg})
 	result = append(result, tail...)
 	return result
 }
 
-func (cm *ContextManager) summarize(ctx context.Context, messages []ollama.Message, instructions string) (string, error) {
+func (cm *ContextManager) summarize(ctx context.Context, messages []llm.Message, instructions string) (string, error) {
 	var content strings.Builder
 	for _, m := range messages {
 		fmt.Fprintf(&content, "[%s]: %s\n", m.Role, truncate(m.Content, summarizeTruncateLen))
@@ -102,9 +102,9 @@ func (cm *ContextManager) summarize(ctx context.Context, messages []ollama.Messa
 		sysPrompt += fmt.Sprintf(" Always respond in %s.", langName(cm.language))
 	}
 
-	resp, err := cm.client.ChatSync(ctx, &ollama.ChatRequest{
+	resp, err := cm.client.ChatSync(ctx, &llm.ChatRequest{
 		Model: cm.model,
-		Messages: []ollama.Message{
+		Messages: []llm.Message{
 			{Role: "system", Content: sysPrompt},
 			{Role: "user", Content: content.String()},
 		},
@@ -119,7 +119,7 @@ func (cm *ContextManager) summarize(ctx context.Context, messages []ollama.Messa
 	return resp.Content, nil
 }
 
-func (cm *ContextManager) estimateTokens(messages []ollama.Message) int {
+func (cm *ContextManager) estimateTokens(messages []llm.Message) int {
 	total := 0
 	for _, m := range messages {
 		total += estimateStringTokens(m.Content)

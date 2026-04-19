@@ -1,4 +1,4 @@
-package ollama
+package llm
 
 // Message represents a chat message.
 type Message struct {
@@ -30,7 +30,7 @@ type ChatRequest struct {
 	Stream   bool           `json:"stream"`
 }
 
-// ToolDef describes a tool for the Ollama API.
+// ToolDef describes a tool for the LLM API.
 type ToolDef struct {
 	Type     string      `json:"type"`
 	Function ToolFuncDef `json:"function"`
@@ -51,20 +51,6 @@ type JSONSchema struct {
 	Description string                `json:"description,omitempty"`
 	Enum        []string              `json:"enum,omitempty"`
 	Items       *JSONSchema           `json:"items,omitempty"`
-}
-
-// ChatResponse is the response from the chat API.
-type ChatResponse struct {
-	Model              string  `json:"model"`
-	Message            Message `json:"message"`
-	Done               bool    `json:"done"`
-	DoneReason         string  `json:"done_reason,omitempty"`
-	PromptEvalCount    int     `json:"prompt_eval_count,omitempty"`
-	PromptEvalDuration int64   `json:"prompt_eval_duration,omitempty"`
-	EvalCount          int     `json:"eval_count,omitempty"`
-	EvalDuration       int64   `json:"eval_duration,omitempty"`
-	TotalDuration      int64   `json:"total_duration,omitempty"`
-	LoadDuration       int64   `json:"load_duration,omitempty"`
 }
 
 // ChatChunk represents a streaming chunk or final aggregated response.
@@ -94,14 +80,19 @@ type EmbedResponse struct {
 	Embeddings [][]float64 `json:"embeddings"`
 }
 
-// Model represents an Ollama model.
+// Model represents an LLM model.
 type Model struct {
 	Name       string `json:"name"`
 	ModifiedAt string `json:"modified_at"`
 	Size       int64  `json:"size"`
 }
 
-// ModelsResponse is the response from the tags API.
+// ModelsResponse is the response from the models API.
 type ModelsResponse struct {
 	Models []Model `json:"models"`
 }
+
+// ChunkCallback is called during streaming with the number of eval tokens
+// received so far and the content of the current chunk.
+// Used by the agent to emit live progress events.
+type ChunkCallback func(tokensSoFar int, content string)

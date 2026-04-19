@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/raoptimus/kodrun/internal/ollama"
+	"github.com/raoptimus/kodrun/internal/llm"
 )
 
 const maxGitOutputBytes = 16 * 1024
@@ -27,10 +27,10 @@ func NewGitStatusTool(workDir string) *gitStatusTool {
 func (t *gitStatusTool) Name() string        { return "git_status" }
 func (t *gitStatusTool) Description() string { return "Show git status and current branch" }
 
-func (t *gitStatusTool) Schema() ollama.JSONSchema {
-	return ollama.JSONSchema{
+func (t *gitStatusTool) Schema() llm.JSONSchema {
+	return llm.JSONSchema{
 		Type:       "object",
-		Properties: map[string]ollama.JSONSchema{},
+		Properties: map[string]llm.JSONSchema{},
 	}
 }
 
@@ -87,10 +87,10 @@ func (t *gitDiffTool) Description() string {
 	return "Show git diff (optionally staged or against a ref)"
 }
 
-func (t *gitDiffTool) Schema() ollama.JSONSchema {
-	return ollama.JSONSchema{
+func (t *gitDiffTool) Schema() llm.JSONSchema {
+	return llm.JSONSchema{
 		Type: "object",
-		Properties: map[string]ollama.JSONSchema{
+		Properties: map[string]llm.JSONSchema{
 			"staged": {Type: "string", Description: "Show staged changes", Enum: []string{"true", "false"}},
 			"ref":    {Type: "string", Description: "Commit or branch ref to diff against"},
 		},
@@ -153,10 +153,10 @@ func NewGitLogTool(workDir string) *gitLogTool {
 func (t *gitLogTool) Name() string        { return "git_log" }
 func (t *gitLogTool) Description() string { return "Show recent git commits" }
 
-func (t *gitLogTool) Schema() ollama.JSONSchema {
-	return ollama.JSONSchema{
+func (t *gitLogTool) Schema() llm.JSONSchema {
+	return llm.JSONSchema{
 		Type: "object",
-		Properties: map[string]ollama.JSONSchema{
+		Properties: map[string]llm.JSONSchema{
 			"count": {Type: "string", Description: "Number of commits to show (default: 10)"},
 			"path":  {Type: "string", Description: "File path to filter log"},
 		},
@@ -217,10 +217,10 @@ func NewGitCommitTool(workDir string) *gitCommitTool {
 func (t *gitCommitTool) Name() string        { return "git_commit" }
 func (t *gitCommitTool) Description() string { return "Stage files and create a git commit" }
 
-func (t *gitCommitTool) Schema() ollama.JSONSchema {
-	return ollama.JSONSchema{
+func (t *gitCommitTool) Schema() llm.JSONSchema {
+	return llm.JSONSchema{
 		Type: "object",
-		Properties: map[string]ollama.JSONSchema{
+		Properties: map[string]llm.JSONSchema{
 			"message": {Type: "string", Description: "Commit message"},
 			"files":   {Type: "string", Description: "Space-separated files to stage, or \".\" for all"},
 		},

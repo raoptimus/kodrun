@@ -18,6 +18,8 @@
 # ----------------------------------------------------------------------------
 providers:
   default:
+    # type: ollama | openai (default: ollama)
+    # api_key: ""            # Bearer token (required for openai, optional for ollama)
     base_url: "http://localhost:11434"
     model: "qwen3-coder:30b"
     timeout: 5m
@@ -38,10 +40,12 @@ providers:
     context_size: 32768
     temperature: 0.2        # executor: deterministic edits
 
-  # Optional: dedicated remote GPU server for heavy models.
-  # gpu-server:
-  #   base_url: "http://gpu-server:11434"
-  #   model: "qwen3-coder:30b"
+  # Optional: OpenAI-compatible server (e.g. vllm, llama.cpp, LiteLLM).
+  # vllm:
+  #   type: openai
+  #   api_key: "sk-..."
+  #   base_url: "http://gpu-server:8000"
+  #   model: "Qwen/Qwen3-Coder-30B"
   #   timeout: 10m
   #   context_size: 65536
   #   temperature: 0.5
@@ -151,12 +155,16 @@ tools:
     - "*.key"
     - "credentials.*"
     - "secrets.*"
+  # Max lines returned by a single read_file call (default 500).
+  max_read_lines: 500
 
 rules:
   # Fixed directories: .kodrun/rules, .kodrun/commands, .kodrun/docs
   # Register get_rule as a tool for LLM (true by default)
   # When false, rules are only available via catalog in system prompt
   use_tool: true
+  # Max size (bytes) of a single @-reference file included inline (default 4096).
+  max_ref_size: 4096
 
 snippets:
   # Fixed directory: .kodrun/snippets
@@ -166,6 +174,7 @@ snippets:
 rag:
   # Provider name for embedding (from providers section above). The provider's
   # `model` field IS the embedding model — there is no separate setting here.
+  # Required only when backend is "local".
   provider: embed
   # Enable RAG (semantic search over project conventions).
   #
@@ -176,6 +185,14 @@ rag:
   # that no longer exists. Source files are read live via the `read_file`
   # tool, which is always authoritative.
   enabled: false
+  # Backend: "local" (default, in-memory vector index with disk persistence)
+  # or "muninn" (Muninn DB server that handles embeddings internally).
+  # When using "muninn", the `provider` field is not required.
+  backend: local
+  # Muninn DB settings (only used when backend: muninn).
+  # muninn:
+  #   url: "http://127.0.0.1:8475"
+  #   vault: "kodrun"
   # Deprecated: no longer used. Kept for backward compatibility — kodrun no
   # longer indexes project source code. Remove these fields from your config.
   # index_dirs:
@@ -192,7 +209,7 @@ rag:
   # Hard cap on the RAG prefetch block injected into /code-review prompts.
   # 0 falls back to the built-in default (24 KB).
   review_budget_bytes: 24576
-  # Index storage path
+  # Index storage path (only used when backend: local).
   index_path: ".kodrun/rag_index"
 
 # MCP servers (Model Context Protocol)
@@ -210,3 +227,7 @@ rag:
 #     command: "uvx"
 #     args: ["mcp-server-sqlite", "--db-path", "./data.db"]
 #     disabled: true
+
+tui:
+  # Maximum number of conversation history entries kept in memory (default 100).
+  max_history: 100
