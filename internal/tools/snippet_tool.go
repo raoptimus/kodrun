@@ -73,7 +73,6 @@ func (t *SnippetTool) Description() string {
 
 func (t *SnippetTool) Schema() llm.JSONSchema {
 	stringArray := &llm.JSONSchema{
-		Type:  "array",
 		Items: &llm.JSONSchema{Type: "string"},
 	}
 	return llm.JSONSchema{

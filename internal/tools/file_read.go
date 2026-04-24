@@ -94,10 +94,7 @@ func (t *ReadFileTool) Execute(ctx context.Context, params map[string]any) (*Too
 		return nil, &ToolError{Msg: fmt.Sprintf("offset %d beyond file end (%d lines)", offset, totalLines)}
 	}
 
-	end := offset + limit
-	if end > totalLines {
-		end = totalLines
-	}
+	end := min(offset+limit, totalLines)
 
 	truncated := end < totalLines
 

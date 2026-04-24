@@ -115,12 +115,13 @@ func TestResultCache_FailureNotCached(t *testing.T) {
 	dir := t.TempDir()
 	reg := NewRegistry()
 	reg.WithCache(NewResultCache())
-	reg.Register(NewReadFileTool(dir, nil, 100))
+	reg.Register(NewReadFileTool(dir, []string{"*.secret"}, 100))
 
 	ctx := context.Background()
-	_, err := reg.Execute(ctx, "read_file", map[string]any{"path": "missing.txt"})
+	_ = os.WriteFile(filepath.Join(dir, "data.secret"), []byte("x"), 0o644)
+	_, err := reg.Execute(ctx, "read_file", map[string]any{"path": "data.secret"})
 	if err == nil {
-		t.Fatal("expected failure for missing file")
+		t.Fatal("expected failure for forbidden file")
 	}
 	if reg.Cache().Stores() != 0 {
 		t.Fatal("failures should not be stored in cache")

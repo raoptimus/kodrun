@@ -23,7 +23,6 @@ const (
 	dirPermission = 0o755
 	movePathCap   = 2 // from + to paths
 	boolTrue      = "true"
-	boolFalse     = "false"
 )
 
 // stringParam safely extracts a string value from a map[string]any.

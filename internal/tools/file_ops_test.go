@@ -139,12 +139,13 @@ func TestDeleteFileTool_Execute_ForbiddenPath_Failure(t *testing.T) {
 	assert.Contains(t, err.Error(), "forbidden")
 }
 
-func TestDeleteFileTool_Execute_MissingFile_Failure(t *testing.T) {
+func TestDeleteFileTool_Execute_MissingFile_ReturnsResult(t *testing.T) {
 	tool := NewDeleteFileTool(t.TempDir(), nil)
 
-	_, err := tool.Execute(context.Background(), map[string]any{"path": "nonexistent.txt"})
+	result, err := tool.Execute(context.Background(), map[string]any{"path": "nonexistent.txt"})
 
-	require.Error(t, err)
+	require.NoError(t, err)
+	assert.Contains(t, result.Output, "does not exist")
 }
 
 func TestDeleteFileTool_ResolvePaths_Successfully(t *testing.T) {

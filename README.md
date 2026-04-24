@@ -28,7 +28,7 @@ Tested with **qwen3-coder:30b**, **qwen3.6**, **qwen3.5:35b-a3b**. For RAG (sema
 - **Tool-call result cache** — repeated read-only calls are served from cache.
 - **MCP (Model Context Protocol)** support for external tool servers.
 - **Security** — path traversal protection, `forbidden_patterns`, executor write-whitelist scoped to the approved plan.
-- **Context management** — auto-compaction on overflow.
+- **Context management** — auto-compaction on overflow with incremental summarization, smart truncation (preserves head+tail), tool-call boundary awareness, and token estimation auto-calibration from API responses.
 - **CI** — GitHub Actions pipeline with lint, test and coverage upload.
 
 ## Quick Start
@@ -142,6 +142,7 @@ Available inside the interactive TUI. Type `/` to see the full list.
 | `/clear` | Clear conversation context. |
 | `/resume`, `/sessions` | Resume last saved session or list saved sessions. |
 | `/reindex`, `/rag`, `/add_doc` | Manage the RAG index. |
+| `/model` | Switch LLM model for the current session. |
 | `/exit` | Exit KodRun. |
 
 Project-specific commands defined in `.kodrun/commands/*.md` are listed alongside the built-ins.
@@ -208,6 +209,16 @@ See [`examples/kodrun.yaml`](examples/kodrun.yaml) for a fully annotated project
 - **Plan revision preserves context.** When you add a remark after planning, the revision agent now receives the original task context (including RAG and source code), not just the extracted plan text.
 - **RAG backend selection.** New option `rag.backend` (`local` or `muninn`). Default is `local` (unchanged). Muninn backend delegates embeddings to an external Muninn DB server.
 - **Live LLM streaming.** During `/code-review`, press `Ctrl+O` to open transcript view with real-time LLM output streaming.
+
+### ⚠️ Migrating to v1.3.0-beta
+
+- **Chat mode.** New operating mode for free-form discussion with read-only tool access. Toggle with `Shift+Tab` (cycles plan → edit → chat → plan). Set as default via `agent.default_mode: "chat"`.
+- **`/model` command.** Switch the active LLM model mid-session via an interactive picker. The toolbar updates immediately.
+- **Token auto-calibration.** Token estimates self-correct using actual prompt token counts from API responses (EMA-based). No config needed.
+- **Planner context enrichment.** Structurer now extracts per-step `context` and plan-level `context` fields. Step executors receive detailed task context, pre-read source files, and auto-enriched `rule_names`.
+- **Improved context compaction.** Smart truncation preserves both head and tail of long strings; incremental summarization merges previous summaries; tool-call/result pairs are never split across trim boundaries.
+- **Graceful tool errors.** `read_file`, `list_dir`, and `delete_file` return a result message instead of an error for non-existent paths.
+- **Autocomplete scrolling.** Slash-command list now scrolls when items exceed the visible area.
 
 ### Minimal `.kodrun/kodrun.yaml`
 
