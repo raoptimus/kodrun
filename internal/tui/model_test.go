@@ -33,6 +33,7 @@ func newTestModel(t *testing.T) Model {
 		make(chan ConfirmRequest),
 		make(chan PlanConfirmRequest),
 		make(chan StepConfirmRequest),
+		make(chan ModelPickerRequest),
 		t.TempDir(),
 		agent.ModeEdit,
 		false,

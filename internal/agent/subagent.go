@@ -11,6 +11,8 @@ package agent
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/pkg/errors"
@@ -29,7 +31,7 @@ import (
 // The returned error is non-nil only on a hard failure of the chat loop;
 // REPLAN responses from the sub-agent are surfaced via EventReplan and
 // reported as a normal completion to the DAG runner.
-func (o *Orchestrator) runStep(ctx context.Context, step *Step, confirmFn ConfirmFunc) (SessionStats, error) {
+func (o *Orchestrator) runStep(ctx context.Context, step *Step, planContext string, confirmFn ConfirmFunc) (SessionStats, error) {
 	ag := o.newAgent(RoleExecutor, o.maxExecIter)
 	prompt := systemPromptForRole(RoleExecutor, o.language, o.progLang(), o.ruleCatalog, ag.reg.Names(), o.hasSnippets, o.hasRAG)
 	ag.InitWithPrompt(prompt)
@@ -41,11 +43,17 @@ func (o *Orchestrator) runStep(ctx context.Context, step *Step, confirmFn Confir
 		ag.SetAllowedReadPaths(step.Files)
 	}
 
-	// Build a compact per-step task payload. Only the step's own data is
-	// surfaced — the sub-agent never sees the rest of the plan, which
-	// eliminates the temptation to "also fix the neighbouring file".
+	// Build a compact per-step task payload. The sub-agent receives the
+	// plan-level goal so it understands the broader context, plus the
+	// source code of its declared files so it can edit without read_file.
 	var b strings.Builder
+	if planContext != "" {
+		fmt.Fprintf(&b, "## Goal\n%s\n\n", planContext)
+	}
 	fmt.Fprintf(&b, "## Step %d: %s\n\n", step.ID, step.Title)
+	if step.Context != "" {
+		fmt.Fprintf(&b, "Context: %s\n", step.Context)
+	}
 	if step.Action != "" {
 		fmt.Fprintf(&b, "Action: %s\n", step.Action)
 	}
@@ -56,6 +64,13 @@ func (o *Orchestrator) runStep(ctx context.Context, step *Step, confirmFn Confir
 		fmt.Fprintf(&b, "Files: %s\n", strings.Join(step.Files, ", "))
 	}
 	b.WriteString("\nApply the change and stop. Do not touch any file outside the Files list.\n")
+
+	// Pre-read source code of step files so the executor can edit
+	// immediately without wasting iterations on read_file calls.
+	if code := collectStepFiles(o.workDir, step.Files); code != "" {
+		b.WriteString("\n## Source Code (already read — do NOT call read_file)\n")
+		b.WriteString(code)
+	}
 
 	// Resolve reference examples from disk and inject into the prompt.
 	if len(step.Examples) > 0 {
@@ -103,6 +118,27 @@ func (o *Orchestrator) runStep(ctx context.Context, step *Step, confirmFn Confir
 	}
 
 	return stats, nil
+}
+
+// collectStepFiles reads the source code of step files from disk and returns
+// a formatted string suitable for injection into the executor prompt. Files
+// that do not exist (e.g. action:"create") are silently skipped.
+func collectStepFiles(workDir string, files []string) string {
+	var buf strings.Builder
+	for _, rel := range files {
+		abs := filepath.Join(workDir, rel)
+		data, err := os.ReadFile(abs)
+		if err != nil {
+			continue
+		}
+		lines := strings.Split(string(data), "\n")
+		fmt.Fprintf(&buf, "=== %s ===\n", rel)
+		for i, line := range lines {
+			fmt.Fprintf(&buf, "%d\t%s\n", i+1, line)
+		}
+		buf.WriteByte('\n')
+	}
+	return buf.String()
 }
 
 // perStepRAG builds a compact per-step RAG payload combining declared rule

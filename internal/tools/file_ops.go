@@ -10,6 +10,7 @@ package tools
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -79,6 +80,9 @@ func (t *DeleteFileTool) Execute(ctx context.Context, params map[string]any) (*T
 	}
 
 	if err := os.Remove(resolved); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return &ToolResult{Output: fmt.Sprintf("File does not exist: %s", path)}, nil
+		}
 		return nil, fmt.Errorf("delete file: %w", err)
 	}
 

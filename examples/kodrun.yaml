@@ -122,13 +122,13 @@ agent:
   # --------------------------------------------------------------------------
   # Max iterations of the agent loop (infinite-loop protection).
   max_iterations: 50
-  # Default mode at startup: "plan" (read-only) or "edit" (full tools).
+  # Default mode at startup: "plan" (read-only), "edit" (full tools), or "chat" (discussion).
   default_mode: "plan"
   # Stream "thinking" reasoning blocks from models that support it.
   think: true
   # Pre-read all .go files into the executor prompt (skips read_file iterations).
   prefetch_code: true
-  # Override automatic project-language detection. Empty = auto. Values: go|python|jsts.
+  # Override automatic project-language detection. Empty = auto. Values: go|python|jsts|frontend.
   project_language: ""
   # Automatically fix build/test/lint errors via LLM.
   auto_fix: true

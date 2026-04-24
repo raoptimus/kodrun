@@ -42,6 +42,7 @@ var translations = map[string]map[string]string{
 		// Placeholders
 		"placeholder.plan":       "Describe task for planning...",
 		"placeholder.edit":       "Enter task or /command...",
+		"placeholder.chat":       "Ask a question or discuss...",
 		"placeholder.constraint": "Describe constraint...",
 
 		// Confirm
@@ -59,6 +60,7 @@ var translations = map[string]map[string]string{
 		// Status
 		"status.switched_edit": "Switched to edit mode (send message to start)",
 		"status.switched_plan": "Switched to plan mode (think enabled)",
+		"status.switched_chat": "Switched to chat mode",
 		"status.cancelled":     "cancelled",
 		"status.task_running":  "task already running, press Esc to cancel",
 		"status.mouse_on":      "mouse capture enabled",
@@ -71,6 +73,7 @@ var translations = map[string]map[string]string{
 		// Labels
 		"label.plan_mode":    "plan mode on",
 		"label.edit_mode":    "accept edits on",
+		"label.chat_mode":    "chat mode on",
 		"label.shift_tab":    "(shift+tab)",
 		"label.context_left": "%d%% left",
 
@@ -120,6 +123,7 @@ var translations = map[string]map[string]string{
 		// Placeholders
 		"placeholder.plan":       "Опишите задачу для планирования...",
 		"placeholder.edit":       "Введите задачу или /команду...",
+		"placeholder.chat":       "Задайте вопрос или обсудите...",
 		"placeholder.constraint": "Опишите ограничение...",
 
 		// Confirm
@@ -137,6 +141,7 @@ var translations = map[string]map[string]string{
 		// Status
 		"status.switched_edit": "Режим правок (отправьте сообщение для начала)",
 		"status.switched_plan": "Режим плана (think включён)",
+		"status.switched_chat": "Режим чата",
 		"status.cancelled":     "отменено",
 		"status.task_running":  "задача выполняется, нажмите Esc для отмены",
 		"status.mouse_on":      "захват мыши включён",
@@ -149,6 +154,7 @@ var translations = map[string]map[string]string{
 		// Labels
 		"label.plan_mode":    "режим плана",
 		"label.edit_mode":    "режим правок",
+		"label.chat_mode":    "режим чата",
 		"label.shift_tab":    "(shift+tab)",
 		"label.context_left": "%d%% свободно",
 

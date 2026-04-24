@@ -168,6 +168,15 @@ func (o *Orchestrator) runPlanDAG(ctx context.Context, plan *Plan, maxParallel i
 	dag := buildStepDAG(plan)
 	locks := newFileLockSet()
 
+	// Enrich step rule names from file paths. The structurer may already
+	// have populated RuleNames from the plan text; this adds rules detected
+	// from the step's file paths so that perStepRAG loads them explicitly.
+	for i := range plan.Steps {
+		s := &plan.Steps[i]
+		detected := entityTypesFromPaths(s.Files, o.ruleNames)
+		s.RuleNames = mergeRuleNames(s.RuleNames, detected)
+	}
+
 	// Pre-compute per-step RAG bundles once. Each bundle is independent of
 	// scheduling order, so doing this up-front lets parallel sub-agents share
 	// the result instead of issuing duplicate embedding searches.
@@ -214,7 +223,7 @@ func (o *Orchestrator) runPlanDAG(ctx context.Context, plan *Plan, maxParallel i
 			})
 			defer o.emit(&Event{Type: EventGroupEnd, GroupID: groupID})
 
-			stats, err := o.runStep(runCtx, step, confirmFn)
+			stats, err := o.runStep(runCtx, step, plan.Context, confirmFn)
 			results <- stepResult{id: id, stats: stats, err: err}
 		}()
 	}

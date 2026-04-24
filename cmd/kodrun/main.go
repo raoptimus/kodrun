@@ -48,7 +48,7 @@ import (
 	"github.com/raoptimus/kodrun/internal/tui"
 )
 
-var version = "v1.1.0-beta"
+var version = "v1.2.0-beta"
 
 const (
 	cmdNameEdit       = "edit"
@@ -320,8 +320,11 @@ func runRoot(ctx context.Context, cmd *cli.Command) error {
 
 	// Set default mode and think from config
 	defaultMode := agent.ModePlan
-	if cfg.Agent.DefaultMode == cmdNameEdit {
+	switch cfg.Agent.DefaultMode {
+	case cmdNameEdit:
 		defaultMode = agent.ModeEdit
+	case agent.ModeChat.String():
+		defaultMode = agent.ModeChat
 	}
 	ag.SetMode(defaultMode)
 	ag.SetThink(cfg.Agent.Think)
@@ -513,6 +516,9 @@ func runRoot(ctx context.Context, cmd *cli.Command) error {
 		return <-resultCh
 	}
 
+	// Model picker channel (interactive model selection)
+	modelPickerCh := make(chan tui.ModelPickerRequest, 1)
+
 	// Per-task cancelable context
 	var (
 		taskCancelMu sync.Mutex
@@ -547,6 +553,33 @@ func runRoot(ctx context.Context, cmd *cli.Command) error {
 
 			// Built-in commands
 			switch cmdName {
+			case "model":
+				models, err := client.Models(taskCtx)
+				if err != nil {
+					emit(&agent.Event{Type: agent.EventError, Message: fmt.Sprintf("Failed to list models: %v", err)})
+					emit(&agent.Event{Type: agent.EventDone})
+					return
+				}
+				names := make([]string, len(models))
+				for i, m := range models {
+					names[i] = m.Name
+				}
+				sort.Strings(names)
+				resultCh := make(chan string, 1)
+				modelPickerCh <- tui.ModelPickerRequest{
+					Models:  names,
+					Current: ag.Model(),
+					Result:  resultCh,
+				}
+				selected := <-resultCh
+				if selected != "" && selected != ag.Model() {
+					ag.SetModel(selected)
+					chatProv.Model = selected
+					emit(&agent.Event{Type: agent.EventModelChange, Message: selected})
+					emit(&agent.Event{Type: agent.EventAgent, Message: fmt.Sprintf("Model switched to: %s", selected)})
+				}
+				emit(&agent.Event{Type: agent.EventDone})
+				return
 			case "compact":
 				var instructions string
 				if len(parts) > 1 {
@@ -961,13 +994,14 @@ func runRoot(ctx context.Context, cmd *cli.Command) error {
 			emit(&agent.Event{Type: agent.EventAgent, Message: "Plan augmentation: send your refinement as a new message."})
 			return
 		case agent.PlanAutoAccept, agent.PlanManualApprove:
+			autoAccept := cr.Action == agent.PlanAutoAccept
 			var confirmFn agent.ConfirmFunc
-			if cr.Action == agent.PlanManualApprove {
+			if !autoAccept {
 				confirmFn = ag.GetConfirmFunc()
 			}
 			emit(&agent.Event{Type: agent.EventAgent, Message: "▸ Executing approved plan..."})
 			orch := newOrchestrator(client, &chatProv, reg, &cfg, emit, confirmFn, planConfirmFn, stepConfirmFn, ruleCatalog, ragIndex, godocIndexer, langState, loader)
-			if err := orch.RunExecutor(taskCtx, responseText, confirmFn); err != nil && taskCtx.Err() == nil {
+			if err := orch.RunExecutor(taskCtx, responseText, confirmFn, autoAccept); err != nil && taskCtx.Err() == nil {
 				emit(&agent.Event{Type: agent.EventError, Message: err.Error()})
 			}
 		}
@@ -987,7 +1021,7 @@ func runRoot(ctx context.Context, cmd *cli.Command) error {
 	}
 
 	commands := buildCommandItems(loader)
-	model := tui.NewModel(chatProv.Model, version, chatProv.ContextSize, taskFn, cancelTask, events, commands, confirmCh, planConfirmCh, stepConfirmCh,
+	model := tui.NewModel(chatProv.Model, version, chatProv.ContextSize, taskFn, cancelTask, events, commands, confirmCh, planConfirmCh, stepConfirmCh, modelPickerCh,
 		flags.workDir, defaultMode, cfg.Agent.Think, setModeFn, contextFn, cfg.Agent.Language, cfg.TUI.MaxHistory)
 
 	// Save terminal state before bubbletea modifies it (alt screen, mouse reporting).
@@ -1048,6 +1082,7 @@ func buildCommandItems(loader *rules.Loader) []tui.CommandItem {
 		tui.CommandItem{Name: "add_doc", Description: "Add a document to RAG index"},
 		tui.CommandItem{Name: "orchestrate", Description: "Run Plan→Execute→Review pipeline"},
 		tui.CommandItem{Name: cmdNameCodeReview, Description: "Parallel specialist code review: rules, idiomaticity, best practices, security, structure, architecture"},
+		tui.CommandItem{Name: "model", Description: "Switch LLM model for this session"},
 		tui.CommandItem{Name: "exit", Description: "Exit KodRun"},
 	)
 

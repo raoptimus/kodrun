@@ -10,6 +10,7 @@ package tools
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -66,6 +67,9 @@ func (t *ReadFileTool) Execute(ctx context.Context, params map[string]any) (*Too
 
 	info, err := os.Stat(resolved)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return &ToolResult{Output: fmt.Sprintf("File does not exist: %s", path)}, nil
+		}
 		return nil, fmt.Errorf("read file: %w", err)
 	}
 	if info.IsDir() {

@@ -446,12 +446,15 @@ func (o *Orchestrator) runPlanner(ctx context.Context, task string) (string, err
 		return "", err
 	}
 
-	// Two-phase architecture: always run extractor to normalize planner output
-	// into a structured plan. This eliminates heuristics — the extractor handles
-	// thinking text, vague suggestions, scattered findings, and already-good plans.
-	plan, err = o.extractPlan(ctx, plan)
-	if err != nil {
-		return "", err
+	// The extractor normalizes review/analysis output into structured JSON
+	// findings (severity, what, fix). For implementation tasks the planner
+	// output is already an actionable plan; the structurer (called later by
+	// runExecutor) handles JSON conversion and file grouping.
+	if o.review {
+		plan, err = o.extractPlan(ctx, plan)
+		if err != nil {
+			return "", err
+		}
 	}
 
 	// Log quality issues as warnings (informational only, not a gate).
@@ -777,9 +780,9 @@ func (o *Orchestrator) runPlannerRevision(ctx context.Context, plan, feedback st
 // It is intended for callers that obtained a plan outside of the orchestrator
 // (e.g. via the standalone agent + classifier path) and want to delegate just
 // the execution to the orchestrator's executor sub-agent.
-func (o *Orchestrator) RunExecutor(ctx context.Context, plan string, confirmFn ConfirmFunc) error {
+func (o *Orchestrator) RunExecutor(ctx context.Context, plan string, confirmFn ConfirmFunc, autoAccept bool) error {
 	o.emit(&Event{Type: EventModeChange, Message: "edit"})
-	stats, err := o.runExecutor(ctx, plan, confirmFn, false)
+	stats, err := o.runExecutor(ctx, plan, confirmFn, autoAccept)
 	if err != nil {
 		return errors.WithMessage(err, "executor")
 	}

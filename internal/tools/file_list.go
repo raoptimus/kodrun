@@ -10,6 +10,7 @@ package tools
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -66,6 +67,9 @@ func (t *ListDirTool) Execute(ctx context.Context, params map[string]any) (*Tool
 		entries, err = t.listFlat(ctx, resolved)
 	}
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return &ToolResult{Output: fmt.Sprintf("Directory does not exist: %s", path)}, nil
+		}
 		return nil, err
 	}
 

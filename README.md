@@ -16,11 +16,12 @@ Tested with **qwen3-coder:30b**, **qwen3.6**, **qwen3.5:35b-a3b**. For RAG (sema
 - **Multi-role orchestrator** — `planner` / `executor` / `reviewer` / `extractor` / `structurer` / `step_executor` / `response_classifier`, each role wired to its own provider profile.
 - **Parallel DAG plan execution** — approved plans run as a dependency graph of sub-agents with per-file locking.
 - **Multi-provider config** — one entry per (URL, model, temperature) profile; any role can point at any profile.
-- **Language-aware system prompts** — tool names, build/lint/test commands, and coding conventions in system prompts are adapted to the detected project language (Go, Python, JS/TS). No more Go bias in non-Go projects.
+- **Language-aware system prompts** — tool names, build/lint/test commands, and coding conventions in system prompts are adapted to the detected project language (Go, Python, JS/TS). When no language is detected, prompts contain no language-specific guidelines — the agent follows user instructions without bias toward any particular stack.
 - **Automatic project language & tech stack detection** — Go, Python, JS/TS; per-language tools auto-registered. Tech stack (gRPC, HTTP, Postgres, ClickHouse, MongoDB, Redis, Kafka) detected from dependencies for snippet filtering.
 - **Rules + snippets + custom commands** — `.kodrun/` driven, with `@`-reference validation at startup.
 - **RAG with multi-index** — semantic search over conventions + docs + snippets + embedded references. Architecture overview snippets are pinned verbatim in `/code-review`. Configurable backend: local (in-memory with disk persistence) or Muninn DB.
 - **`/code-review` command** — per-file code review pipeline. Pre-loads file contents, RAG snippets and dependency signatures, then reviews each file in parallel (no tool-calling required during review). Unchanged files are served from disk cache (`.kodrun/cache/review/`). Includes a separate architecture review pass. Results are merged, deduplicated and presented as a structured plan. Live LLM streaming in transcript view (`Ctrl+O`).
+- **Three operating modes** — **plan** (read-only analysis), **edit** (full tool access), **chat** (free-form discussion with read-only tools). Toggle with `Shift+Tab` (cycles plan → edit → chat → plan). Set default via `agent.default_mode`.
 - **Edit nudge** — auto-correction for models that respond with prose instead of tool calls in EDIT mode; prevents plan-shaped text from being silently accepted.
 - **`web_fetch` tool** — download web pages, convert HTML to markdown, and optionally index via RAG for semantic search.
 - **TUI** — fullscreen bubbletea interface, markdown rendering, confirm card with diff preview, step-level confirmation, RAG indexing progress, cache stats. Plain stdout mode for pipes/scripts.
@@ -84,6 +85,18 @@ kodrun
 # Plain stdout (no TUI) — useful in pipes and CI
 kodrun --no-tui
 ```
+
+### Operating modes
+
+KodRun has three modes, toggled with `Shift+Tab` (cycles plan → edit → chat → plan):
+
+| Mode | Description | Available tools |
+|------|-------------|-----------------|
+| **plan** | Read-only analysis. Creates numbered plans without writing code. | read_file, grep, git_status, ... |
+| **edit** | Full tool access. Executes plans, writes/edits files, runs build/lint/test. | all tools |
+| **chat** | Free-form discussion. Answer questions, explain code, discuss architecture. | read_file, grep, git_status, ... |
+
+Set default mode in config: `agent.default_mode: "plan"` (default), `"edit"`, or `"chat"`.
 
 ### One-shot task
 

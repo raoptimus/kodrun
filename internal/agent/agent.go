@@ -72,6 +72,7 @@ const (
 	headerPLAN         = "PLAN"
 	headerPLANRu       = "ПЛАН"
 	langEnglish        = "English"
+	roleAssistant      = "assistant"
 )
 
 // Mode represents the agent operating mode.
@@ -82,14 +83,22 @@ const (
 	ModePlan Mode = iota
 	// ModeEdit is full tool access mode.
 	ModeEdit
+	// ModeChat is free-form discussion mode with read-only tool access.
+	ModeChat
 )
+
+const modeChatStr = "chat"
 
 // String returns the mode name.
 func (m Mode) String() string {
-	if m == ModePlan {
+	switch m {
+	case ModePlan:
 		return string(ClassifyKindPlan)
+	case ModeChat:
+		return modeChatStr
+	default:
+		return "edit"
 	}
-	return "edit"
 }
 
 // readOnlyTools is the set of tools allowed in plan mode.
@@ -263,6 +272,9 @@ const (
 	// Fields: InferenceTokens, InferenceElapsed. Emitted periodically (throttled)
 	// while the model is generating tokens so the TUI can show progress.
 	EventInferenceProgress
+	// EventModelChange signals that the active model was changed at runtime.
+	// Message holds the new model name. The TUI updates the toolbar display.
+	EventModelChange
 )
 
 // Agent orchestrates the LLM-tool loop.
@@ -555,6 +567,16 @@ func (a *Agent) DisableTools(names ...string) {
 	}
 }
 
+// SetModel changes the model used for subsequent LLM calls.
+func (a *Agent) SetModel(model string) {
+	a.model = model
+}
+
+// Model returns the current model name.
+func (a *Agent) Model() string {
+	return a.model
+}
+
 // SetMode sets the agent operating mode.
 func (a *Agent) SetMode(mode Mode) {
 	a.mode = mode
@@ -596,7 +618,7 @@ func (a *Agent) ToolCallCount() int {
 // through the lastPlan extraction.
 func (a *Agent) LastAssistantMessage() string {
 	for i := len(a.history) - 1; i >= 0; i-- {
-		if a.history[i].Role == "assistant" {
+		if a.history[i].Role == roleAssistant {
 			return a.history[i].Content
 		}
 	}
@@ -637,6 +659,8 @@ func (a *Agent) LoadFromSession(s *Session) {
 	switch s.Mode {
 	case string(ClassifyKindPlan):
 		a.mode = ModePlan
+	case modeChatStr:
+		a.mode = ModeChat
 	default:
 		a.mode = ModeEdit
 	}
@@ -909,9 +933,12 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 			return errors.WithMessage(err, "chat")
 		}
 
-		// Track real prompt token count for auto-compact
+		// Track real prompt token count for auto-compact and calibrate estimator
 		if resp.PromptEvalCount > 0 {
 			a.lastPromptEvalCount = resp.PromptEvalCount
+			if a.ctxMgr != nil {
+				a.ctxMgr.Calibrate(a.history, resp.PromptEvalCount)
+			}
 		}
 
 		// Emit token usage
@@ -937,7 +964,7 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 
 		// Add assistant response to history
 		msg := llm.Message{
-			Role:      "assistant",
+			Role:      roleAssistant,
 			Content:   resp.Content,
 			ToolCalls: resp.ToolCalls,
 		}
@@ -956,7 +983,7 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 					// with one carrying the synthetic tool call so the
 					// subsequent tool-result message has a matching ToolCallID.
 					a.history[len(a.history)-1] = llm.Message{
-						Role:      "assistant",
+						Role:      roleAssistant,
 						Content:   "",
 						ToolCalls: []llm.ToolCall{*synth},
 					}
@@ -1058,10 +1085,10 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 			if a.isToolBlocked(tc.Function.Name) {
 				a.history = append(a.history, llm.Message{
 					Role:       "tool",
-					Content:    fmt.Sprintf("Tool %q is NOT available in analysis mode. Do NOT call write tools. Use ONLY: %s", tc.Function.Name, strings.Join(a.reg.NamesFiltered(readOnlyTools), ", ")),
+					Content:    fmt.Sprintf("Tool %q is NOT available in %s mode. Do NOT call write tools. Use ONLY: %s", tc.Function.Name, a.mode.String(), strings.Join(a.reg.NamesFiltered(readOnlyTools), ", ")),
 					ToolCallID: tc.ID,
 				})
-				a.emit(&Event{Type: EventTool, Tool: tc.Function.Name, Message: "blocked in plan mode", Success: false})
+				a.emit(&Event{Type: EventTool, Tool: tc.Function.Name, Message: fmt.Sprintf("blocked in %s mode", a.mode.String()), Success: false})
 				continue
 			}
 			allBlocked = false
@@ -1369,7 +1396,13 @@ func (a *Agent) emitToolResult(tc llm.ToolCall, result *tools.ToolResult, toolEr
 			ev.Diff = v
 		}
 	}
-	a.emit(&ev)
+	// Cache-hit read-only tools: suppress UI event and shorten history
+	// to avoid visual noise and wasted model context.
+	isCachedReadOnly := ev.CacheHit && readOnlyTools[tc.Function.Name]
+
+	if !isCachedReadOnly {
+		a.emit(&ev)
+	}
 
 	a.stats.ToolCalls++
 	if ev.FileAction != "" {
@@ -1378,7 +1411,9 @@ func (a *Agent) emitToolResult(tc llm.ToolCall, result *tools.ToolResult, toolEr
 	}
 
 	resultContent := result.Output
-	if len(resultContent) > maxToolResultBytes {
+	if isCachedReadOnly {
+		resultContent = "[already read — see earlier tool result]"
+	} else if len(resultContent) > maxToolResultBytes {
 		resultContent = resultContent[:maxToolResultBytes] + "\n... [truncated, total " + fmt.Sprintf("%d", len(result.Output)) + " bytes]"
 	}
 	a.history = append(a.history, llm.Message{
@@ -1395,9 +1430,10 @@ func (a *Agent) isToolBlocked(tool string) bool {
 	if a.disabledTools[tool] {
 		return true
 	}
-	if a.mode != ModePlan {
+	if a.mode == ModeEdit {
 		return false
 	}
+	// Plan and Chat modes: only read-only tools allowed.
 	return !readOnlyTools[tool] && !a.extraReadOnlyTools[tool]
 }
 
@@ -1623,9 +1659,11 @@ func langName(code string) string {
 
 func (a *Agent) buildSystemPrompt() string {
 	lang := langName(a.language)
+	pl := a.currentProgLang()
+	ltc := langToolsForLang(pl)
 
 	var b strings.Builder
-	if pl := a.currentProgLang(); pl != "" {
+	if pl != "" {
 		fmt.Fprintf(&b, "You are KodRun, a %s programming assistant.\n", pl)
 	} else {
 		b.WriteString("You are KodRun, a programming assistant.\n")
@@ -1637,12 +1675,22 @@ func (a *Agent) buildSystemPrompt() string {
 		b.WriteString("\n")
 	}
 
-	if a.mode == ModePlan {
+	switch a.mode {
+	case ModePlan:
 		b.WriteString("You are in PLAN mode (READ-ONLY).\n")
 		b.WriteString("You can ONLY analyze code and create plans. You CANNOT modify files.\n")
 		b.WriteString("You MUST NOT call any tools besides: " + strings.Join(a.reg.NamesFiltered(readOnlyTools), ", ") + "\n\n")
 		b.WriteString("IMPORTANT — Questions vs Tasks:\n")
-		b.WriteString("- If the user asks a QUESTION (about Go, naming, conventions, architecture, etc.) — answer it DIRECTLY and concisely. Do NOT create a plan for questions.\n")
+		switch pl {
+		case progLangGo:
+			b.WriteString("- If the user asks a QUESTION (about Go, naming, conventions, architecture, etc.) — answer it DIRECTLY and concisely. Do NOT create a plan for questions.\n")
+		case progLangPython:
+			b.WriteString("- If the user asks a QUESTION (about Python naming, PEP conventions, architecture, etc.) — answer it DIRECTLY and concisely. Do NOT create a plan for questions.\n")
+		case progLangJSTS:
+			b.WriteString("- If the user asks a QUESTION (about TypeScript naming, conventions, architecture, etc.) — answer it DIRECTLY and concisely. Do NOT create a plan for questions.\n")
+		default:
+			b.WriteString("- If the user asks a QUESTION (about naming, conventions, architecture, etc.) — answer it DIRECTLY and concisely. Do NOT create a plan for questions.\n")
+		}
 		b.WriteString("- If the user gives a TASK (fix, refactor, add feature, etc.) — create a numbered plan.\n\n")
 		b.WriteString("STRICT RULES (for tasks):\n")
 		b.WriteString("- NEVER generate code blocks, patches, diffs, or file contents\n")
@@ -1652,27 +1700,59 @@ func (a *Agent) buildSystemPrompt() string {
 		b.WriteString("- Your plan must be a numbered list with text descriptions only\n")
 		b.WriteString("- Do NOT read binary files, build artifacts, or IDE config directories\n\n")
 		b.WriteString("Guidelines:\n")
-		b.WriteString("- Read and analyze only *.go source files and project docs\n")
+		switch pl {
+		case progLangGo:
+			b.WriteString("- Read and analyze *.go source files and project docs\n")
+		case progLangPython:
+			b.WriteString("- Read and analyze *.py source files and project docs\n")
+		case progLangJSTS:
+			b.WriteString("- Read and analyze *.ts, *.tsx, *.js, *.jsx source files and project docs\n")
+		default:
+			b.WriteString("- Read and analyze source files and project docs\n")
+		}
 		b.WriteString("- Identify files that need changes\n")
 		b.WriteString("- Propose a step-by-step plan\n")
 		b.WriteString("- Estimate complexity and risks\n")
 		b.WriteString("- Be concise and actionable\n")
-		b.WriteString("- Reference Go best practices and project conventions\n")
+		b.WriteString("- Verification section MUST only include commands that match the actual project stack and task scope. Do NOT invent commands for tools, servers, linters or formatters not present in the project.\n")
+		switch pl {
+		case progLangGo:
+			b.WriteString("- Reference Effective Go, Go Code Review Comments, Go Common Mistakes and project conventions\n")
+		case progLangPython:
+			b.WriteString("- Reference PEP 8, PEP 20 and project conventions\n")
+		case progLangJSTS:
+			b.WriteString("- Reference TypeScript best practices and project conventions\n")
+		default:
+			// No language-specific best practices when language is unknown.
+		}
 		if a.hasRAG {
 			b.WriteString("\nIMPORTANT — Project rules and conventions (from RAG):\n")
-			b.WriteString("The task context includes MANDATORY RULES marked [MANDATORY PROJECT RULES] and GO STANDARDS marked [GO STANDARDS].\n")
+			fmt.Fprintf(&b, "The task context includes MANDATORY RULES marked [MANDATORY PROJECT RULES] and %s marked [%s].\n", ltc.standardsLabel, ltc.standardsLabel)
 			b.WriteString("These are NOT suggestions — they are REQUIREMENTS. Treat violations as bugs.\n")
-			b.WriteString("Examples: naming conventions (getter=Owner not GetOwner), error wrapping with pkg/errors, context.Context as first arg, etc.\n")
+			b.WriteString("These include naming conventions, error handling, code structure, and all documented standards.\n")
 			b.WriteString("You MUST check code against ALL provided rules. Include violations in your plan.\n")
 			b.WriteString("You may call search_docs for additional targeted searches if needed.\n")
 		} else if a.hasSnippets {
 			b.WriteString("\nIMPORTANT — Documentation check (MANDATORY):\n")
 			b.WriteString("You MUST call snippets BEFORE creating the plan. This is not optional.\n")
-			b.WriteString("1. Call snippets(paths=[<list of all .go files you read>]) to get code conventions\n")
+			switch pl {
+			case progLangGo:
+				b.WriteString("1. Call snippets(paths=[<list of all .go files you read>]) to get code conventions\n")
+			case progLangPython:
+				b.WriteString("1. Call snippets(paths=[<list of all .py files you read>]) to get code conventions\n")
+			default:
+				b.WriteString("1. Call snippets(paths=[<list of all source files you read>]) to get code conventions\n")
+			}
 			b.WriteString("2. Read and understand the found conventions\n")
 			b.WriteString("3. Only then create the plan, incorporating found conventions as requirements\n")
 		}
-	} else {
+	case ModeChat:
+		b.WriteString("You are in CHAT mode.\n")
+		b.WriteString("Answer questions, explain code, discuss architecture and design decisions.\n")
+		b.WriteString("You can read files for context using read-only tools: " + strings.Join(a.reg.NamesFiltered(readOnlyTools), ", ") + "\n")
+		b.WriteString("Do NOT create numbered plans, do NOT write or edit files, do NOT call write tools.\n")
+		b.WriteString("Be concise and helpful.\n")
+	default:
 		b.WriteString("You are in EDIT mode. EDIT mode is for ACTING on the code, not for describing changes.\n\n")
 		b.WriteString("CRITICAL — Action vs description:\n")
 		b.WriteString("- If the user's input is a TASK to change code (fix, refactor, create, edit, move, restructure, apply plan, implement, ...) you MUST start your response with tool calls (write_file, edit_file, bash, read_file as needed). Do NOT output a markdown plan, do NOT write \"ANALYSIS\" / \"АНАЛИЗ\" or \"IMPLEMENTATION PLAN\" / \"ПЛАН ИСПРАВЛЕНИЙ\" sections, do NOT explain what you are about to do — just call the tools.\n")
@@ -1682,18 +1762,27 @@ func (a *Agent) buildSystemPrompt() string {
 		b.WriteString("- PLAN mode is the place for descriptions. EDIT mode is for actions. Stay in your lane.\n\n")
 		b.WriteString("Available tools: " + strings.Join(a.reg.Names(), ", ") + "\n\n")
 		b.WriteString("Guidelines:\n")
-		b.WriteString("- Write idiomatic Go code\n")
-		b.WriteString("- Use go best practice and project's guides\n")
-		b.WriteString("- Use go version 1.25+\n")
-		b.WriteString("- Handle errors properly\n")
+		switch pl {
+		case progLangGo:
+			b.WriteString("- Write idiomatic Go code following Effective Go, Go Code Review Comments, Go Common Mistakes. Use Go 1.25+.\n")
+			b.WriteString("- Handle errors properly\n")
+		case progLangPython:
+			b.WriteString("- Write idiomatic Python code following PEP 8 and project conventions.\n")
+			b.WriteString("- Handle errors properly\n")
+		case progLangJSTS:
+			b.WriteString("- Write idiomatic TypeScript/JavaScript code following project conventions.\n")
+			b.WriteString("- Handle errors properly\n")
+		default:
+			// No language-specific guidelines when language is unknown.
+		}
 		b.WriteString("- Use edit_file for targeted changes, write_file for new files\n")
 		b.WriteString("- Be concise in responses\n")
 		b.WriteString("- Do NOT repeat or quote file contents in your responses. Reference files by path only.\n")
 		if a.hasRAG {
 			b.WriteString("\nIMPORTANT — Project rules and conventions (from RAG):\n")
-			b.WriteString("The task context includes MANDATORY RULES marked [MANDATORY PROJECT RULES] and GO STANDARDS marked [GO STANDARDS].\n")
+			fmt.Fprintf(&b, "The task context includes MANDATORY RULES marked [MANDATORY PROJECT RULES] and %s marked [%s].\n", ltc.standardsLabel, ltc.standardsLabel)
 			b.WriteString("These are REQUIREMENTS, not suggestions. Apply them to every line you write.\n")
-			b.WriteString("Examples: getter naming (Owner not GetOwner), error wrapping with pkg/errors, context.Context as first arg.\n")
+			b.WriteString("These include naming conventions, error handling, code structure, and all documented standards.\n")
 			b.WriteString("You may call search_docs for additional targeted searches if needed.\n")
 		} else if a.hasSnippets {
 			b.WriteString("\nIMPORTANT — Documentation check (MANDATORY):\n")
@@ -1703,13 +1792,25 @@ func (a *Agent) buildSystemPrompt() string {
 			b.WriteString("3. Only then write/edit code, following ALL found conventions (naming, structure, patterns, error handling)\n")
 			b.WriteString("4. If no snippets match, proceed without conventions\n")
 		}
-		b.WriteString("\nAfter completing EVERY task you MUST run this verification sequence:\n")
-		b.WriteString("1. Run go_build to verify compilation. If errors — fix them and re-run.\n")
-		b.WriteString("2. Run go_lint to check code quality. If errors — fix them and re-run.\n")
-		b.WriteString("3. Run go_test to verify correctness. If errors — fix them and re-run.\n")
-		b.WriteString("4. Update AGENTS.md if you changed architecture, added/removed files, or modified public APIs.\n")
-		b.WriteString("   Use read_file to read AGENTS.md first, then edit_file to update only the relevant sections.\n")
-		b.WriteString("   Do NOT rewrite the entire file — only update what changed.\n")
+		if ltc.buildTool != "" || ltc.lintTool != "" || ltc.testTool != "" {
+			b.WriteString("\nAfter completing EVERY task you MUST run this verification sequence:\n")
+			step := 1
+			if ltc.buildTool != "" {
+				fmt.Fprintf(&b, "%d. Run %s to verify compilation. If errors — fix them and re-run.\n", step, ltc.buildTool)
+				step++
+			}
+			if ltc.lintTool != "" {
+				fmt.Fprintf(&b, "%d. Run %s to check code quality. If errors — fix them and re-run.\n", step, ltc.lintTool)
+				step++
+			}
+			if ltc.testTool != "" {
+				fmt.Fprintf(&b, "%d. Run %s to verify correctness. If errors — fix them and re-run.\n", step, ltc.testTool)
+				step++
+			}
+			fmt.Fprintf(&b, "%d. Update AGENTS.md if you changed architecture, added/removed files, or modified public APIs.\n", step)
+			b.WriteString("   Use read_file to read AGENTS.md first, then edit_file to update only the relevant sections.\n")
+			b.WriteString("   Do NOT rewrite the entire file — only update what changed.\n")
+		}
 	}
 
 	// Repeat language directive at the end for reinforcement (important for local models).

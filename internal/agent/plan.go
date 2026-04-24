@@ -51,6 +51,7 @@ type Example struct {
 type Step struct {
 	ID        int       `json:"id"`
 	Title     string    `json:"title"`
+	Context   string    `json:"context,omitempty"`
 	Files     []string  `json:"files,omitempty"`
 	Action    string    `json:"action,omitempty"`
 	Rationale string    `json:"rationale,omitempty"`
@@ -280,6 +281,9 @@ func renderFindingStep(b *strings.Builder, idx int, v map[string]any) {
 
 	if what := firstString(v, "what"); what != "" {
 		fmt.Fprintf(b, "- **What:** %s\n", what)
+	}
+	if ctx := firstString(v, "context"); ctx != "" {
+		fmt.Fprintf(b, "- **Context:** %s\n", ctx)
 	}
 	if why := firstString(v, "why"); why != "" {
 		fmt.Fprintf(b, "- **Why:** %s\n", why)

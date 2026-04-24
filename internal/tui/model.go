@@ -48,6 +48,7 @@ const (
 	dividerLabelPad   = 2  // spaces around phase divider label
 	dividerMinPad     = 4  // minimum total padding for phase divider
 	dividerHalf       = 2  // divisor for centering divider label
+	pickerScrollHalf  = 2  // divisor for centering picker scroll window
 )
 
 var (
@@ -183,6 +184,18 @@ type StepConfirmMsg struct {
 	Request StepConfirmRequest
 }
 
+// ModelPickerRequest represents a pending model selection from the user.
+type ModelPickerRequest struct {
+	Models  []string    // available model names
+	Current string      // currently active model
+	Result  chan string // selected model name ("" on cancel)
+}
+
+// ModelPickerMsg wraps a ModelPickerRequest as a tea.Msg.
+type ModelPickerMsg struct {
+	Request ModelPickerRequest
+}
+
 // EventMsg wraps an agent event as a tea.Msg.
 type EventMsg struct {
 	Event agent.Event
@@ -248,6 +261,11 @@ type Model struct {
 	stepConfirmCh      chan StepConfirmRequest
 	pendingStepConfirm *StepConfirmRequest
 	stepConfirmIdx     int
+
+	// Model picker (interactive model selection)
+	modelPickerCh      chan ModelPickerRequest
+	pendingModelPicker *ModelPickerRequest
+	modelPickerIdx     int
 
 	// Group collapsing — legacy single active group (used by Analyze() in
 	// the planner path and any caller that doesn't set GroupID).
@@ -316,14 +334,18 @@ type Model struct {
 }
 
 func (m *Model) defaultPlaceholder() string {
-	if m.mode == agent.ModePlan {
+	switch m.mode {
+	case agent.ModePlan:
 		return m.locale.Get("placeholder.plan")
+	case agent.ModeChat:
+		return m.locale.Get("placeholder.chat")
+	default:
+		return m.locale.Get("placeholder.edit")
 	}
-	return m.locale.Get("placeholder.edit")
 }
 
 // NewModel creates a new TUI model.
-func NewModel(modelName, version string, contextSize int, taskFn TaskFunc, cancelFn CancelFunc, events chan agent.Event, commands []CommandItem, confirmCh chan ConfirmRequest, planConfirmCh chan PlanConfirmRequest, stepConfirmCh chan StepConfirmRequest, workDir string, mode agent.Mode, think bool, setModeFn SetModeFn, contextFn ContextFunc, lang string, maxHistory int) Model {
+func NewModel(modelName, version string, contextSize int, taskFn TaskFunc, cancelFn CancelFunc, events chan agent.Event, commands []CommandItem, confirmCh chan ConfirmRequest, planConfirmCh chan PlanConfirmRequest, stepConfirmCh chan StepConfirmRequest, modelPickerCh chan ModelPickerRequest, workDir string, mode agent.Mode, think bool, setModeFn SetModeFn, contextFn ContextFunc, lang string, maxHistory int) Model {
 	locale := NewLocale(lang)
 	ti := textarea.New()
 	if mode == agent.ModePlan {
@@ -369,6 +391,7 @@ func NewModel(modelName, version string, contextSize int, taskFn TaskFunc, cance
 		confirmCh:     confirmCh,
 		planConfirmCh: planConfirmCh,
 		stepConfirmCh: stepConfirmCh,
+		modelPickerCh: modelPickerCh,
 		workDir:       workDir,
 		historyIdx:    -1,
 		inputHistory:  history,
@@ -400,6 +423,9 @@ func (m Model) Init() tea.Cmd {
 	}
 	if m.stepConfirmCh != nil {
 		cmds = append(cmds, m.waitForStepConfirm())
+	}
+	if m.modelPickerCh != nil {
+		cmds = append(cmds, m.waitForModelPicker())
 	}
 	return tea.Batch(cmds...)
 }
@@ -460,6 +486,16 @@ func (m Model) waitForPlanConfirm() tea.Cmd {
 			return nil
 		}
 		return PlanConfirmMsg{Request: req}
+	}
+}
+
+func (m Model) waitForModelPicker() tea.Cmd {
+	return func() tea.Msg {
+		req, ok := <-m.modelPickerCh
+		if !ok {
+			return nil
+		}
+		return ModelPickerMsg{Request: req}
 	}
 }
 
@@ -549,6 +585,37 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmds...)
 
 	case tea.KeyMsg:
+		// Handle model picker
+		if m.pendingModelPicker != nil {
+			if msg.Type == tea.KeyCtrlC {
+				return m, tea.Quit
+			}
+			switch msg.Type {
+			case tea.KeyUp:
+				if m.modelPickerIdx > 0 {
+					m.modelPickerIdx--
+				}
+				return m, nil
+			case tea.KeyDown:
+				if m.modelPickerIdx < len(m.pendingModelPicker.Models)-1 {
+					m.modelPickerIdx++
+				}
+				return m, nil
+			case tea.KeyEnter:
+				selected := m.pendingModelPicker.Models[m.modelPickerIdx]
+				m.pendingModelPicker.Result <- selected
+				m.pendingModelPicker = nil
+				m.recalcViewport()
+				return m, m.waitForModelPicker()
+			case tea.KeyEsc:
+				m.pendingModelPicker.Result <- ""
+				m.pendingModelPicker = nil
+				m.recalcViewport()
+				return m, m.waitForModelPicker()
+			}
+			return m, nil
+		}
+
 		// Handle confirmation prompt
 		if m.pendingConfirm != nil {
 			if msg.Type == tea.KeyCtrlC {
@@ -767,23 +834,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		switch msg.Type {
 		case tea.KeyShiftTab:
-			wasPlan := m.mode == agent.ModePlan
-			if wasPlan {
+			switch m.mode {
+			case agent.ModePlan:
 				m.mode = agent.ModeEdit
 				m.think = false
 				m.textinput.Placeholder = m.locale.Get("placeholder.edit")
-			} else {
+				m.addLog(systemStyle.Render(m.locale.Get("status.switched_edit")))
+			case agent.ModeEdit:
+				m.mode = agent.ModeChat
+				m.think = true
+				m.textinput.Placeholder = m.locale.Get("placeholder.chat")
+				m.addLog(systemStyle.Render(m.locale.Get("status.switched_chat")))
+			case agent.ModeChat:
 				m.mode = agent.ModePlan
 				m.think = true
 				m.textinput.Placeholder = m.locale.Get("placeholder.plan")
+				m.addLog(systemStyle.Render(m.locale.Get("status.switched_plan")))
 			}
 			if m.setModeFn != nil {
 				m.setModeFn(m.mode, m.think)
-			}
-			if wasPlan {
-				m.addLog(systemStyle.Render(m.locale.Get("status.switched_edit")))
-			} else {
-				m.addLog(systemStyle.Render(m.locale.Get("status.switched_plan")))
 			}
 			return m, nil
 		case tea.KeyF2:
@@ -1105,11 +1174,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.contextTotal = e.ContextTotal
 			}
 		case agent.EventModeChange:
-			if e.Message == "edit" {
+			switch e.Message {
+			case "edit":
 				m.mode = agent.ModeEdit
-			} else {
+			case agent.ModeChat.String():
+				m.mode = agent.ModeChat
+			default:
 				m.mode = agent.ModePlan
 			}
+		case agent.EventModelChange:
+			m.model = e.Message
+			m.rebuildHeader()
 		case agent.EventPhase:
 			m.phase = e.Message
 			label := strings.ToUpper(e.Message)
@@ -1185,6 +1260,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.addLog("")
 		m.recalcViewport()
 		return m, nil
+
+	case ModelPickerMsg:
+		m.pendingModelPicker = &msg.Request
+		m.modelPickerIdx = 0
+		for i, name := range msg.Request.Models {
+			if name == msg.Request.Current {
+				m.modelPickerIdx = i
+				break
+			}
+		}
+		m.recalcViewport()
+		return m, nil
 	}
 
 	var cmd tea.Cmd
@@ -1246,6 +1333,8 @@ func (m *Model) updateComplete() {
 func (m *Model) viewportHeight() int {
 	var inputH int
 	switch {
+	case m.pendingModelPicker != nil:
+		inputH = min(len(m.pendingModelPicker.Models), maxVisibleItems) + menuPadding
 	case m.pendingStepConfirm != nil:
 		inputH = len(stepConfirmMenuOptions) + menuPadding
 	case m.pendingPlanConfirm != nil && m.planConfirmSt == confirmChoose:
@@ -1663,6 +1752,8 @@ func (m Model) View() string {
 
 	var inputLine string
 	switch {
+	case m.pendingModelPicker != nil:
+		inputLine = m.renderModelPicker()
 	case m.pendingStepConfirm != nil:
 		inputLine = m.renderStepConfirmMenu()
 	case m.pendingPlanConfirm != nil && m.planConfirmSt == confirmChoose:
@@ -1745,9 +1836,13 @@ func (m Model) renderToolbar() string {
 
 	modeLabel := m.locale.Get("label.edit_mode")
 	modeColor := lipgloss.Color("2") // green for edit
-	if m.mode == agent.ModePlan {
+	switch m.mode {
+	case agent.ModePlan:
 		modeLabel = m.locale.Get("label.plan_mode")
 		modeColor = lipgloss.Color("0") // black for plan
+	case agent.ModeChat:
+		modeLabel = m.locale.Get("label.chat_mode")
+		modeColor = lipgloss.Color("4") // blue for chat
 	}
 	modePart := lipgloss.NewStyle().Bold(true).Foreground(modeColor).Render(
 		strings.ToUpper(modeLabel),
@@ -1776,15 +1871,18 @@ func (m Model) renderToolbar() string {
 
 func (m Model) renderComplete() string {
 	visible := m.filtered
+	offset := 0
 	if len(visible) > maxVisibleItems {
-		visible = visible[:maxVisibleItems]
+		offset = max(0, m.selectedIdx-maxVisibleItems+1)
+		offset = min(offset, len(visible)-maxVisibleItems)
+		visible = visible[offset : offset+maxVisibleItems]
 	}
 
 	lines := make([]string, 0, len(visible))
 	for i, item := range visible {
 		name := fmt.Sprintf("/%s", item.Name)
 		line := fmt.Sprintf("  %-16s %s", name, item.Description)
-		if i == m.selectedIdx {
+		if i+offset == m.selectedIdx {
 			line = completeSelected.Render(line)
 		} else {
 			line = completeNormal.Render(line)
@@ -1896,6 +1994,42 @@ func (m Model) renderStepConfirmMenu() string {
 		}
 	}
 	lines = append(lines, "", confirmHintStyle.Render(m.locale.Get("step_confirm.hint")))
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) renderModelPicker() string {
+	models := m.pendingModelPicker.Models
+	current := m.pendingModelPicker.Current
+
+	// Scrollable window around selected index
+	start := 0
+	if len(models) > maxVisibleItems {
+		start = m.modelPickerIdx - maxVisibleItems/pickerScrollHalf
+		if start < 0 {
+			start = 0
+		}
+		if start+maxVisibleItems > len(models) {
+			start = len(models) - maxVisibleItems
+		}
+	}
+	end := start + min(len(models), maxVisibleItems)
+
+	var lines []string
+	lines = append(lines, confirmHeaderStyle.Render("Select model:"))
+	for i := start; i < end; i++ {
+		name := models[i]
+		marker := "  "
+		if name == current {
+			marker = "* "
+		}
+		label := marker + name
+		if i == m.modelPickerIdx {
+			lines = append(lines, confirmSelected.Render("> "+label))
+		} else {
+			lines = append(lines, confirmNormal.Render("  "+label))
+		}
+	}
+	lines = append(lines, "", confirmHintStyle.Render("↑/↓ navigate · Enter select · Esc cancel"))
 	return strings.Join(lines, "\n")
 }
 
