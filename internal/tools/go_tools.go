@@ -13,6 +13,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os/exec"
 	"strings"
 	"time"
@@ -47,7 +48,7 @@ func (t *goTool) Execute(ctx context.Context, params map[string]any) (*ToolResul
 	}
 
 	if flags, ok := params["flags"].(string); ok && flags != "" {
-		for _, f := range strings.Fields(flags) {
+		for f := range strings.FieldsSeq(flags) {
 			if isForbiddenFlag(f) {
 				return nil, &ToolError{Msg: fmt.Sprintf("flag %q is not allowed", f)}
 			}
@@ -135,9 +136,7 @@ func goToolSchema(extraProps map[string]llm.JSONSchema) llm.JSONSchema {
 		"packages": {Type: "string", Description: "Go packages (default: ./...)"},
 		"flags":    {Type: "string", Description: "Additional flags"},
 	}
-	for k, v := range extraProps {
-		props[k] = v
-	}
+	maps.Copy(props, extraProps)
 	return llm.JSONSchema{
 		Type:       "object",
 		Properties: props,
@@ -148,7 +147,7 @@ func goToolSchema(extraProps map[string]llm.JSONSchema) llm.JSONSchema {
 func NewGoBuildTool(workDir string) *goTool {
 	return &goTool{
 		workDir:     workDir,
-		name:        "go_build",
+		name:        NameGoBuild,
 		description: "Run go build",
 		command:     "go",
 		defaultArgs: []string{"build", "-o", ".build"},
@@ -160,7 +159,7 @@ func NewGoBuildTool(workDir string) *goTool {
 func NewGoTestTool(workDir string) *goTool {
 	return &goTool{
 		workDir:     workDir,
-		name:        "go_test",
+		name:        NameGoTest,
 		description: "Run go test",
 		command:     "go",
 		defaultArgs: []string{"test"},
@@ -174,7 +173,7 @@ func NewGoTestTool(workDir string) *goTool {
 func NewGoVetTool(workDir string) *goTool {
 	return &goTool{
 		workDir:     workDir,
-		name:        "go_vet",
+		name:        NameGoVet,
 		description: "Run go vet",
 		command:     "go",
 		defaultArgs: []string{"vet"},
@@ -186,7 +185,7 @@ func NewGoVetTool(workDir string) *goTool {
 func NewGoFmtTool(workDir string) *goTool {
 	return &goTool{
 		workDir:     workDir,
-		name:        "go_fmt",
+		name:        NameGoFmt,
 		description: "Run gofmt -w on files",
 		command:     "gofmt",
 		defaultArgs: []string{"-w"},
@@ -203,7 +202,7 @@ func NewGoFmtTool(workDir string) *goTool {
 func NewGoLintTool(workDir string) *goTool {
 	return &goTool{
 		workDir:     workDir,
-		name:        "go_lint",
+		name:        NameGoLint,
 		description: "Run golangci-lint",
 		command:     "golangci-lint",
 		defaultArgs: []string{"run"},
@@ -217,7 +216,7 @@ func NewGoLintTool(workDir string) *goTool {
 func NewGoModTidyTool(workDir string) *goTool {
 	return &goTool{
 		workDir:     workDir,
-		name:        "go_mod_tidy",
+		name:        NameGoModTidy,
 		description: "Run go mod tidy",
 		command:     "go",
 		defaultArgs: []string{"mod", "tidy"},
@@ -232,7 +231,7 @@ func NewGoModTidyTool(workDir string) *goTool {
 func NewGoGetTool(workDir string) *goTool {
 	return &goTool{
 		workDir:     workDir,
-		name:        "go_get",
+		name:        NameGoGet,
 		description: "Run go get to add or update a dependency",
 		command:     "go",
 		defaultArgs: []string{"get"},
@@ -261,6 +260,10 @@ type goDocTool struct {
 	indexer GoDocIndexer // nil when RAG is disabled
 }
 
+// IsReadOnly marks go_doc as a read-only tool. The wrapped goTool is generic
+// and cannot make this assertion on its own, so we override here.
+func (t *goDocTool) IsReadOnly() bool { return true }
+
 // godocSearchTopK is the default number of results for godoc semantic search.
 const godocSearchTopK = 5
 
@@ -271,7 +274,7 @@ func NewGoDocTool(workDir string, indexer GoDocIndexer) *goDocTool {
 	return &goDocTool{
 		goTool: goTool{
 			workDir:     workDir,
-			name:        "go_doc",
+			name:        NameGoDoc,
 			description: "Run go doc to view/index package documentation, or search previously indexed Go docs by query",
 			command:     "go",
 			defaultArgs: []string{"doc"},

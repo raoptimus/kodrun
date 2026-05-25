@@ -47,21 +47,25 @@ func TestPlanFromMarkdown_NoFiles(t *testing.T) {
 
 func TestPathAllowed_NilWhitelistAllowsEverything(t *testing.T) {
 	a := &Agent{}
-	if !a.pathAllowed("anything.go") {
+	a.exec = newToolExecutor(nil, NewPermissionManager(), "")
+	a.exec.attach(a)
+	if !a.exec.pathAllowed("anything.go") {
 		t.Fatal("nil whitelist should allow all paths")
 	}
 }
 
 func TestPathAllowed_RespectsWhitelist(t *testing.T) {
 	a := &Agent{}
+	a.exec = newToolExecutor(nil, NewPermissionManager(), "")
+	a.exec.attach(a)
 	a.SetAllowedReadPaths([]string{"internal/agent/agent.go", "config.go"})
-	if !a.pathAllowed("internal/agent/agent.go") {
+	if !a.exec.pathAllowed("internal/agent/agent.go") {
 		t.Error("expected exact path to be allowed")
 	}
-	if !a.pathAllowed("config.go") {
+	if !a.exec.pathAllowed("config.go") {
 		t.Error("expected basename match to be allowed")
 	}
-	if a.pathAllowed("internal/secret/keys.go") {
+	if a.exec.pathAllowed("internal/secret/keys.go") {
 		t.Error("expected non-whitelisted path to be denied")
 	}
 }

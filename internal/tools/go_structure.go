@@ -29,7 +29,8 @@ type goStructureTool struct {
 	workDir string
 }
 
-func (t *goStructureTool) Name() string { return "go_structure" }
+func (t *goStructureTool) Name() string     { return NameGoStructure }
+func (t *goStructureTool) IsReadOnly() bool { return true }
 func (t *goStructureTool) Description() string {
 	return "Show Go file/package structure: types (with fields), interfaces, functions, constants, variables — with line numbers. Like go doc but for any .go file."
 }
@@ -446,7 +447,7 @@ func (t *goStructureTool) CachePolicy() CachePolicy {
 
 // ResolvePaths implements PathResolver. It resolves the path parameter
 // to an absolute filesystem path for mtime-based cache invalidation.
-func (t *goStructureTool) ResolvePaths(params map[string]any) []string {
+func (t *goStructureTool) ResolvePaths(_ context.Context, params map[string]any) []string {
 	p := stringParam(params, "path")
 	if p == "" {
 		return nil

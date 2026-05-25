@@ -20,7 +20,7 @@ import (
 	"github.com/raoptimus/kodrun/internal/llm"
 )
 
-const extBash = "bash"
+const extBash = NameBash
 
 // FileStatTool returns file metadata without reading its contents.
 type FileStatTool struct {
@@ -33,10 +33,11 @@ func NewFileStatTool(workDir string, forbiddenPatterns []string) *FileStatTool {
 	return &FileStatTool{workDir: workDir, forbiddenPatterns: forbiddenPatterns}
 }
 
-func (t *FileStatTool) Name() string { return "file_stat" }
+func (t *FileStatTool) Name() string { return NameFileStat }
 func (t *FileStatTool) Description() string {
 	return "Get file metadata (size, lines, modified date) without reading contents"
 }
+func (t *FileStatTool) IsReadOnly() bool { return true }
 
 func (t *FileStatTool) Schema() llm.JSONSchema {
 	return llm.JSONSchema{
@@ -114,12 +115,12 @@ func (t *FileStatTool) CachePolicy() CachePolicy {
 }
 
 // ResolvePaths returns the absolute filesystem path the call depends on.
-func (t *FileStatTool) ResolvePaths(params map[string]any) []string {
+func (t *FileStatTool) ResolvePaths(ctx context.Context, params map[string]any) []string {
 	path := stringParam(params, "path")
 	if path == "" {
 		return nil
 	}
-	resolved, err := SafePath(context.TODO(), t.workDir, path)
+	resolved, err := SafePath(ctx, t.workDir, path)
 	if err != nil {
 		return nil
 	}

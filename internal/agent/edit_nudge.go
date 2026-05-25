@@ -31,8 +31,9 @@ const (
 
 // maxEditNudges caps how many times a single Send() invocation will nudge
 // the model back into tool-calling mode when it answers EDIT requests with
-// prose. Prevents loops on models that refuse to call tools.
-const maxEditNudges = 2
+// prose. Each nudge uses a progressively stronger message (see
+// editNudgeMessage). Prevents loops on models that refuse to call tools.
+const maxEditNudges = 3
 
 // maxPlanToolNudges caps how many times a single Send() invocation will
 // nudge the model to call tools when it returns NO_ISSUES in plan mode
@@ -195,11 +196,44 @@ func ExtractDiffFromText(content string) string {
 // editDiffMaxLines limits the number of diff lines shown for text-form tool calls.
 const editDiffMaxLines = 30
 
+// editNudgeMessage returns an escalating nudge message for the given attempt.
+// nudgeNum is 1-based (1 = first nudge). hasReadFiles indicates whether the
+// model has already called read_file during this Send() invocation, which
+// means it should not re-read — it should edit.
+// editNudgeLevel enumerates escalation levels for EDIT-mode nudges.
+const (
+	editNudgeLevel1 = 1 // gentle reminder
+	editNudgeLevel2 = 2 // forceful, context-aware
+)
+
+func editNudgeMessage(nudgeNum int, hasReadFiles bool) string {
+	switch nudgeNum {
+	case editNudgeLevel1:
+		return "Stop. You are in EDIT mode. Do NOT describe the changes — apply them now " +
+			"via write_file/edit_file/bash. Begin with the FIRST change only. " +
+			"Do not explain. Do not output another plan."
+	case editNudgeLevel2:
+		if hasReadFiles {
+			return "You have already read the files. Do NOT read them again. " +
+				"Call edit_file RIGHT NOW for the first fix. Produce exactly ONE edit_file call " +
+				"with path, old_str, and new_str. No text. No plan. Just the tool call."
+		}
+		return "CRITICAL: You are STILL outputting text instead of calling tools. " +
+			"Call edit_file with path, old_str, new_str for a SINGLE change. " +
+			"Do not describe anything. Do not output a plan. Just ONE tool call."
+	default:
+		return "LAST CHANCE. You MUST call edit_file or write_file RIGHT NOW. " +
+			"Pick exactly ONE thing to fix and call edit_file(path, old_str, new_str). " +
+			"If you cannot use edit_file — call bash to apply a patch. " +
+			"Any text response without a tool call will be discarded."
+	}
+}
+
 // looksLikeMarkdownPlan reports whether content is shaped like a markdown
 // plan/analysis the model produced instead of calling tools. The intent is
 // to catch the EDIT-mode failure mode where the model lists steps it would
-// take instead of taking them. False positives are acceptable (we just
-// nudge — at most twice — and on the second time fall back to normal exit).
+// take instead of taking them. False positives are acceptable (we nudge
+// up to maxEditNudges times with escalating messages before giving up).
 //
 // Heuristic, in order of weight:
 //  1. Empty/short content → not a plan (a real answer to a question is fine).

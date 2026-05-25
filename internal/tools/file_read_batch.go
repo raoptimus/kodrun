@@ -78,7 +78,8 @@ func NewReadChangedFilesTool(workDir string, langState *projectlang.State) *Read
 	return &ReadChangedFilesTool{workDir: workDir, langState: langState}
 }
 
-func (t *ReadChangedFilesTool) Name() string { return "read_changed_files" }
+func (t *ReadChangedFilesTool) Name() string     { return NameReadChangedFiles }
+func (t *ReadChangedFilesTool) IsReadOnly() bool { return true }
 func (t *ReadChangedFilesTool) Description() string {
 	return "Read diff with context for all git-changed source code files. " +
 		"Returns unified diff with surrounding context lines. " +

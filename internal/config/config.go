@@ -236,8 +236,9 @@ type RAGConfig struct {
 
 // MuninnConfig holds Muninn DB connection settings.
 type MuninnConfig struct {
-	URL   string `mapstructure:"url"`
-	Vault string `mapstructure:"vault"`
+	URL    string `mapstructure:"url"`
+	Vault  string `mapstructure:"vault"`
+	APIKey string `mapstructure:"api_key"`
 }
 
 // Default configuration values.

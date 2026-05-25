@@ -112,7 +112,7 @@ func TestWriteFileTool_ResolvePaths_Successfully(t *testing.T) {
 	dir := t.TempDir()
 	tool := NewWriteFileTool(dir, nil)
 
-	paths := tool.ResolvePaths(map[string]any{"path": "f.go"})
+	paths := tool.ResolvePaths(context.Background(), map[string]any{"path": "f.go"})
 
 	require.Len(t, paths, 1)
 	assert.Equal(t, filepath.Join(dir, "f.go"), paths[0])
@@ -121,7 +121,7 @@ func TestWriteFileTool_ResolvePaths_Successfully(t *testing.T) {
 func TestWriteFileTool_ResolvePaths_EmptyPath_Successfully(t *testing.T) {
 	tool := NewWriteFileTool(t.TempDir(), nil)
 
-	paths := tool.ResolvePaths(map[string]any{})
+	paths := tool.ResolvePaths(context.Background(), map[string]any{})
 
 	assert.Nil(t, paths)
 }

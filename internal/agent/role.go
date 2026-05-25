@@ -29,6 +29,7 @@ const (
 	RoleReviewer           Role = "reviewer"
 	RoleExtractor          Role = "extractor"
 	RoleStructurer         Role = "structurer"
+	RoleVerifier           Role = "verifier"
 	RoleResponseClassifier Role = "response_classifier"
 
 	// Code review roles. The orchestrator pre-loads all context (file content,
@@ -59,6 +60,8 @@ func taskLabelForRole(role Role) string {
 		return "Reviewing file..."
 	case RoleArchReviewer:
 		return "Reviewing architecture..."
+	case RoleVerifier:
+		return "Verifying plan completion..."
 	}
 	return "Processing task..."
 }
@@ -284,6 +287,48 @@ func systemPromptForRole(role Role, lang, progLang, ruleCatalog string, toolName
 		b.WriteString("- `examples` is an optional array. Include when the original plan has EXAMPLE: lines. Each example points to existing code demonstrating the correct pattern. Do not fabricate examples.\n")
 		b.WriteString("- Preserve the order and intent of the original plan exactly. Do not invent new work.\n")
 		b.WriteString("- Output ONLY the JSON object. No comments, no markdown, no trailing text.\n")
+		b.WriteString("- The plan may contain a \"## Verification\" or \"## Post-execution verification\" section with shell commands (e.g. `make build`). Do NOT convert these into steps — they are post-execution checks handled by the verifier, not executor tasks.\n")
+
+	case RoleVerifier:
+		ltc := langToolsForLang(progLang)
+		b.WriteString("You are the VERIFIER agent.\n")
+		b.WriteString("Your job is to check whether an approved plan was FULLY and CORRECTLY implemented.\n\n")
+		b.WriteString("You receive:\n")
+		b.WriteString("1. The ORIGINAL TASK that was requested\n")
+		b.WriteString("2. The APPROVED PLAN with numbered steps\n")
+		b.WriteString("3. The EXECUTION STATS (files changed, lines added/removed)\n\n")
+		b.WriteString("CRITICAL WORKFLOW:\n")
+		b.WriteString("- The source code is PROVIDED in the task. Do NOT call read_file, list_dir, find_files, or grep.\n")
+		b.WriteString("- For each step in the approved plan, check the provided source code\n")
+		b.WriteString("- Check whether the change described in the step was actually applied\n")
+		b.WriteString("- Check whether the change was applied correctly (not just present, but correct)\n")
+		b.WriteString("- If the plan included verification steps (build, lint, test) that FAILED during execution, flag them as incomplete\n\n")
+		b.WriteString("OUTPUT FORMAT:\n")
+		b.WriteString("- If ALL steps were implemented correctly, respond with exactly: VERIFIED\n")
+		b.WriteString("- If any steps are missing or incorrect, output ONLY the incomplete/incorrect items as a numbered plan:\n")
+		b.WriteString("  N. <what is missing or wrong>\n")
+		b.WriteString("     file: <path>\n")
+		b.WriteString("     context: <all details needed to fix it>\n")
+		b.WriteString("     rationale: <what the plan said vs what was actually done>\n\n")
+		b.WriteString("STRICT RULES:\n")
+		b.WriteString("- Do NOT invent new work. Only flag items that were in the approved plan but not implemented.\n")
+		b.WriteString("- Do NOT flag style issues, improvements, or optimizations not in the plan.\n")
+		b.WriteString("- Do NOT flag items that were completed correctly.\n")
+		b.WriteString("- Be concise and actionable.\n")
+		if ltc.buildTool != "" {
+			fmt.Fprintf(&b, "- ALWAYS run %s to verify compilation. If it fails, flag the build as incomplete — do NOT try to fix it yourself.\n", ltc.buildTool)
+		}
+		fmt.Fprintf(&b, "- Always respond in %s\n", langName(lang))
+		if ragEnabled {
+			b.WriteString("\nIMPORTANT — Project rules and conventions (from RAG):\n")
+			fmt.Fprintf(&b, "The task context includes MANDATORY RULES marked [MANDATORY PROJECT RULES] and %s marked [%s].\n", ltc.standardsLabel, ltc.standardsLabel)
+			b.WriteString("Check that implemented code follows these rules. Flag violations only if the plan required compliance.\n")
+			b.WriteString("You may call search_docs for additional targeted searches if needed.\n")
+		} else if snippetsEnabled {
+			b.WriteString("\nIMPORTANT — Code conventions check:\n")
+			b.WriteString("Call snippets(paths=[<list of changed files>]) to get the project's code conventions.\n")
+			b.WriteString("Check that implemented code follows these conventions. Flag violations only if the plan required compliance.\n")
+		}
 
 	case RoleCodeReviewer:
 		b.WriteString(codeReviewerPrompt(lang))

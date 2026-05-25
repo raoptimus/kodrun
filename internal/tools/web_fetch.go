@@ -54,7 +54,8 @@ func NewWebFetchTool(indexer WebIndexer, topK int) *WebFetchTool {
 	return &WebFetchTool{indexer: indexer, topK: topK}
 }
 
-func (t *WebFetchTool) Name() string { return "web_fetch" }
+func (t *WebFetchTool) Name() string     { return NameWebFetch }
+func (t *WebFetchTool) IsReadOnly() bool { return true }
 
 func (t *WebFetchTool) Description() string {
 	return "Fetch a web page, convert HTML to markdown, and return relevant content. " +

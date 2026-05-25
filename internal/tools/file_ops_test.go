@@ -154,7 +154,7 @@ func TestDeleteFileTool_ResolvePaths_Successfully(t *testing.T) {
 
 	tool := NewDeleteFileTool(dir, nil)
 
-	paths := tool.ResolvePaths(map[string]any{"path": "f.txt"})
+	paths := tool.ResolvePaths(context.Background(), map[string]any{"path": "f.txt"})
 
 	require.Len(t, paths, 1)
 	assert.Equal(t, filepath.Join(dir, "f.txt"), paths[0])
@@ -163,7 +163,7 @@ func TestDeleteFileTool_ResolvePaths_Successfully(t *testing.T) {
 func TestDeleteFileTool_ResolvePaths_EmptyPath_Successfully(t *testing.T) {
 	tool := NewDeleteFileTool(t.TempDir(), nil)
 
-	paths := tool.ResolvePaths(map[string]any{})
+	paths := tool.ResolvePaths(context.Background(), map[string]any{})
 
 	assert.Nil(t, paths)
 }
@@ -240,7 +240,7 @@ func TestMoveFileTool_ResolvePaths_BothPaths_Successfully(t *testing.T) {
 
 	tool := NewMoveFileTool(dir, nil)
 
-	paths := tool.ResolvePaths(map[string]any{"from": "a.txt", "to": "b.txt"})
+	paths := tool.ResolvePaths(context.Background(), map[string]any{"from": "a.txt", "to": "b.txt"})
 
 	require.Len(t, paths, 2)
 	assert.Equal(t, filepath.Join(dir, "a.txt"), paths[0])
@@ -250,7 +250,7 @@ func TestMoveFileTool_ResolvePaths_BothPaths_Successfully(t *testing.T) {
 func TestMoveFileTool_ResolvePaths_EmptyPaths_Successfully(t *testing.T) {
 	tool := NewMoveFileTool(t.TempDir(), nil)
 
-	paths := tool.ResolvePaths(map[string]any{})
+	paths := tool.ResolvePaths(context.Background(), map[string]any{})
 
 	assert.Empty(t, paths)
 }

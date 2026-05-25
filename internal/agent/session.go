@@ -12,6 +12,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -120,7 +121,8 @@ func ListSessions(sessionsDir string) ([]*SessionSummary, error) {
 		id := strings.TrimSuffix(entry.Name(), ".json")
 		s, err := LoadSession(sessionsDir, id)
 		if err != nil {
-			continue // skip corrupt files
+			slog.Warn("kodrun: skipping unreadable session", "id", id, "error", err)
+			continue
 		}
 
 		summaries = append(summaries, &SessionSummary{

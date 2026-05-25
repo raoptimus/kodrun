@@ -68,8 +68,8 @@ func TestNewOrchestrator(t *testing.T) {
 	if orch == nil {
 		t.Fatal("NewOrchestrator returned nil")
 	}
-	if orch.model != "test-model" {
-		t.Errorf("model: got %q", orch.model)
+	if got := orch.profileFor(RolePlanner).Model; got != "test-model" {
+		t.Errorf("planner model: got %q", got)
 	}
 	if orch.review {
 		t.Error("review should be false by default")
@@ -90,6 +90,7 @@ func TestOrchestrator_NewAgent_Roles(t *testing.T) {
 		{RolePlanner, ModePlan, true},
 		{RoleExecutor, ModeEdit, false},
 		{RoleReviewer, ModePlan, true},
+		{RoleVerifier, ModePlan, true},
 	}
 
 	for _, tt := range tests {

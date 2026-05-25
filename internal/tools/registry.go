@@ -11,6 +11,7 @@ package tools
 import (
 	"context"
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 	"sync"
@@ -24,6 +25,14 @@ type Tool interface {
 	Description() string
 	Schema() llm.JSONSchema
 	Execute(ctx context.Context, params map[string]any) (*ToolResult, error)
+}
+
+// ReadOnlyMarker is implemented by tools that do not modify the filesystem,
+// shell state, or external systems. Tools that implement this interface and
+// return true are exposed to plan/chat/verifier modes; absent or false means
+// the tool is treated as a write tool.
+type ReadOnlyMarker interface {
+	IsReadOnly() bool
 }
 
 // ToolResult represents the successful outcome of a tool execution.
@@ -127,7 +136,7 @@ func (r *Registry) Execute(ctx context.Context, name string, params map[string]a
 			if policy.Cacheable {
 				cacheable = true
 				cacheKey = buildCacheKey(name, policy, params)
-				resolvedPaths = resolveParamPaths(t, policy, params)
+				resolvedPaths = resolveParamPaths(ctx, t, policy, params)
 				if hit, found := cache.Get(cacheKey); found {
 					return &ToolResult{
 						Output: hit.Output,
@@ -148,7 +157,7 @@ func (r *Registry) Execute(ctx context.Context, name string, params map[string]a
 	// Write-tool invalidation: if this tool is referenced as an invalidator by
 	// any cached read-tool, drop entries depending on the affected paths.
 	if cache != nil && len(invalidates) > 0 && err == nil {
-		for _, p := range writeToolPaths(t, params) {
+		for _, p := range writeToolPaths(ctx, t, params) {
 			cache.InvalidatePath(p)
 		}
 	}
@@ -178,10 +187,11 @@ func buildCacheKey(name string, policy CachePolicy, params map[string]any) strin
 
 // resolveParamPaths returns absolute filesystem paths for all PathParams of a
 // cacheable tool. Tools that need custom resolution can implement
-// PathResolver.
-func resolveParamPaths(t Tool, policy CachePolicy, params map[string]any) []string {
+// PathResolver. Passing ctx lets symlink/walk-heavy resolvers honour
+// cancellation when the parent Execute context is cancelled.
+func resolveParamPaths(ctx context.Context, t Tool, policy CachePolicy, params map[string]any) []string {
 	if pr, ok := t.(PathResolver); ok {
-		return pr.ResolvePaths(params)
+		return pr.ResolvePaths(ctx, params)
 	}
 	// Best-effort: extract string params named in PathParams. Without a
 	// workdir resolver here, we trust that tools storing in CachePolicy provide
@@ -198,9 +208,9 @@ func resolveParamPaths(t Tool, policy CachePolicy, params map[string]any) []stri
 // writeToolPaths returns the absolute filesystem paths a write-tool will
 // affect. Write tools should implement PathResolver to participate in
 // invalidation; otherwise this falls back to common params.
-func writeToolPaths(t Tool, params map[string]any) []string {
+func writeToolPaths(ctx context.Context, t Tool, params map[string]any) []string {
 	if pr, ok := t.(PathResolver); ok {
-		return pr.ResolvePaths(params)
+		return pr.ResolvePaths(ctx, params)
 	}
 	if s, ok := params["path"].(string); ok && s != "" {
 		return []string{s}
@@ -212,9 +222,7 @@ func writeToolPaths(t Tool, params map[string]any) []string {
 // to true. A new map is always returned to avoid mutating the cached entry.
 func cloneMetaWithCacheHit(meta map[string]any) map[string]any {
 	out := make(map[string]any, len(meta)+1)
-	for k, v := range meta {
-		out[k] = v
-	}
+	maps.Copy(out, meta)
 	out["cache_hit"] = true
 	return out
 }
@@ -226,7 +234,7 @@ func cloneMetaWithCacheHit(meta map[string]any) map[string]any {
 // Implementations should return absolute paths after applying any workdir
 // resolution they perform internally.
 type PathResolver interface {
-	ResolvePaths(params map[string]any) []string
+	ResolvePaths(ctx context.Context, params map[string]any) []string
 }
 
 // ToolDefs returns Ollama tool definitions for all registered tools.
@@ -277,6 +285,25 @@ func (r *Registry) ToolDefsFiltered(allowed map[string]bool) []llm.ToolDef {
 		}
 	}
 	return defs
+}
+
+// ReadOnlyTools returns the set of registered tool names that report
+// IsReadOnly() == true. Tools that do not implement ReadOnlyMarker are
+// considered write tools and excluded. Returns an empty map when the
+// registry is nil so callers in unit tests don't have to special-case it.
+func (r *Registry) ReadOnlyTools() map[string]bool {
+	if r == nil {
+		return map[string]bool{}
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make(map[string]bool, len(r.tools))
+	for name, t := range r.tools {
+		if m, ok := t.(ReadOnlyMarker); ok && m.IsReadOnly() {
+			out[name] = true
+		}
+	}
+	return out
 }
 
 // NamesFiltered returns tool names that are in the allowed set.

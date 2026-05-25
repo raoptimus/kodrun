@@ -65,7 +65,8 @@ func (t *SnippetTool) SetTechStack(stack []string) {
 	t.techStack = stack
 }
 
-func (t *SnippetTool) Name() string { return "snippets" }
+func (t *SnippetTool) Name() string     { return NameSnippets }
+func (t *SnippetTool) IsReadOnly() bool { return true }
 func (t *SnippetTool) Description() string {
 	return "MUST call before writing, modifying, or reviewing code — returns code template snippets. " +
 		"Pass file paths to match against snippet globs. Actions: match (default), list, tags."

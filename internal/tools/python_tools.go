@@ -96,30 +96,30 @@ func pythonToolSchema(argsDesc string) llm.JSONSchema {
 // RegisterPythonTools registers Python-specific tools.
 func RegisterPythonTools(reg *Registry, workDir string) {
 	reg.Register(&pythonTool{
-		workDir: workDir, name: "python_run",
+		workDir: workDir, name: NamePythonRun,
 		description: "Run a Python script (python <args>)",
 		command:     "python", defaultArgs: nil,
 		schema: pythonToolSchema("Script path and arguments, e.g. main.py --flag"),
 	})
 	reg.Register(&pythonTool{
-		workDir: workDir, name: "pytest",
+		workDir: workDir, name: NamePytest,
 		description: "Run pytest", command: "pytest", defaultArgs: nil,
 		schema: pythonToolSchema("pytest arguments, e.g. -k test_name -q"),
 	})
 	reg.Register(&pythonTool{
-		workDir: workDir, name: "pip_install",
+		workDir: workDir, name: NamePipInstall,
 		description: "Install a Python package via pip",
 		command:     "pip", defaultArgs: []string{"install"},
 		schema: pythonToolSchema("Package(s) to install"),
 	})
 	reg.Register(&pythonTool{
-		workDir: workDir, name: "ruff",
+		workDir: workDir, name: NameRuff,
 		description: "Run ruff linter/formatter",
 		command:     "ruff", defaultArgs: []string{"check"},
 		schema: pythonToolSchema("ruff arguments, e.g. --fix path/"),
 	})
 	reg.Register(&pythonTool{
-		workDir: workDir, name: "black",
+		workDir: workDir, name: NameBlack,
 		description: "Run black formatter",
 		command:     "black", defaultArgs: []string{"."},
 		schema: pythonToolSchema("black arguments"),

@@ -32,8 +32,9 @@ func NewGrepTool(workDir string, forbidden []string) *GrepTool {
 	return &GrepTool{workDir: workDir, forbidden: forbidden}
 }
 
-func (t *GrepTool) Name() string        { return "grep" }
+func (t *GrepTool) Name() string        { return NameGrep }
 func (t *GrepTool) Description() string { return "Search for a regex pattern in files" }
+func (t *GrepTool) IsReadOnly() bool    { return true }
 
 func (t *GrepTool) Schema() llm.JSONSchema {
 	return llm.JSONSchema{

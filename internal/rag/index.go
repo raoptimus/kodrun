@@ -59,12 +59,12 @@ type Index struct {
 	entries []IndexEntry
 	path    string
 	model   string
-	client  llm.Client
+	client  llm.Embedder
 	updated time.Time
 }
 
 // NewIndex creates a new RAG index.
-func NewIndex(client llm.Client, model, indexPath string) *Index {
+func NewIndex(client llm.Embedder, model, indexPath string) *Index {
 	return &Index{
 		client: client,
 		model:  model,
@@ -394,6 +394,21 @@ type SearchResult struct {
 func chunkHash(c Chunk) string {
 	h := sha256.New()
 	fmt.Fprintf(h, "%s:%d:%d:%s", c.FilePath, c.StartLine, c.EndLine, c.Content)
+	return fmt.Sprintf("%x", h.Sum(nil))[:16]
+}
+
+// ChunkSetHash computes an order-independent fingerprint for a chunk set.
+// Used by backends without per-chunk dedup to detect unchanged inputs.
+func ChunkSetHash(chunks []Chunk) string {
+	hashes := make([]string, len(chunks))
+	for i, c := range chunks {
+		hashes[i] = chunkHash(c)
+	}
+	sort.Strings(hashes)
+	h := sha256.New()
+	for _, hash := range hashes {
+		fmt.Fprint(h, hash)
+	}
 	return fmt.Sprintf("%x", h.Sum(nil))[:16]
 }
 

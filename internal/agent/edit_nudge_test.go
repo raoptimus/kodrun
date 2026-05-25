@@ -242,6 +242,61 @@ func TestParseTextToolCall_NoToolCallDetected_ReturnsNil(t *testing.T) {
 	}
 }
 
+func TestEditNudgeMessage(t *testing.T) {
+	tests := []struct {
+		name         string
+		nudgeNum     int
+		hasReadFiles bool
+		wantContains []string
+	}{
+		{
+			name:         "nudge 1 without reads",
+			nudgeNum:     1,
+			hasReadFiles: false,
+			wantContains: []string{"EDIT mode", "FIRST change only"},
+		},
+		{
+			name:         "nudge 1 with reads",
+			nudgeNum:     1,
+			hasReadFiles: true,
+			wantContains: []string{"EDIT mode", "FIRST change only"},
+		},
+		{
+			name:         "nudge 2 without reads",
+			nudgeNum:     2,
+			hasReadFiles: false,
+			wantContains: []string{"CRITICAL", "SINGLE change"},
+		},
+		{
+			name:         "nudge 2 with reads acknowledges files read",
+			nudgeNum:     2,
+			hasReadFiles: true,
+			wantContains: []string{"already read the files", "Do NOT read them again"},
+		},
+		{
+			name:         "nudge 3 is last chance",
+			nudgeNum:     3,
+			hasReadFiles: false,
+			wantContains: []string{"LAST CHANCE", "edit_file", "ONE thing"},
+		},
+		{
+			name:         "nudge 4 falls through to default (last chance)",
+			nudgeNum:     4,
+			hasReadFiles: false,
+			wantContains: []string{"LAST CHANCE"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := editNudgeMessage(tt.nudgeNum, tt.hasReadFiles)
+			for _, want := range tt.wantContains {
+				require.Contains(t, got, want)
+			}
+		})
+	}
+}
+
 func TestExtractDiffFromText_EditFile_Successfully(t *testing.T) {
 	content := "edit_file\npath: internal/app/api/app.go\nold_str: func Run() {\n}\nnew_str: func Run() error {\n    return nil\n}"
 

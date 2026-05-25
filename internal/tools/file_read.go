@@ -35,8 +35,9 @@ func NewReadFileTool(workDir string, forbiddenPatterns []string, maxLines int) *
 	return &ReadFileTool{workDir: workDir, forbiddenPatterns: forbiddenPatterns, maxLines: maxLines}
 }
 
-func (t *ReadFileTool) Name() string        { return "read_file" }
+func (t *ReadFileTool) Name() string        { return NameReadFile }
 func (t *ReadFileTool) Description() string { return "Read the contents of a file" }
+func (t *ReadFileTool) IsReadOnly() bool    { return true }
 
 func (t *ReadFileTool) Schema() llm.JSONSchema {
 	return llm.JSONSchema{
@@ -137,12 +138,12 @@ func (t *ReadFileTool) CachePolicy() CachePolicy {
 }
 
 // ResolvePaths returns the absolute filesystem path the call depends on.
-func (t *ReadFileTool) ResolvePaths(params map[string]any) []string {
+func (t *ReadFileTool) ResolvePaths(ctx context.Context, params map[string]any) []string {
 	path := stringParam(params, "path")
 	if path == "" {
 		return nil
 	}
-	resolved, err := SafePath(context.TODO(), t.workDir, path)
+	resolved, err := SafePath(ctx, t.workDir, path)
 	if err != nil {
 		return nil
 	}

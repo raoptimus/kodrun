@@ -33,7 +33,7 @@ func NewWriteFileTool(workDir string, forbiddenPatterns []string) *WriteFileTool
 	return &WriteFileTool{workDir: workDir, forbiddenPatterns: forbiddenPatterns}
 }
 
-func (t *WriteFileTool) Name() string { return "write_file" }
+func (t *WriteFileTool) Name() string { return NameWriteFile }
 func (t *WriteFileTool) Description() string {
 	return "Write content to a file, creating directories as needed"
 }
@@ -51,12 +51,12 @@ func (t *WriteFileTool) Schema() llm.JSONSchema {
 
 // ResolvePaths returns the absolute path that this write affects, used by the
 // registry to invalidate dependent cache entries.
-func (t *WriteFileTool) ResolvePaths(params map[string]any) []string {
+func (t *WriteFileTool) ResolvePaths(ctx context.Context, params map[string]any) []string {
 	p := stringParam(params, "path")
 	if p == "" {
 		return nil
 	}
-	resolved, err := SafePath(context.TODO(), t.workDir, p)
+	resolved, err := SafePath(ctx, t.workDir, p)
 	if err != nil {
 		return nil
 	}

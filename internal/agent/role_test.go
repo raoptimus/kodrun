@@ -30,6 +30,7 @@ func TestTaskLabelForRole_KnownRoles_Successfully(t *testing.T) {
 		{name: "response_classifier", role: RoleResponseClassifier, want: "Classifying response..."},
 		{name: "code_reviewer", role: RoleCodeReviewer, want: "Reviewing file..."},
 		{name: "arch_reviewer", role: RoleArchReviewer, want: "Reviewing architecture..."},
+		{name: "verifier", role: RoleVerifier, want: "Verifying plan completion..."},
 	}
 
 	for _, tt := range tests {
@@ -62,6 +63,7 @@ func TestSystemPromptForRole_ContainsAssistantIdentity_Successfully(t *testing.T
 		{name: "extractor", role: RoleExtractor},
 		{name: "structurer", role: RoleStructurer},
 		{name: "response_classifier", role: RoleResponseClassifier},
+		{name: "verifier", role: RoleVerifier},
 	}
 
 	for _, tt := range tests {
@@ -171,6 +173,16 @@ func TestSystemPromptForRole_ResponseClassifierContainsSchema_Successfully(t *te
 	assert.Contains(t, got, "RESPONSE CLASSIFIER")
 	assert.Contains(t, got, `"kind"`)
 	assert.Contains(t, got, `"needs_user_action"`)
+}
+
+func TestSystemPromptForRole_VerifierContainsRole_Successfully(t *testing.T) {
+	t.Parallel()
+
+	got := systemPromptForRole(RoleVerifier, "en", "", "", nil)
+
+	assert.Contains(t, got, "You are the VERIFIER agent")
+	assert.Contains(t, got, "VERIFIED")
+	assert.Contains(t, got, "Do NOT invent new work")
 }
 
 func TestReviewChecks_AllCategories_Successfully(t *testing.T) {

@@ -29,8 +29,9 @@ func NewFindFilesTool(workDir string, forbidden []string) *FindFilesTool {
 	return &FindFilesTool{workDir: workDir, forbidden: forbidden}
 }
 
-func (t *FindFilesTool) Name() string        { return "find_files" }
+func (t *FindFilesTool) Name() string        { return NameFindFiles }
 func (t *FindFilesTool) Description() string { return "Find files matching a glob pattern" }
+func (t *FindFilesTool) IsReadOnly() bool    { return true }
 
 func (t *FindFilesTool) Schema() llm.JSONSchema {
 	return llm.JSONSchema{

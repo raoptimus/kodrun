@@ -31,8 +31,9 @@ func NewListDirTool(workDir string, forbidden []string) *ListDirTool {
 	return &ListDirTool{workDir: workDir, forbidden: forbidden}
 }
 
-func (t *ListDirTool) Name() string        { return "list_dir" }
+func (t *ListDirTool) Name() string        { return NameListDir }
 func (t *ListDirTool) Description() string { return "List files and directories in a path" }
+func (t *ListDirTool) IsReadOnly() bool    { return true }
 
 func (t *ListDirTool) Schema() llm.JSONSchema {
 	return llm.JSONSchema{

@@ -9,8 +9,6 @@
 package tools
 
 import (
-	"context"
-
 	"github.com/raoptimus/kodrun/internal/projectlang"
 	"github.com/raoptimus/kodrun/internal/rules"
 	"github.com/raoptimus/kodrun/internal/snippets"
@@ -52,22 +50,35 @@ func RegisterLanguageTools(reg *Registry, lang projectlang.Language, workDir str
 	}
 }
 
-// RegisterAllTools is the legacy facade used at startup. It registers core
-// tools, the language-specific tool set for the given language, and the
+// RegisterConfig groups everything Register needs. Build it once at startup
+// and pass by pointer; this avoids the 13-positional-argument shape that
+// used to break every call site whenever a new dependency was added.
+type RegisterConfig struct {
+	WorkDir        string
+	Forbidden      []string
+	MaxReadLines   int
+	Loader         *rules.Loader
+	SnippetLoader  *snippets.Loader
+	Scope          rules.Scope
+	UseRuleTool    bool
+	UseSnippetTool bool
+	RAGEnabled     bool
+	Lang           projectlang.Language
+	Indexer        GoDocIndexer
+	LangState      *projectlang.State
+}
+
+// Register registers core tools, the language-specific tool set, and the
 // optional rule/snippet tools when RAG is disabled.
-func RegisterAllTools(_ context.Context, reg *Registry, workDir string, forbidden []string,
-	maxReadLines int, loader *rules.Loader, snippetLoader *snippets.Loader, scope rules.Scope,
-	useRuleTool, useSnippetTool, ragEnabled bool, lang projectlang.Language, indexer GoDocIndexer,
-	langState *projectlang.State,
-) {
-	RegisterCoreTools(reg, workDir, forbidden, maxReadLines, langState)
-	RegisterLanguageTools(reg, lang, workDir, indexer)
-	if loader != nil && useRuleTool && !ragEnabled {
-		reg.Register(NewRuleTool(loader, scope))
+func Register(reg *Registry, cfg *RegisterConfig) {
+	RegisterCoreTools(reg, cfg.WorkDir, cfg.Forbidden, cfg.MaxReadLines, cfg.LangState)
+	RegisterLanguageTools(reg, cfg.Lang, cfg.WorkDir, cfg.Indexer)
+	if cfg.Loader != nil && cfg.UseRuleTool && !cfg.RAGEnabled {
+		reg.Register(NewRuleTool(cfg.Loader, cfg.Scope))
 	}
-	if snippetLoader != nil && useSnippetTool && !ragEnabled {
-		st := NewSnippetTool(snippetLoader)
-		st.SetTechStack(langState.EnsureTechDetected().Strings())
+	if cfg.SnippetLoader != nil && cfg.UseSnippetTool && !cfg.RAGEnabled {
+		st := NewSnippetTool(cfg.SnippetLoader)
+		st.SetTechStack(cfg.LangState.EnsureTechDetected().Strings())
 		reg.Register(st)
 	}
 }

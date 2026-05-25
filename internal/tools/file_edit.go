@@ -30,7 +30,7 @@ func NewEditFileTool(workDir string, forbiddenPatterns []string) *EditFileTool {
 	return &EditFileTool{workDir: workDir, forbiddenPatterns: forbiddenPatterns}
 }
 
-func (t *EditFileTool) Name() string        { return "edit_file" }
+func (t *EditFileTool) Name() string        { return NameEditFile }
 func (t *EditFileTool) Description() string { return "Edit a file by replacing old_str with new_str" }
 
 func (t *EditFileTool) Schema() llm.JSONSchema {
@@ -47,12 +47,12 @@ func (t *EditFileTool) Schema() llm.JSONSchema {
 
 // ResolvePaths returns the absolute path edited, used by the registry for
 // cache invalidation.
-func (t *EditFileTool) ResolvePaths(params map[string]any) []string {
+func (t *EditFileTool) ResolvePaths(ctx context.Context, params map[string]any) []string {
 	p, ok := params["path"].(string)
 	if !ok || p == "" {
 		return nil
 	}
-	resolved, err := SafePath(context.TODO(), t.workDir, p)
+	resolved, err := SafePath(ctx, t.workDir, p)
 	if err != nil {
 		return nil
 	}

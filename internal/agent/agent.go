@@ -12,8 +12,6 @@ import (
 	"context"
 	"fmt"
 	"maps"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -45,80 +43,12 @@ const (
 	fileListMaxLen            = 120             // max chars for file list in tool result
 	toolArgTruncateLen        = 80              // max chars for tool argument display
 
-	actionDelete       = "Delete"
-	toolNameReadFile   = "read_file"
-	toolNameWriteFile  = "write_file"
-	toolNameEditFile   = "edit_file"
-	toolNameDeleteFile = "delete_file"
-	toolNameMoveFile   = "move_file"
-	toolNameFindFiles  = "find_files"
-	toolNameListDir    = "list_dir"
-	toolNameCreateDir  = "create_dir"
-	toolNameGrep       = "grep"
-	toolNameBash       = "bash"
-	toolNameGoBuild    = "go_build"
-	toolNameGoTest     = "go_test"
-	toolNameGoLint     = "go_lint"
-	toolNameGoVet      = "go_vet"
-	toolNameGoDoc      = "go_doc"
-	toolNameSearchDocs = "search_docs"
-	toolNameSnippets   = "snippets"
-	toolNameGitStatus  = "git_status"
-	toolNameGitDiff    = "git_diff"
-	toolNameGitLog     = "git_log"
-	toolNameGitCommit  = "git_commit"
-	toolNameGetRule    = "get_rule"
-	toolNameWebFetch   = "web_fetch"
-	headerPLAN         = "PLAN"
-	headerPLANRu       = "ПЛАН"
-	langEnglish        = "English"
-	roleAssistant      = "assistant"
+	actionDelete  = "Delete"
+	headerPLAN    = "PLAN"
+	headerPLANRu  = "ПЛАН"
+	langEnglish   = "English"
+	roleAssistant = "assistant"
 )
-
-// Mode represents the agent operating mode.
-type Mode int
-
-const (
-	// ModePlan is read-only analysis mode.
-	ModePlan Mode = iota
-	// ModeEdit is full tool access mode.
-	ModeEdit
-	// ModeChat is free-form discussion mode with read-only tool access.
-	ModeChat
-)
-
-const modeChatStr = "chat"
-
-// String returns the mode name.
-func (m Mode) String() string {
-	switch m {
-	case ModePlan:
-		return string(ClassifyKindPlan)
-	case ModeChat:
-		return modeChatStr
-	default:
-		return "edit"
-	}
-}
-
-// readOnlyTools is the set of tools allowed in plan mode.
-var readOnlyTools = map[string]bool{
-	"file_stat":          true,
-	toolNameReadFile:     true,
-	"read_changed_files": true,
-	toolNameWebFetch:     true,
-	toolNameListDir:      true,
-	toolNameFindFiles:    true,
-	toolNameGrep:         true,
-	toolNameGetRule:      true,
-	toolNameSnippets:     true,
-	toolNameSearchDocs:   true,
-	toolNameGoDoc:        true,
-	"go_structure":       true,
-	toolNameGitStatus:    true,
-	toolNameGitDiff:      true,
-	toolNameGitLog:       true,
-}
 
 // EventHandler receives agent events for display.
 type EventHandler func(event *Event)
@@ -285,7 +215,7 @@ type Agent struct {
 	history             []llm.Message
 	maxIter             int
 	workDir             string
-	onEvent             EventHandler
+	events              eventEmitter
 	confirmFn           ConfirmFunc
 	permMgr             *PermissionManager
 	ctxMgr              *ContextManager
@@ -304,7 +234,6 @@ type Agent struct {
 	hasSnippets         bool
 	hasRAG              bool
 	taskLabel           string
-	groupID             string
 	ragIndex            tools.RAGSearcher
 	godocIndexer        tools.GoDocIndexer
 	langState           *projectlang.State
@@ -313,8 +242,7 @@ type Agent struct {
 	extraReadOnlyTools  map[string]bool
 	disabledTools       map[string]bool
 	toolsDisabled       bool
-	sessionDir          string
-	sessionID           string
+	session             sessionStore
 
 	// Generation overrides used by specialised roles (extractor uses
 	// temperature=0 + format="json" to coerce structured output from the same
@@ -354,30 +282,58 @@ type Agent struct {
 	// when a model did file_stat but skipped read_file.
 	hasCalledReadFile bool
 
+	// hasCalledWriteTool tracks whether any write tool (edit_file,
+	// write_file, bash, etc.) was called during the current Send()
+	// invocation. Used by the EDIT-mode nudge to detect when the model
+	// read files but never applied changes.
+	hasCalledWriteTool bool
+
 	// readFileNudges counts how many times the current Send() pushed a
 	// "now call read_file" nudge after detecting file_stat without read_file.
 	readFileNudges int
 
+	// readPathsSession tracks paths the model has already read via read_file
+	// in the current Send() invocation. A repeat read on the same path is
+	// intercepted by guardDuplicateRead and answered with a short synthetic
+	// message pointing back to the prior tool result, saving tokens. Cleared
+	// per-path when a write tool affects that path so a re-read after
+	// modification still works. Reset at the start of every Send.
+	readPathsSession map[string]struct{}
+
 	// verbose enables per-iteration timing diagnostics.
 	verbose bool
+
+	// exec runs tool calls. Currently a thin scaffold; stages 4b–4e migrate
+	// helpers, guards and the run-loop step into it.
+	exec *toolExecutor
 }
 
 // New creates a new Agent.
 func New(client llm.Client, model string, reg *tools.Registry, maxIter int, workDir string, contextSize int) *Agent {
-	return &Agent{
+	permMgr := NewPermissionManager()
+	a := &Agent{
 		client:      client,
 		model:       model,
 		reg:         reg,
 		maxIter:     maxIter,
 		workDir:     workDir,
 		contextSize: contextSize,
-		permMgr:     NewPermissionManager(),
+		permMgr:     permMgr,
+		exec:        newToolExecutor(reg, permMgr, workDir),
 	}
+	a.exec.attach(a)
+	return a
 }
 
 // SetEventHandler sets the handler for agent events.
 func (a *Agent) SetEventHandler(h EventHandler) {
-	a.onEvent = h
+	a.events.SetHandler(h)
+}
+
+// readOnlyTools returns the set of registered read-only tool names. The
+// registry derives this from each tool's IsReadOnly() declaration.
+func (a *Agent) readOnlyTools() map[string]bool {
+	return a.exec.readOnlyTools()
 }
 
 // SetConfirmFunc sets the confirmation callback for destructive operations.
@@ -420,7 +376,7 @@ func (a *Agent) SetTaskLabel(label string) {
 // group (e.g. parallel specialist reviewers) set this so their tool calls
 // and status messages do not pollute the main log or another agent's group.
 func (a *Agent) SetGroupID(id string) {
-	a.groupID = id
+	a.events.SetGroupID(id)
 }
 
 // SetVerbose enables per-iteration timing diagnostics.
@@ -517,27 +473,6 @@ func (a *Agent) SetAllowedReadPaths(paths []string) {
 		m[p] = struct{}{}
 	}
 	a.allowedReadPaths = m
-}
-
-// pathAllowed returns true if the given path may be read under the current
-// whitelist. When no whitelist is set, all paths are allowed.
-func (a *Agent) pathAllowed(path string) bool {
-	if a.allowedReadPaths == nil {
-		return true
-	}
-	if path == "" {
-		return false
-	}
-	if _, ok := a.allowedReadPaths[path]; ok {
-		return true
-	}
-	// Allow basename matches so that path/to/foo.go and foo.go both work when
-	// either form appears in the plan.
-	base := filepath.Base(path)
-	if _, ok := a.allowedReadPaths[base]; ok {
-		return true
-	}
-	return false
 }
 
 // AddConfirmTools adds tool names that require user confirmation (e.g. MCP tools).
@@ -640,15 +575,12 @@ func (a *Agent) EnterEditWithPlan() {
 
 // SetSessionDir enables session auto-save. Sessions are stored in dir.
 func (a *Agent) SetSessionDir(dir string) {
-	a.sessionDir = dir
-	if a.sessionID == "" {
-		a.sessionID = NewSessionID()
-	}
+	a.session.SetDir(dir)
 }
 
 // SessionID returns the current session ID.
 func (a *Agent) SessionID() string {
-	return a.sessionID
+	return a.session.ID()
 }
 
 // LoadFromSession restores agent state from a saved session.
@@ -667,51 +599,26 @@ func (a *Agent) LoadFromSession(s *Session) {
 
 	a.lastPlan = s.Plan
 	a.stats = s.Stats
-	a.sessionID = s.ID
+	a.session.SetID(s.ID)
 	a.contextInjected = true // context was already in saved history
 }
 
 // autoSave persists the current agent state to disk if sessionDir is set.
 func (a *Agent) autoSave() {
-	if a.sessionDir == "" {
-		return
-	}
-
-	session := &Session{
-		ID:        a.sessionID,
-		CreatedAt: time.Time{}, // will be set on first save
-		Model:     a.model,
-		Mode:      a.mode.String(),
-		Messages:  a.History(),
-		Plan:      a.lastPlan,
-		Stats:     a.stats,
-		WorkDir:   a.workDir,
-	}
-
-	// Preserve CreatedAt from existing session on disk.
-	existing, err := LoadSession(a.sessionDir, a.sessionID)
-	if err == nil {
-		session.CreatedAt = existing.CreatedAt
-	} else {
-		session.CreatedAt = time.Now()
-	}
-
-	if err := SaveSession(a.sessionDir, session); err != nil {
+	if err := a.session.save(&Session{
+		Model:    a.model,
+		Mode:     a.mode.String(),
+		Messages: a.History(),
+		Plan:     a.lastPlan,
+		Stats:    a.stats,
+		WorkDir:  a.workDir,
+	}); err != nil {
 		a.emit(&Event{Type: EventError, Message: "session auto-save failed: " + err.Error()})
 	}
 }
 
 func (a *Agent) emit(e *Event) {
-	if a.onEvent == nil {
-		return
-	}
-	// Stamp the caller's group id if the event does not already carry one.
-	// This is how sub-agents inherit their parent group in the TUI without
-	// every call site having to know about groups.
-	if e.GroupID == "" && a.groupID != "" {
-		e.GroupID = a.groupID
-	}
-	a.onEvent(e)
+	a.events.emit(e)
 }
 
 // Init initializes the agent with system prompt. Call once before Send().
@@ -815,9 +722,10 @@ func (a *Agent) ensureLanguageDetected() {
 	a.emit(&Event{Type: EventAgent, Message: fmt.Sprintf("Project language detected: %s — language tools registered", lang)})
 }
 
-// Send processes a single user message, preserving conversation history.
-func (a *Agent) Send(ctx context.Context, task string) error {
-	a.ensureLanguageDetected()
+// prepareUserContent enriches the raw task text with RAG search results and
+// (on the first Send) the cached project context block, then appends the
+// resulting message to history.
+func (a *Agent) prepareUserContent(ctx context.Context, task string) {
 	userContent := task
 	if a.hasRAG && a.ragIndex != nil {
 		if results, err := a.ragIndex.Search(ctx, task, ragTopK); err == nil && len(results) > 0 {
@@ -829,6 +737,12 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 		a.contextInjected = true
 	}
 	a.history = append(a.history, llm.Message{Role: "user", Content: userContent})
+}
+
+// resetSendState clears per-Send counters and scratch maps before the chat
+// loop starts a fresh task. Stats are reset so tokens/iterations from the
+// previous Send don't bleed into this one.
+func (a *Agent) resetSendState() {
 	a.stats.reset()
 	a.planBuf.Reset()
 	a.editNudges = 0
@@ -836,7 +750,124 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 	a.toolCallCount = 0
 	a.planBlockedStreak = 0
 	a.hasCalledReadFile = false
+	a.hasCalledWriteTool = false
 	a.readFileNudges = 0
+	a.readPathsSession = make(map[string]struct{})
+}
+
+// maintainContext applies auto-compact (when prompt usage crosses the
+// threshold) and the safety-net trim before the next LLM call. Errors from
+// either path are non-fatal — the loop just proceeds with the un-shrunk
+// history.
+func (a *Agent) maintainContext(ctx context.Context) {
+	if a.autoCompact && a.ctxMgr != nil && a.lastPromptEvalCount > 0 && a.contextSize > 0 {
+		ratio := float64(a.lastPromptEvalCount) / float64(a.contextSize)
+		if ratio >= autoCompactThreshold {
+			if err := a.Compact(ctx, ""); err == nil {
+				a.lastPromptEvalCount = 0
+			}
+		}
+	}
+	if a.ctxMgr != nil {
+		before := a.ctxMgr.estimateTokens(a.history)
+		trimmed, err := a.ctxMgr.Trim(ctx, a.history)
+		if err == nil && a.ctxMgr.estimateTokens(trimmed) < before {
+			a.history = trimmed
+			after := a.ctxMgr.estimateTokens(a.history)
+			a.emit(&Event{
+				Type:         EventCompact,
+				Message:      fmt.Sprintf("Auto-trimmed: ~%d → ~%d tokens", before, after),
+				ContextUsed:  after,
+				ContextTotal: a.contextSize,
+			})
+		} else if err == nil {
+			a.history = trimmed
+		}
+	}
+}
+
+// handleEmptyResponse reacts to an LLM turn with no tool calls. Returns true
+// when Send should continue the chat loop (synthetic tool-call recovery, an
+// edit-mode nudge, or a plan-mode nudge); false means Send should emit Done
+// and finish the task. This is the heart of the "model went text-only when
+// it should have called a tool" recovery path.
+func (a *Agent) handleEmptyResponse(ctx context.Context, resp *llm.ChatChunk) bool {
+	if a.mode == ModeEdit {
+		if synth := parseTextToolCall(resp.Content); synth != nil {
+			a.emit(&Event{Type: EventAgent, Message: "Recovered text-form tool call — executing synthetically."})
+			a.history[len(a.history)-1] = llm.Message{
+				Role:      roleAssistant,
+				Content:   "",
+				ToolCalls: []llm.ToolCall{*synth},
+			}
+			a.toolCallCount++
+			a.exec.executeSingle(ctx, *synth)
+			return true
+		}
+	}
+
+	shouldNudge := looksLikeMarkdownPlan(resp.Content) ||
+		(a.toolCallCount > 0 && !a.hasCalledWriteTool)
+	if a.mode == ModeEdit && a.editNudges < maxEditNudges && shouldNudge {
+		a.editNudges++
+		a.emit(&Event{Type: EventAgent, Message: fmt.Sprintf("Model responded with text instead of tool calls; nudging (%d/%d)...", a.editNudges, maxEditNudges)})
+		a.history = append(a.history, llm.Message{
+			Role:    "user",
+			Content: editNudgeMessage(a.editNudges, a.hasCalledReadFile),
+		})
+		return true
+	}
+
+	if a.mode == ModePlan {
+		content := strings.TrimSpace(resp.Content)
+		if !a.toolsDisabled && a.toolCallCount == 0 && a.planToolNudges < maxPlanToolNudges &&
+			(content == "" || isNoIssues(content)) {
+			a.planToolNudges++
+			a.emit(&Event{Type: EventAgent, Message: fmt.Sprintf(
+				"Model responded without calling any tools; nudging (%d/%d)...",
+				a.planToolNudges, maxPlanToolNudges)})
+			a.history = append(a.history, llm.Message{
+				Role:    "user",
+				Content: "You responded without calling any tools. This is FORBIDDEN. Re-read the task above: it contains a file list section with bullet paths. You MUST call file_stat on EACH file from that list. Do NOT guess file paths — use ONLY the paths listed in the task. Start now.",
+			})
+			return true
+		}
+		if a.toolCallCount > 0 && !a.hasCalledReadFile && a.readFileNudges < maxReadFileNudges {
+			a.readFileNudges++
+			a.emit(&Event{Type: EventAgent, Message: fmt.Sprintf(
+				"Model called file_stat but not read_file; nudging (%d/%d)...",
+				a.readFileNudges, maxReadFileNudges)})
+			a.history = append(a.history, llm.Message{
+				Role:    "user",
+				Content: "Good, you called file_stat. Now you MUST call read_file(path) on each file to read its contents. Use the EXACT paths from the file list in the task — do NOT guess or modify paths. You cannot review code without reading it. Call read_file now.",
+			})
+			return true
+		}
+		if resp.Content != "" {
+			a.planBuf.WriteString(resp.Content)
+		}
+		raw := a.planBuf.String()
+		a.lastPlan = extractPlan(raw)
+		if a.lastPlan == "" && len(raw) > 0 {
+			a.lastPlan = strings.TrimSpace(raw)
+		}
+		return false
+	}
+
+	if resp.Content != "" {
+		a.emit(&Event{Type: EventAgent, Message: resp.Content})
+		if a.editNudges >= maxEditNudges {
+			a.emit(&Event{Type: EventAgent, Message: fmt.Sprintf("Model returned text-only response in EDIT mode after %d nudges — aborting without changes. Consider using a stronger model or lowering executor temperature (see executor_provider: precise).", maxEditNudges)})
+		}
+	}
+	return false
+}
+
+// Send processes a single user message, preserving conversation history.
+func (a *Agent) Send(ctx context.Context, task string) error {
+	a.ensureLanguageDetected()
+	a.prepareUserContent(ctx, task)
+	a.resetSendState()
 
 	// Emit a start-of-task status line only when a label was set. Sub-agents
 	// that live inside a collapsible group (parallel specialist reviewers)
@@ -858,33 +889,7 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 			a.emit(&Event{Type: EventAgent, Message: fmt.Sprintf("Iteration %d/%d: requesting model...", iterCount, a.maxIter)})
 		}
 
-		// Auto-compact by real prompt_eval_count when context is >=99% full
-		if a.autoCompact && a.ctxMgr != nil && a.lastPromptEvalCount > 0 && a.contextSize > 0 {
-			ratio := float64(a.lastPromptEvalCount) / float64(a.contextSize)
-			if ratio >= autoCompactThreshold {
-				if err := a.Compact(ctx, ""); err == nil {
-					a.lastPromptEvalCount = 0
-				}
-			}
-		}
-
-		// Trim context if needed (safety net by estimate)
-		if a.ctxMgr != nil {
-			before := a.ctxMgr.estimateTokens(a.history)
-			trimmed, err := a.ctxMgr.Trim(ctx, a.history)
-			if err == nil && a.ctxMgr.estimateTokens(trimmed) < before {
-				a.history = trimmed
-				after := a.ctxMgr.estimateTokens(a.history)
-				a.emit(&Event{
-					Type:         EventCompact,
-					Message:      fmt.Sprintf("Auto-trimmed: ~%d → ~%d tokens", before, after),
-					ContextUsed:  after,
-					ContextTotal: a.contextSize,
-				})
-			} else if err == nil {
-				a.history = trimmed
-			}
-		}
+		a.maintainContext(ctx)
 
 		opts := map[string]any{
 			"num_ctx": a.contextSize,
@@ -911,7 +916,7 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 		resp, err := a.client.ChatSyncWithCallback(ctx, &llm.ChatRequest{
 			Model:    a.model,
 			Messages: a.history,
-			Tools:    a.toolDefsForMode(),
+			Tools:    a.exec.toolDefsForMode(),
 			Options:  opts,
 			Format:   a.format,
 		}, progressCb)
@@ -970,88 +975,9 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 		}
 		a.history = append(a.history, msg)
 
-		// No tool calls = candidate final response.
 		if len(resp.ToolCalls) == 0 {
-			// Synthetic tool-call recovery: some models write edit_file /
-			// write_file as plain text instead of a JSON tool call. Parse
-			// the text and execute the tool synthetically so the step
-			// succeeds without a nudge round-trip.
-			if a.mode == ModeEdit {
-				if synth := parseTextToolCall(resp.Content); synth != nil {
-					a.emit(&Event{Type: EventAgent, Message: "Recovered text-form tool call — executing synthetically."})
-					// Replace the text-only assistant message (appended above)
-					// with one carrying the synthetic tool call so the
-					// subsequent tool-result message has a matching ToolCallID.
-					a.history[len(a.history)-1] = llm.Message{
-						Role:      roleAssistant,
-						Content:   "",
-						ToolCalls: []llm.ToolCall{*synth},
-					}
-					a.toolCallCount++
-					a.executeSingle(ctx, *synth)
-					continue
-				}
-			}
-
-			// EDIT-mode nudge: local models routinely answer an action task
-			// with a markdown plan instead of calling write_file/edit_file.
-			// Detect that pattern and push one or two follow-ups before
-			// giving up. This is the safety net behind the EDIT system
-			// prompt — it does not fix the model, only the symptom.
-			if a.mode == ModeEdit && a.editNudges < maxEditNudges && looksLikeMarkdownPlan(resp.Content) {
-				a.editNudges++
-				a.emit(&Event{Type: EventAgent, Message: fmt.Sprintf("Model responded with text instead of tool calls; nudging (%d/%d)...", a.editNudges, maxEditNudges)})
-				a.history = append(a.history, llm.Message{
-					Role:    "user",
-					Content: "Stop. You are in EDIT mode. Do NOT describe the changes — apply them now via write_file/edit_file/bash. Begin with the first tool call. Do not explain. Do not output another plan.",
-				})
+			if a.handleEmptyResponse(ctx, &resp) {
 				continue
-			}
-			if a.mode == ModePlan {
-				// PLAN-mode nudge: specialist reviewers must call tools
-				// (file_stat, read_file) before concluding. If the model
-				// returned NO_ISSUES without any tool calls, nudge it once.
-				content := strings.TrimSpace(resp.Content)
-				if !a.toolsDisabled && a.toolCallCount == 0 && a.planToolNudges < maxPlanToolNudges &&
-					(content == "" || isNoIssues(content)) {
-					a.planToolNudges++
-					a.emit(&Event{Type: EventAgent, Message: fmt.Sprintf(
-						"Model responded without calling any tools; nudging (%d/%d)...",
-						a.planToolNudges, maxPlanToolNudges)})
-					a.history = append(a.history, llm.Message{
-						Role:    "user",
-						Content: "You responded without calling any tools. This is FORBIDDEN. Re-read the task above: it contains a file list section with bullet paths. You MUST call file_stat on EACH file from that list. Do NOT guess file paths — use ONLY the paths listed in the task. Start now.",
-					})
-					continue
-				}
-				// Guided-flow nudge: model called file_stat but never
-				// read_file — it cannot review code it hasn't read.
-				// Push one follow-up directing it to the next step.
-				if a.toolCallCount > 0 && !a.hasCalledReadFile && a.readFileNudges < maxReadFileNudges {
-					a.readFileNudges++
-					a.emit(&Event{Type: EventAgent, Message: fmt.Sprintf(
-						"Model called file_stat but not read_file; nudging (%d/%d)...",
-						a.readFileNudges, maxReadFileNudges)})
-					a.history = append(a.history, llm.Message{
-						Role:    "user",
-						Content: "Good, you called file_stat. Now you MUST call read_file(path) on each file to read its contents. Use the EXACT paths from the file list in the task — do NOT guess or modify paths. You cannot review code without reading it. Call read_file now.",
-					})
-					continue
-				}
-				if resp.Content != "" {
-					a.planBuf.WriteString(resp.Content)
-				}
-				raw := a.planBuf.String()
-				a.lastPlan = extractPlan(raw)
-				// If extractPlan found no structured plan, use raw text as fallback.
-				if a.lastPlan == "" && len(raw) > 0 {
-					a.lastPlan = strings.TrimSpace(raw)
-				}
-			} else if resp.Content != "" {
-				a.emit(&Event{Type: EventAgent, Message: resp.Content})
-				if a.editNudges >= maxEditNudges {
-					a.emit(&Event{Type: EventAgent, Message: fmt.Sprintf("Model returned text-only response in EDIT mode after %d nudges — aborting without changes. Consider using a stronger model or lowering executor temperature (see executor_provider: precise).", maxEditNudges)})
-				}
 			}
 			a.stats.AvgTkPerSec = a.stats.avgTkPerSec()
 			a.emit(&Event{Type: EventDone, Message: "Done", Stats: &a.stats})
@@ -1059,85 +985,12 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 			return nil
 		}
 
-		// Split tool calls into parallel (read-only) and sequential groups.
-		var parallelCalls []llm.ToolCall
-		var sequentialCalls []llm.ToolCall
-		for _, tc := range resp.ToolCalls {
-			if a.canRunParallel(tc.Function.Name) {
-				parallelCalls = append(parallelCalls, tc)
-			} else {
-				sequentialCalls = append(sequentialCalls, tc)
-			}
-		}
-
-		// Execute read-only tools in parallel via WorkerPool.
-		if len(parallelCalls) > 0 {
-			a.toolCallCount += len(parallelCalls)
-			a.executeParallel(ctx, parallelCalls)
-		}
-
-		// Execute remaining tools sequentially (write ops, confirm, blocked).
-		augmented := false
-		allBlocked := len(sequentialCalls) > 0
-		for _, tc := range sequentialCalls {
-			// Block destructive tools in plan mode — check BEFORE emitting
-			// the tool event so the TUI never shows a write-tool attempt.
-			if a.isToolBlocked(tc.Function.Name) {
-				a.history = append(a.history, llm.Message{
-					Role:       "tool",
-					Content:    fmt.Sprintf("Tool %q is NOT available in %s mode. Do NOT call write tools. Use ONLY: %s", tc.Function.Name, a.mode.String(), strings.Join(a.reg.NamesFiltered(readOnlyTools), ", ")),
-					ToolCallID: tc.ID,
-				})
-				a.emit(&Event{Type: EventTool, Tool: tc.Function.Name, Message: fmt.Sprintf("blocked in %s mode", a.mode.String()), Success: false})
-				continue
-			}
-			allBlocked = false
-
-			detail := toolDetail(tc.Function.Name, tc.Function.Arguments)
-			a.emit(&Event{Type: EventTool, Tool: tc.Function.Name, Message: detail})
-
-			// Check confirmation for destructive operations
-			if a.needsConfirm(tc.Function.Name) && a.confirmFn != nil {
-				fp := Fingerprint(tc.Function.Name, tc.Function.Arguments)
-				if !a.permMgr.IsAllowed(fp) {
-					payload := a.buildConfirmPayload(ctx, tc.Function.Name, tc.Function.Arguments)
-					cr := a.confirmFn(payload)
-					switch cr.Action {
-					case ConfirmDeny:
-						a.history = append(a.history, llm.Message{
-							Role:       "tool",
-							Content:    "Operation denied by user",
-							ToolCallID: tc.ID,
-						})
-						a.emit(&Event{Type: EventTool, Tool: tc.Function.Name, Message: "denied by user", Success: false})
-						continue
-					case ConfirmAllowOnce:
-						// proceed to execute
-					case ConfirmAllowSession:
-						a.permMgr.AllowSession(fp)
-					case ConfirmAugment:
-						a.history = append(a.history, llm.Message{
-							Role:       "tool",
-							Content:    fmt.Sprintf("User rejected this call and provided a constraint: %s\nPlease rebuild this %s call accordingly.", cr.Augment, tc.Function.Name),
-							ToolCallID: tc.ID,
-						})
-						a.emit(&Event{Type: EventTool, Tool: tc.Function.Name, Message: "augmented: " + cr.Augment, Success: false})
-						augmented = true
-					}
-					if augmented {
-						break
-					}
-				}
-			}
-
-			a.toolCallCount++
-			a.executeSingle(ctx, tc)
-		}
+		toolStep := a.exec.Run(ctx, resp.ToolCalls)
 
 		// Track consecutive iterations where every tool call was blocked.
 		// When parallel read-only calls succeeded, the iteration is useful
 		// regardless of sequential blocked calls.
-		if allBlocked && len(parallelCalls) == 0 {
+		if toolStep.AllBlocked && !toolStep.HadParallel {
 			a.planBlockedStreak++
 			if a.mode == ModePlan && a.planBlockedStreak >= maxPlanBlocked {
 				a.emit(&Event{Type: EventAgent, Message: fmt.Sprintf(
@@ -1173,7 +1026,7 @@ func (a *Agent) Send(ctx context.Context, task string) error {
 		a.stats.TotalLLMTime += llmDuration
 		a.stats.TotalToolTime += toolDuration
 
-		if augmented {
+		if toolStep.Augmented {
 			continue // re-send to LLM with constraint
 		}
 
@@ -1210,311 +1063,11 @@ func (a *Agent) Run(ctx context.Context, task, ruleCatalog string) error {
 	return a.Send(ctx, task)
 }
 
-func (a *Agent) toolDefsForMode() []llm.ToolDef {
-	if a.toolsDisabled {
-		return nil
-	}
-	var defs []llm.ToolDef
-	if a.mode == ModeEdit {
-		defs = a.reg.ToolDefs()
-	} else {
-		defs = a.reg.ToolDefsFiltered(readOnlyTools)
-	}
-	if len(a.disabledTools) == 0 {
-		return defs
-	}
-	filtered := defs[:0]
-	for i := range defs {
-		if !a.disabledTools[defs[i].Function.Name] {
-			filtered = append(filtered, defs[i])
-		}
-	}
-	return filtered
-}
-
 // SetToolsDisabled forces the agent to advertise no tools to the model and
 // blocks any tool call attempt. Used by the extractor role: a deterministic
 // JSON-only pass that must not be tempted into hallucinating tool calls.
 func (a *Agent) SetToolsDisabled(disabled bool) {
 	a.toolsDisabled = disabled
-}
-
-// canRunParallel returns true if a tool call can safely run in the worker pool.
-// Only read-only tools that don't need confirmation qualify.
-func (a *Agent) canRunParallel(toolName string) bool {
-	if a.pool == nil || cap(a.pool.sem) <= 1 {
-		return false
-	}
-	return (readOnlyTools[toolName] || a.extraReadOnlyTools[toolName]) && !a.isToolBlocked(toolName)
-}
-
-// executeParallel runs read-only tool calls concurrently via the worker pool
-// and appends results to history in the original order.
-func (a *Agent) executeParallel(ctx context.Context, calls []llm.ToolCall) {
-	tasks := make([]TaskFunc, len(calls))
-	guards := make([]*tools.ToolResult, len(calls))
-	for i, tc := range calls {
-		guards[i] = a.guardReadWhitelist(tc)
-		name := tc.Function.Name
-		args := tc.Function.Arguments
-		idx := i
-		if name == toolNameReadFile {
-			a.hasCalledReadFile = true
-		}
-		tasks[i] = func(ctx context.Context) (*tools.ToolResult, error) {
-			if guards[idx] != nil {
-				return guards[idx], nil
-			}
-			return a.reg.Execute(ctx, name, args)
-		}
-	}
-
-	results := a.pool.Execute(ctx, tasks)
-
-	for i, tr := range results {
-		tc := calls[i]
-		if tr.Err != nil {
-			a.emit(&Event{Type: EventError, Tool: tc.Function.Name, Message: tr.Err.Error()})
-			a.history = append(a.history, llm.Message{
-				Role:       "tool",
-				Content:    "Error: " + tr.Err.Error(),
-				ToolCallID: tc.ID,
-			})
-			continue
-		}
-		a.emitToolResult(tc, tr.Result, nil)
-	}
-}
-
-// guardReadWhitelist returns a synthetic refusal result if the tool call is a
-// read-only file tool targeting a path outside the current allowed-read
-// whitelist. Returns nil when the call is permitted.
-func (a *Agent) guardReadWhitelist(tc llm.ToolCall) *tools.ToolResult {
-	if a.allowedReadPaths == nil {
-		return nil
-	}
-	name := tc.Function.Name
-	// Only constrain path-bearing read tools.
-	switch name {
-	case toolNameReadFile, toolNameListDir, toolNameFindFiles, toolNameGrep:
-	default:
-		return nil
-	}
-	// Extract the path argument under any of the common keys.
-	var p string
-	if v, ok := tc.Function.Arguments["path"].(string); ok {
-		p = v
-	} else if v, ok := tc.Function.Arguments["root"].(string); ok {
-		p = v
-	}
-	if p == "" {
-		return nil
-	}
-	if a.pathAllowed(p) {
-		return nil
-	}
-	msg := fmt.Sprintf(
-		"refused: %q is not in the executor whitelist for this plan. "+
-			"You may only read files listed in the approved plan. "+
-			"If you need additional context, output `REPLAN: <reason>` and stop.",
-		p,
-	)
-	return &tools.ToolResult{Output: msg}
-}
-
-// executeSingle runs a single tool call and records the result.
-func (a *Agent) executeSingle(ctx context.Context, tc llm.ToolCall) {
-	if guard := a.guardReadWhitelist(tc); guard != nil {
-		a.emit(&Event{Type: EventTool, Tool: tc.Function.Name, Message: "blocked by whitelist", Success: false})
-		a.emitToolResult(tc, guard, nil)
-		return
-	}
-	if tc.Function.Name == toolNameReadFile {
-		a.hasCalledReadFile = true
-	}
-	result, err := a.reg.Execute(ctx, tc.Function.Name, tc.Function.Arguments)
-	if err != nil {
-		a.emit(&Event{Type: EventError, Tool: tc.Function.Name, Message: err.Error()})
-		// Still add error to history so the model gets feedback.
-		a.history = append(a.history, llm.Message{
-			Role:       "tool",
-			Content:    "Error: " + err.Error(),
-			ToolCallID: tc.ID,
-		})
-		return
-	}
-	a.emitToolResult(tc, result, nil)
-}
-
-// emitToolResult emits an event and appends the tool result to history.
-func (a *Agent) emitToolResult(tc llm.ToolCall, result *tools.ToolResult, toolErr error) {
-	success := toolErr == nil
-	// For read-only tools, show detail (path) instead of output content.
-	msg := truncate(result.Output, truncatePreviewLen)
-	if readOnlyTools[tc.Function.Name] {
-		detail := toolDetail(tc.Function.Name, tc.Function.Arguments)
-		if detail != "" {
-			msg = detail
-		}
-	}
-	// For batch-read tools, show file list from result meta.
-	if msg == "" && result.Meta != nil {
-		if fl, ok := result.Meta["file_list"].([]string); ok && len(fl) > 0 {
-			msg = strings.Join(fl, ", ")
-			if len(msg) > fileListMaxLen {
-				msg = msg[:fileListMaxLen] + "..."
-			}
-		}
-	}
-	// Build full output for transcript view (same truncation as LLM history).
-	fullOutput := result.Output
-	if len(fullOutput) > maxToolResultBytes {
-		fullOutput = fullOutput[:maxToolResultBytes] + "\n... [truncated]"
-	}
-
-	ev := Event{
-		Type:       EventTool,
-		Tool:       tc.Function.Name,
-		Message:    msg,
-		Success:    success,
-		FullOutput: fullOutput,
-	}
-	if result.Meta != nil {
-		if v, ok := result.Meta["cache_hit"].(bool); ok && v {
-			ev.CacheHit = true
-		}
-		if v, ok := result.Meta["action"].(string); ok {
-			ev.FileAction = v
-		}
-		if v, ok := result.Meta["added"].(int); ok {
-			ev.LinesAdded = v
-		}
-		if v, ok := result.Meta["removed"].(int); ok {
-			ev.LinesRemoved = v
-		}
-		if v, ok := result.Meta["diff"].(string); ok {
-			ev.Diff = v
-		}
-	}
-	// Cache-hit read-only tools: suppress UI event and shorten history
-	// to avoid visual noise and wasted model context.
-	isCachedReadOnly := ev.CacheHit && readOnlyTools[tc.Function.Name]
-
-	if !isCachedReadOnly {
-		a.emit(&ev)
-	}
-
-	a.stats.ToolCalls++
-	if ev.FileAction != "" {
-		filePath := stringFromMap(tc.Function.Arguments, "path")
-		a.stats.recordFileAction(ev.FileAction, filePath, ev.LinesAdded, ev.LinesRemoved)
-	}
-
-	resultContent := result.Output
-	if isCachedReadOnly {
-		resultContent = "[already read — see earlier tool result]"
-	} else if len(resultContent) > maxToolResultBytes {
-		resultContent = resultContent[:maxToolResultBytes] + "\n... [truncated, total " + fmt.Sprintf("%d", len(result.Output)) + " bytes]"
-	}
-	a.history = append(a.history, llm.Message{
-		Role:       "tool",
-		Content:    resultContent,
-		ToolCallID: tc.ID,
-	})
-}
-
-func (a *Agent) isToolBlocked(tool string) bool {
-	if a.toolsDisabled {
-		return true
-	}
-	if a.disabledTools[tool] {
-		return true
-	}
-	if a.mode == ModeEdit {
-		return false
-	}
-	// Plan and Chat modes: only read-only tools allowed.
-	return !readOnlyTools[tool] && !a.extraReadOnlyTools[tool]
-}
-
-func (a *Agent) needsConfirm(tool string) bool {
-	switch tool {
-	case toolNameWriteFile, toolNameEditFile, toolNameDeleteFile, toolNameMoveFile, toolNameBash, toolNameGitCommit, toolNameWebFetch:
-		return true
-	}
-	return a.extraConfirmTools[tool]
-}
-
-// buildConfirmPayload builds a ConfirmPayload for a tool call. For edit/write
-// tools it tries to read the current file content and produce a unified diff
-// preview so the user can see the change before approving.
-func (a *Agent) buildConfirmPayload(ctx context.Context, name string, args map[string]any) ConfirmPayload {
-	p := ConfirmPayload{Tool: name, Args: map[string]string{}}
-	put := func(k, v string) {
-		p.Args[k] = v
-		p.ArgKeys = append(p.ArgKeys, k)
-	}
-	switch name {
-	case toolNameEditFile:
-		path := stringFromMap(args, "path")
-		oldStr := stringFromMap(args, "old_str")
-		newStr := stringFromMap(args, "new_str")
-		put("path", path)
-		if resolved, err := tools.SafePath(ctx, a.workDir, path); err == nil {
-			if data, err := os.ReadFile(resolved); err == nil {
-				content := string(data)
-				if strings.Contains(content, oldStr) {
-					newContent := strings.Replace(content, oldStr, newStr, 1)
-					p.Preview = tools.SimpleDiff(content, newContent, path, diffPreviewMaxLines)
-				}
-			}
-		}
-		if p.Preview == "" {
-			p.Preview = fallbackDiffPreview(oldStr, newStr, diffPreviewMaxLines)
-		}
-	case toolNameWriteFile:
-		path := stringFromMap(args, "path")
-		content := stringFromMap(args, "content")
-		put("path", path)
-		var oldContent string
-		existed := false
-		if resolved, err := tools.SafePath(ctx, a.workDir, path); err == nil {
-			if data, err := os.ReadFile(resolved); err == nil {
-				oldContent = string(data)
-				existed = true
-			}
-		}
-		if existed {
-			p.Preview = tools.SimpleDiff(oldContent, content, path, diffPreviewMaxLines)
-		} else {
-			p.Preview = previewNewFile(content, previewNewFileLines)
-		}
-	case toolNameDeleteFile:
-		path := stringFromMap(args, "path")
-		put("path", path)
-	case toolNameMoveFile:
-		from := stringFromMap(args, "from")
-		to := stringFromMap(args, "to")
-		put("from", from)
-		put("to", to)
-	case toolNameBash:
-		cmd := stringFromMap(args, "command")
-		put("command", cmd)
-		p.Danger = tools.IsDangerousCommand(cmd)
-	case toolNameGitCommit:
-		if msg, ok := args["message"].(string); ok {
-			put("message", msg)
-		}
-	case toolNameWebFetch:
-		if u := stringFromMap(args, "url"); u != "" {
-			put("url", u)
-		}
-	default:
-		for k, v := range args {
-			put(k, fmt.Sprintf("%v", v))
-		}
-	}
-	return p
 }
 
 func fallbackDiffPreview(oldStr, newStr string, maxLines int) string {
@@ -1632,213 +1185,6 @@ func toolDetail(name string, args map[string]any) string {
 		}
 	}
 	return ""
-}
-
-func langName(code string) string {
-	switch code {
-	case "ru":
-		return "Russian"
-	case "en":
-		return langEnglish
-	case "de":
-		return "German"
-	case "fr":
-		return "French"
-	case "es":
-		return "Spanish"
-	case "zh":
-		return "Chinese"
-	case "ja":
-		return "Japanese"
-	case "":
-		return langEnglish
-	default:
-		return code
-	}
-}
-
-func (a *Agent) buildSystemPrompt() string {
-	lang := langName(a.language)
-	pl := a.currentProgLang()
-	ltc := langToolsForLang(pl)
-
-	var b strings.Builder
-	if pl != "" {
-		fmt.Fprintf(&b, "You are KodRun, a %s programming assistant.\n", pl)
-	} else {
-		b.WriteString("You are KodRun, a programming assistant.\n")
-	}
-	fmt.Fprintf(&b, "IMPORTANT: ALL your responses MUST be in %s. This is mandatory.\n\n", lang)
-
-	if a.ruleCatalog != "" {
-		b.WriteString(a.ruleCatalog)
-		b.WriteString("\n")
-	}
-
-	switch a.mode {
-	case ModePlan:
-		b.WriteString("You are in PLAN mode (READ-ONLY).\n")
-		b.WriteString("You can ONLY analyze code and create plans. You CANNOT modify files.\n")
-		b.WriteString("You MUST NOT call any tools besides: " + strings.Join(a.reg.NamesFiltered(readOnlyTools), ", ") + "\n\n")
-		b.WriteString("IMPORTANT — Questions vs Tasks:\n")
-		switch pl {
-		case progLangGo:
-			b.WriteString("- If the user asks a QUESTION (about Go, naming, conventions, architecture, etc.) — answer it DIRECTLY and concisely. Do NOT create a plan for questions.\n")
-		case progLangPython:
-			b.WriteString("- If the user asks a QUESTION (about Python naming, PEP conventions, architecture, etc.) — answer it DIRECTLY and concisely. Do NOT create a plan for questions.\n")
-		case progLangJSTS:
-			b.WriteString("- If the user asks a QUESTION (about TypeScript naming, conventions, architecture, etc.) — answer it DIRECTLY and concisely. Do NOT create a plan for questions.\n")
-		default:
-			b.WriteString("- If the user asks a QUESTION (about naming, conventions, architecture, etc.) — answer it DIRECTLY and concisely. Do NOT create a plan for questions.\n")
-		}
-		b.WriteString("- If the user gives a TASK (fix, refactor, add feature, etc.) — create a numbered plan.\n\n")
-		b.WriteString("STRICT RULES (for tasks):\n")
-		b.WriteString("- NEVER generate code blocks, patches, diffs, or file contents\n")
-		b.WriteString("- NEVER show code that should be written or changed\n")
-		b.WriteString("- NEVER call write_file, edit_file, delete_file, bash, or any write tool\n")
-		b.WriteString("- If asked to fix, edit, or write code — describe WHAT to change, not HOW in code\n")
-		b.WriteString("- Your plan must be a numbered list with text descriptions only\n")
-		b.WriteString("- Do NOT read binary files, build artifacts, or IDE config directories\n\n")
-		b.WriteString("Guidelines:\n")
-		switch pl {
-		case progLangGo:
-			b.WriteString("- Read and analyze *.go source files and project docs\n")
-		case progLangPython:
-			b.WriteString("- Read and analyze *.py source files and project docs\n")
-		case progLangJSTS:
-			b.WriteString("- Read and analyze *.ts, *.tsx, *.js, *.jsx source files and project docs\n")
-		default:
-			b.WriteString("- Read and analyze source files and project docs\n")
-		}
-		b.WriteString("- Identify files that need changes\n")
-		b.WriteString("- Propose a step-by-step plan\n")
-		b.WriteString("- Estimate complexity and risks\n")
-		b.WriteString("- Be concise and actionable\n")
-		b.WriteString("- Verification section MUST only include commands that match the actual project stack and task scope. Do NOT invent commands for tools, servers, linters or formatters not present in the project.\n")
-		switch pl {
-		case progLangGo:
-			b.WriteString("- Reference Effective Go, Go Code Review Comments, Go Common Mistakes and project conventions\n")
-		case progLangPython:
-			b.WriteString("- Reference PEP 8, PEP 20 and project conventions\n")
-		case progLangJSTS:
-			b.WriteString("- Reference TypeScript best practices and project conventions\n")
-		default:
-			// No language-specific best practices when language is unknown.
-		}
-		if a.hasRAG {
-			b.WriteString("\nIMPORTANT — Project rules and conventions (from RAG):\n")
-			fmt.Fprintf(&b, "The task context includes MANDATORY RULES marked [MANDATORY PROJECT RULES] and %s marked [%s].\n", ltc.standardsLabel, ltc.standardsLabel)
-			b.WriteString("These are NOT suggestions — they are REQUIREMENTS. Treat violations as bugs.\n")
-			b.WriteString("These include naming conventions, error handling, code structure, and all documented standards.\n")
-			b.WriteString("You MUST check code against ALL provided rules. Include violations in your plan.\n")
-			b.WriteString("You may call search_docs for additional targeted searches if needed.\n")
-		} else if a.hasSnippets {
-			b.WriteString("\nIMPORTANT — Documentation check (MANDATORY):\n")
-			b.WriteString("You MUST call snippets BEFORE creating the plan. This is not optional.\n")
-			switch pl {
-			case progLangGo:
-				b.WriteString("1. Call snippets(paths=[<list of all .go files you read>]) to get code conventions\n")
-			case progLangPython:
-				b.WriteString("1. Call snippets(paths=[<list of all .py files you read>]) to get code conventions\n")
-			default:
-				b.WriteString("1. Call snippets(paths=[<list of all source files you read>]) to get code conventions\n")
-			}
-			b.WriteString("2. Read and understand the found conventions\n")
-			b.WriteString("3. Only then create the plan, incorporating found conventions as requirements\n")
-		}
-	case ModeChat:
-		b.WriteString("You are in CHAT mode.\n")
-		b.WriteString("Answer questions, explain code, discuss architecture and design decisions.\n")
-		b.WriteString("You can read files for context using read-only tools: " + strings.Join(a.reg.NamesFiltered(readOnlyTools), ", ") + "\n")
-		b.WriteString("Do NOT create numbered plans, do NOT write or edit files, do NOT call write tools.\n")
-		b.WriteString("Be concise and helpful.\n")
-	default:
-		b.WriteString("You are in EDIT mode. EDIT mode is for ACTING on the code, not for describing changes.\n\n")
-		b.WriteString("CRITICAL — Action vs description:\n")
-		b.WriteString("- If the user's input is a TASK to change code (fix, refactor, create, edit, move, restructure, apply plan, implement, ...) you MUST start your response with tool calls (write_file, edit_file, bash, read_file as needed). Do NOT output a markdown plan, do NOT write \"ANALYSIS\" / \"АНАЛИЗ\" or \"IMPLEMENTATION PLAN\" / \"ПЛАН ИСПРАВЛЕНИЙ\" sections, do NOT explain what you are about to do — just call the tools.\n")
-		b.WriteString("- A textual response without tool calls is allowed ONLY when the user asked a pure question (no action verb). When in doubt, assume it is a task and call tools.\n")
-		b.WriteString("- If you need to read a file before editing it, call read_file as the first tool — that still counts as \"starting with a tool\".\n")
-		b.WriteString("- If the user pasted a numbered plan, your job is to EXECUTE it, not to rewrite it back. Skip directly to the first edit_file/write_file. Do not produce an \"Implementation plan\" / \"План исправлений\" of your own.\n")
-		b.WriteString("- PLAN mode is the place for descriptions. EDIT mode is for actions. Stay in your lane.\n\n")
-		b.WriteString("Available tools: " + strings.Join(a.reg.Names(), ", ") + "\n\n")
-		b.WriteString("Guidelines:\n")
-		switch pl {
-		case progLangGo:
-			b.WriteString("- Write idiomatic Go code following Effective Go, Go Code Review Comments, Go Common Mistakes. Use Go 1.25+.\n")
-			b.WriteString("- Handle errors properly\n")
-		case progLangPython:
-			b.WriteString("- Write idiomatic Python code following PEP 8 and project conventions.\n")
-			b.WriteString("- Handle errors properly\n")
-		case progLangJSTS:
-			b.WriteString("- Write idiomatic TypeScript/JavaScript code following project conventions.\n")
-			b.WriteString("- Handle errors properly\n")
-		default:
-			// No language-specific guidelines when language is unknown.
-		}
-		b.WriteString("- Use edit_file for targeted changes, write_file for new files\n")
-		b.WriteString("- Be concise in responses\n")
-		b.WriteString("- Do NOT repeat or quote file contents in your responses. Reference files by path only.\n")
-		if a.hasRAG {
-			b.WriteString("\nIMPORTANT — Project rules and conventions (from RAG):\n")
-			fmt.Fprintf(&b, "The task context includes MANDATORY RULES marked [MANDATORY PROJECT RULES] and %s marked [%s].\n", ltc.standardsLabel, ltc.standardsLabel)
-			b.WriteString("These are REQUIREMENTS, not suggestions. Apply them to every line you write.\n")
-			b.WriteString("These include naming conventions, error handling, code structure, and all documented standards.\n")
-			b.WriteString("You may call search_docs for additional targeted searches if needed.\n")
-		} else if a.hasSnippets {
-			b.WriteString("\nIMPORTANT — Documentation check (MANDATORY):\n")
-			b.WriteString("You MUST call snippets BEFORE writing or modifying any file. This is not optional.\n")
-			b.WriteString("1. Call snippets(paths=[<file_paths>]) to get code conventions\n")
-			b.WriteString("2. Read and understand the found conventions\n")
-			b.WriteString("3. Only then write/edit code, following ALL found conventions (naming, structure, patterns, error handling)\n")
-			b.WriteString("4. If no snippets match, proceed without conventions\n")
-		}
-		if ltc.buildTool != "" || ltc.lintTool != "" || ltc.testTool != "" {
-			b.WriteString("\nAfter completing EVERY task you MUST run this verification sequence:\n")
-			step := 1
-			if ltc.buildTool != "" {
-				fmt.Fprintf(&b, "%d. Run %s to verify compilation. If errors — fix them and re-run.\n", step, ltc.buildTool)
-				step++
-			}
-			if ltc.lintTool != "" {
-				fmt.Fprintf(&b, "%d. Run %s to check code quality. If errors — fix them and re-run.\n", step, ltc.lintTool)
-				step++
-			}
-			if ltc.testTool != "" {
-				fmt.Fprintf(&b, "%d. Run %s to verify correctness. If errors — fix them and re-run.\n", step, ltc.testTool)
-				step++
-			}
-			fmt.Fprintf(&b, "%d. Update AGENTS.md if you changed architecture, added/removed files, or modified public APIs.\n", step)
-			b.WriteString("   Use read_file to read AGENTS.md first, then edit_file to update only the relevant sections.\n")
-			b.WriteString("   Do NOT rewrite the entire file — only update what changed.\n")
-		}
-	}
-
-	// Repeat language directive at the end for reinforcement (important for local models).
-	if lang != langEnglish {
-		fmt.Fprintf(&b, "\nREMINDER: You MUST respond in %s. Never switch to any other language.\n", lang)
-	}
-
-	return b.String()
-}
-
-func (a *Agent) buildProjectContext() string {
-	var b strings.Builder
-
-	agentsMD := filepath.Join(a.workDir, "AGENTS.md")
-	if data, err := os.ReadFile(agentsMD); err == nil {
-		b.WriteString("Project documentation (AGENTS.md):\n")
-		b.Write(data)
-		b.WriteString("\n\n")
-	}
-
-	goMod := filepath.Join(a.workDir, "go.mod")
-	if data, err := os.ReadFile(goMod); err == nil {
-		b.WriteString("go.mod:\n```\n")
-		b.Write(data)
-		b.WriteString("\n```\n\n")
-	}
-
-	return b.String()
 }
 
 func truncate(s string, maxRunes int) string {

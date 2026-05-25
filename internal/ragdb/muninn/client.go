@@ -31,8 +31,10 @@ const (
 )
 
 type Options struct {
-	URL   string
-	Vault string
+	URL      string
+	Vault    string
+	APIKey   string
+	StateDir string // local directory for caching chunk-set hash
 }
 
 type WriteEngramIn struct {
@@ -60,6 +62,7 @@ type Client struct {
 	httpClient *http.Client
 	baseURL    string
 	vault      string
+	apiKey     string
 }
 
 func NewClient(opts *Options) *Client {
@@ -67,6 +70,13 @@ func NewClient(opts *Options) *Client {
 		httpClient: &http.Client{Timeout: defaultTimeout},
 		baseURL:    opts.URL,
 		vault:      opts.Vault,
+		apiKey:     opts.APIKey,
+	}
+}
+
+func (c *Client) setAuth(req *http.Request) {
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	}
 }
 
@@ -122,6 +132,7 @@ func (c *Client) doWriteEngram(ctx context.Context, data []byte) error {
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	c.setAuth(req)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -213,6 +224,7 @@ func (c *Client) Activate(ctx context.Context, in *ActivateIn) ([]Engram, error)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	c.setAuth(req)
 	req.Close = true
 
 	resp, err := c.httpClient.Do(req)
@@ -252,6 +264,8 @@ func (c *Client) ListEngrams(ctx context.Context) ([]Engram, error) {
 		if err != nil {
 			return nil, errors.Wrap(err, "muninn: create list request")
 		}
+
+		c.setAuth(req)
 
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
@@ -295,6 +309,8 @@ func (c *Client) DeleteEngram(ctx context.Context, id string) error {
 	if err != nil {
 		return errors.Wrap(err, "muninn: create delete request")
 	}
+
+	c.setAuth(req)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

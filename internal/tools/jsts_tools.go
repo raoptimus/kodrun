@@ -98,31 +98,31 @@ func jstsToolSchema(argsDesc string) llm.JSONSchema {
 // RegisterJSTSTools registers JavaScript/TypeScript ecosystem tools.
 func RegisterJSTSTools(reg *Registry, workDir string) {
 	reg.Register(&jstsTool{
-		workDir: workDir, name: "npm_install",
+		workDir: workDir, name: NameNpmInstall,
 		description: "Run npm install",
 		command:     "npm", defaultArgs: []string{"install"},
 		schema: jstsToolSchema("Package(s) or flags"),
 	})
 	reg.Register(&jstsTool{
-		workDir: workDir, name: "npm_run",
+		workDir: workDir, name: NameNpmRun,
 		description: "Run an npm script (npm run <script>)",
 		command:     "npm", defaultArgs: []string{"run"},
 		schema: jstsToolSchema("Script name and arguments"),
 	})
 	reg.Register(&jstsTool{
-		workDir: workDir, name: "npm_test",
+		workDir: workDir, name: NameNpmTest,
 		description: "Run npm test",
 		command:     "npm", defaultArgs: []string{"test"},
 		schema: jstsToolSchema(defaultArgsDesc),
 	})
 	reg.Register(&jstsTool{
-		workDir: workDir, name: "tsc",
+		workDir: workDir, name: NameTSC,
 		description: "Run TypeScript compiler",
 		command:     "tsc", defaultArgs: []string{"--noEmit"},
 		schema: jstsToolSchema("tsc arguments, e.g. -p tsconfig.json"),
 	})
 	reg.Register(&jstsTool{
-		workDir: workDir, name: "eslint",
+		workDir: workDir, name: NameESLint,
 		description: "Run eslint",
 		command:     "eslint", defaultArgs: []string{"."},
 		schema: jstsToolSchema("eslint arguments"),

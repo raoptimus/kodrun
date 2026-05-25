@@ -27,7 +27,8 @@ func NewRuleTool(loader *rules.Loader, scope rules.Scope) *RuleTool {
 	return &RuleTool{loader: loader, scope: scope}
 }
 
-func (t *RuleTool) Name() string { return "get_rule" }
+func (t *RuleTool) Name() string     { return NameGetRule }
+func (t *RuleTool) IsReadOnly() bool { return true }
 func (t *RuleTool) Description() string {
 	return "Get full content of a project rule with referenced documentation"
 }

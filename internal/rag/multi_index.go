@@ -42,7 +42,7 @@ type MultiIndex struct {
 }
 
 // NewMultiIndex creates a new MultiIndex rooted at basePath.
-func NewMultiIndex(client llm.Client, model, basePath string) *MultiIndex {
+func NewMultiIndex(client llm.Embedder, model, basePath string) *MultiIndex {
 	return &MultiIndex{
 		basePath: basePath,
 		common:   NewIndex(client, model, filepath.Join(basePath, commonKey)),

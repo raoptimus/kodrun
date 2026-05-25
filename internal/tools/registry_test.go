@@ -49,7 +49,9 @@ type stubPathResolverTool struct {
 	paths []string
 }
 
-func (s *stubPathResolverTool) ResolvePaths(_ map[string]any) []string { return s.paths }
+func (s *stubPathResolverTool) ResolvePaths(_ context.Context, _ map[string]any) []string {
+	return s.paths
+}
 
 func TestRegistry_Register_Names_ReturnsSortedNames_Successfully(t *testing.T) {
 	reg := NewRegistry()
@@ -197,7 +199,7 @@ func TestResolveParamPaths_WithPathResolver_Successfully(t *testing.T) {
 	}
 	policy := CachePolicy{PathParams: []string{"path"}}
 
-	got := resolveParamPaths(tool, policy, map[string]any{"path": "a.go"})
+	got := resolveParamPaths(context.Background(), tool, policy, map[string]any{"path": "a.go"})
 
 	assert.Equal(t, []string{"/abs/path/a.go", "/abs/path/b.go"}, got)
 }
@@ -207,7 +209,7 @@ func TestResolveParamPaths_WithoutPathResolver_Successfully(t *testing.T) {
 	policy := CachePolicy{PathParams: []string{"path", "other"}}
 	params := map[string]any{"path": "/tmp/a.go", "other": "/tmp/b.go"}
 
-	got := resolveParamPaths(tool, policy, params)
+	got := resolveParamPaths(context.Background(), tool, policy, params)
 
 	assert.Equal(t, []string{"/tmp/a.go", "/tmp/b.go"}, got)
 }
@@ -217,7 +219,7 @@ func TestResolveParamPaths_EmptyParam_Successfully(t *testing.T) {
 	policy := CachePolicy{PathParams: []string{"path"}}
 	params := map[string]any{"path": ""}
 
-	got := resolveParamPaths(tool, policy, params)
+	got := resolveParamPaths(context.Background(), tool, policy, params)
 
 	assert.Empty(t, got)
 }
@@ -228,7 +230,7 @@ func TestWriteToolPaths_WithPathResolver_Successfully(t *testing.T) {
 		paths:    []string{"/resolved/path"},
 	}
 
-	got := writeToolPaths(tool, map[string]any{"path": "ignored"})
+	got := writeToolPaths(context.Background(), tool, map[string]any{"path": "ignored"})
 
 	assert.Equal(t, []string{"/resolved/path"}, got)
 }
@@ -236,7 +238,7 @@ func TestWriteToolPaths_WithPathResolver_Successfully(t *testing.T) {
 func TestWriteToolPaths_FallbackToPathParam_Successfully(t *testing.T) {
 	tool := &stubTool{name: "write"}
 
-	got := writeToolPaths(tool, map[string]any{"path": "/tmp/file.go"})
+	got := writeToolPaths(context.Background(), tool, map[string]any{"path": "/tmp/file.go"})
 
 	assert.Equal(t, []string{"/tmp/file.go"}, got)
 }
@@ -244,7 +246,7 @@ func TestWriteToolPaths_FallbackToPathParam_Successfully(t *testing.T) {
 func TestWriteToolPaths_NoPathParam_ReturnsNil_Successfully(t *testing.T) {
 	tool := &stubTool{name: "write"}
 
-	got := writeToolPaths(tool, map[string]any{"content": "data"})
+	got := writeToolPaths(context.Background(), tool, map[string]any{"content": "data"})
 
 	assert.Nil(t, got)
 }

@@ -50,7 +50,7 @@ func NewDeleteFileTool(workDir string, forbiddenPatterns []string) *DeleteFileTo
 	return &DeleteFileTool{workDir: workDir, forbiddenPatterns: forbiddenPatterns}
 }
 
-func (t *DeleteFileTool) Name() string        { return "delete_file" }
+func (t *DeleteFileTool) Name() string        { return NameDeleteFile }
 func (t *DeleteFileTool) Description() string { return "Delete a file" }
 
 func (t *DeleteFileTool) Schema() llm.JSONSchema {
@@ -102,7 +102,7 @@ func NewCreateDirTool(workDir string, forbiddenPatterns []string) *CreateDirTool
 	return &CreateDirTool{workDir: workDir, forbiddenPatterns: forbiddenPatterns}
 }
 
-func (t *CreateDirTool) Name() string        { return "create_dir" }
+func (t *CreateDirTool) Name() string        { return NameCreateDir }
 func (t *CreateDirTool) Description() string { return "Create a directory (with parents)" }
 
 func (t *CreateDirTool) Schema() llm.JSONSchema {
@@ -141,12 +141,12 @@ func (t *CreateDirTool) Execute(ctx context.Context, params map[string]any) (*To
 }
 
 // ResolvePaths returns the absolute path of the file being deleted.
-func (t *DeleteFileTool) ResolvePaths(params map[string]any) []string {
+func (t *DeleteFileTool) ResolvePaths(ctx context.Context, params map[string]any) []string {
 	p := stringParam(params, "path")
 	if p == "" {
 		return nil
 	}
-	resolved, err := SafePath(context.TODO(), t.workDir, p)
+	resolved, err := SafePath(ctx, t.workDir, p)
 	if err != nil {
 		return nil
 	}
@@ -164,7 +164,7 @@ func NewMoveFileTool(workDir string, forbiddenPatterns []string) *MoveFileTool {
 	return &MoveFileTool{workDir: workDir, forbiddenPatterns: forbiddenPatterns}
 }
 
-func (t *MoveFileTool) Name() string        { return "move_file" }
+func (t *MoveFileTool) Name() string        { return NameMoveFile }
 func (t *MoveFileTool) Description() string { return "Move or rename a file" }
 
 func (t *MoveFileTool) Schema() llm.JSONSchema {
@@ -180,17 +180,17 @@ func (t *MoveFileTool) Schema() llm.JSONSchema {
 
 // ResolvePaths returns the absolute paths affected by the move (both source
 // and destination so the cache invalidates entries on either side).
-func (t *MoveFileTool) ResolvePaths(params map[string]any) []string {
+func (t *MoveFileTool) ResolvePaths(ctx context.Context, params map[string]any) []string {
 	from := stringParam(params, "from")
 	to := stringParam(params, "to")
 	out := make([]string, 0, movePathCap)
 	if from != "" {
-		if r, err := SafePath(context.TODO(), t.workDir, from); err == nil {
+		if r, err := SafePath(ctx, t.workDir, from); err == nil {
 			out = append(out, r)
 		}
 	}
 	if to != "" {
-		if r, err := SafePath(context.TODO(), t.workDir, to); err == nil {
+		if r, err := SafePath(ctx, t.workDir, to); err == nil {
 			out = append(out, r)
 		}
 	}

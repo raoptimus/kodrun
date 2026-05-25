@@ -32,8 +32,9 @@ func NewGitStatusTool(workDir string) *gitStatusTool {
 	return &gitStatusTool{workDir: workDir}
 }
 
-func (t *gitStatusTool) Name() string        { return "git_status" }
+func (t *gitStatusTool) Name() string        { return NameGitStatus }
 func (t *gitStatusTool) Description() string { return "Show git status and current branch" }
+func (t *gitStatusTool) IsReadOnly() bool    { return true }
 
 func (t *gitStatusTool) Schema() llm.JSONSchema {
 	return llm.JSONSchema{
@@ -90,7 +91,8 @@ func NewGitDiffTool(workDir string) *gitDiffTool {
 	return &gitDiffTool{workDir: workDir}
 }
 
-func (t *gitDiffTool) Name() string { return "git_diff" }
+func (t *gitDiffTool) Name() string     { return NameGitDiff }
+func (t *gitDiffTool) IsReadOnly() bool { return true }
 func (t *gitDiffTool) Description() string {
 	return "Show git diff (optionally staged or against a ref)"
 }
@@ -158,8 +160,9 @@ func NewGitLogTool(workDir string) *gitLogTool {
 	return &gitLogTool{workDir: workDir}
 }
 
-func (t *gitLogTool) Name() string        { return "git_log" }
+func (t *gitLogTool) Name() string        { return NameGitLog }
 func (t *gitLogTool) Description() string { return "Show recent git commits" }
+func (t *gitLogTool) IsReadOnly() bool    { return true }
 
 func (t *gitLogTool) Schema() llm.JSONSchema {
 	return llm.JSONSchema{
@@ -222,7 +225,7 @@ func NewGitCommitTool(workDir string) *gitCommitTool {
 	return &gitCommitTool{workDir: workDir}
 }
 
-func (t *gitCommitTool) Name() string        { return "git_commit" }
+func (t *gitCommitTool) Name() string        { return NameGitCommit }
 func (t *gitCommitTool) Description() string { return "Stage files and create a git commit" }
 
 func (t *gitCommitTool) Schema() llm.JSONSchema {

@@ -34,7 +34,8 @@ func NewRAGSearchTool(index RAGSearcher, topK int) *RAGSearchTool {
 	return &RAGSearchTool{index: index, topK: topK}
 }
 
-func (t *RAGSearchTool) Name() string { return "search_docs" }
+func (t *RAGSearchTool) Name() string     { return NameSearchDocs }
+func (t *RAGSearchTool) IsReadOnly() bool { return true }
 func (t *RAGSearchTool) Description() string {
 	return "Search project files using semantic similarity (RAG). Use for finding relevant code, docs, or examples."
 }

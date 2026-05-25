@@ -10,6 +10,10 @@ package muninn
 
 import (
 	"context"
+	"encoding/json"
+	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -26,14 +30,17 @@ const (
 	tagWeb    = "web"
 
 	writeThrottle = 50 * time.Millisecond
+	stateDirPerm  = 0o755
+	stateFilePerm = 0o600
 )
 
 // Backend implements rag.Backend using Muninn DB as the storage engine.
 // Muninn handles embeddings internally, so no external LLM client is needed.
 type Backend struct {
-	common *Client
-	godoc  *Client
-	web    *Client
+	common   *Client
+	godoc    *Client
+	web      *Client
+	stateDir string // local directory for chunk-set hash cache
 
 	mu      sync.RWMutex
 	updated time.Time
@@ -49,10 +56,53 @@ func NewBackend(opts *Options) *Backend {
 	}
 
 	return &Backend{
-		common: NewClient(&Options{URL: opts.URL, Vault: vault}),
-		godoc:  NewClient(&Options{URL: opts.URL, Vault: vault + "-godoc"}),
-		web:    NewClient(&Options{URL: opts.URL, Vault: vault + "-web"}),
+		common:   NewClient(&Options{URL: opts.URL, Vault: vault}),
+		godoc:    NewClient(&Options{URL: opts.URL, Vault: vault + "-godoc"}),
+		web:      NewClient(&Options{URL: opts.URL, Vault: vault + "-web"}),
+		stateDir: opts.StateDir,
 	}
+}
+
+type muninnState struct {
+	ChunkHash string `json:"chunk_hash"`
+}
+
+func (b *Backend) stateFile() string {
+	if b.stateDir == "" {
+		return ""
+	}
+	return filepath.Join(b.stateDir, "muninn_state.json")
+}
+
+func (b *Backend) loadHash() string {
+	f := b.stateFile()
+	if f == "" {
+		return ""
+	}
+	data, err := os.ReadFile(f)
+	if err != nil {
+		return ""
+	}
+	var s muninnState
+	if err := json.Unmarshal(data, &s); err != nil {
+		return ""
+	}
+	return s.ChunkHash
+}
+
+func (b *Backend) saveHash(hash string) error {
+	f := b.stateFile()
+	if f == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(f), stateDirPerm); err != nil {
+		return err
+	}
+	data, err := json.Marshal(muninnState{ChunkHash: hash})
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(f, data, stateFilePerm)
 }
 
 func (b *Backend) LoadCommon() error { return nil }
@@ -61,7 +111,7 @@ func (b *Backend) LoadGodoc() error  { return nil }
 func (b *Backend) HasLegacyCodeChunks() bool { return false }
 
 func (b *Backend) Reset() error {
-	return b.deleteAll(b.common)
+	return b.deleteAll(context.Background(), b.common)
 }
 
 func (b *Backend) BuildCommon(ctx context.Context, chunks []rag.Chunk) (int, error) {
@@ -69,7 +119,35 @@ func (b *Backend) BuildCommon(ctx context.Context, chunks []rag.Chunk) (int, err
 }
 
 func (b *Backend) BuildCommonWithProgress(ctx context.Context, chunks []rag.Chunk, progress rag.ProgressFunc) (int, error) {
-	return b.buildChunks(ctx, b.common, tagCommon, chunks, progress)
+	if b.stateDir != "" {
+		currentHash := rag.ChunkSetHash(chunks)
+		storedHash := b.loadHash()
+		if storedHash == currentHash {
+			if progress != nil {
+				progress("up to date", 0, 0)
+			}
+			return 0, nil
+		}
+		// Hash changed: reset to avoid stale/duplicate engrams, then re-index.
+		if storedHash != "" {
+			if err := b.deleteAll(ctx, b.common); err != nil {
+				slog.Warn("muninn: reset before reindex failed", "error", err)
+			}
+		}
+	}
+
+	n, err := b.buildChunks(ctx, b.common, tagCommon, chunks, progress)
+	if err != nil {
+		return n, err
+	}
+
+	if b.stateDir != "" {
+		if saveErr := b.saveHash(rag.ChunkSetHash(chunks)); saveErr != nil {
+			slog.Warn("muninn: save state failed", "error", saveErr)
+		}
+	}
+
+	return n, nil
 }
 
 func (b *Backend) Build(ctx context.Context, chunks []rag.Chunk) (int, error) {
@@ -112,7 +190,7 @@ func (b *Backend) SearchGodoc(ctx context.Context, query string, topK int) ([]ra
 }
 
 func (b *Backend) ResetGodoc() error {
-	return b.deleteAll(b.godoc)
+	return b.deleteAll(context.Background(), b.godoc)
 }
 
 func (b *Backend) GodocSize() int { return 0 }
@@ -196,14 +274,14 @@ func (b *Backend) search(ctx context.Context, client *Client, query string, topK
 	return results, nil
 }
 
-func (b *Backend) deleteAll(client *Client) error {
-	engrams, err := client.ListEngrams(context.Background())
+func (b *Backend) deleteAll(ctx context.Context, client *Client) error {
+	engrams, err := client.ListEngrams(ctx)
 	if err != nil {
 		return err
 	}
 
 	for _, e := range engrams {
-		if err := client.DeleteEngram(context.Background(), e.ID); err != nil {
+		if err := client.DeleteEngram(ctx, e.ID); err != nil {
 			// Skip errors for individual deletions during bulk reset.
 			if !strings.Contains(err.Error(), "not found") {
 				return err

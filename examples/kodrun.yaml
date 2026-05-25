@@ -193,6 +193,7 @@ rag:
   # muninn:
   #   url: "http://127.0.0.1:8475"
   #   vault: "kodrun"
+  #   api_key: ""  # optional: required if the vault is protected
   # Deprecated: no longer used. Kept for backward compatibility — kodrun no
   # longer indexes project source code. Remove these fields from your config.
   # index_dirs:

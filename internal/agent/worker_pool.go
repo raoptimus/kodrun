@@ -75,7 +75,11 @@ func (p *WorkerPool) Execute(ctx context.Context, tasks []TaskFunc) []TaskResult
 		}
 
 		wg.Add(1)
-		go func() {
+		// Pass i and task explicitly to the goroutine. While Go ≥1.22
+		// gives every iteration its own loop variable, explicit parameters
+		// document intent and stay correct under //go:build go1.21 or
+		// when this code is copy-pasted into a library with an older minimum.
+		go func(i int, task TaskFunc) {
 			defer func() {
 				if r := recover(); r != nil {
 					results[i] = TaskResult{Index: i, Err: errors.Errorf("task panic: %v", r)}
@@ -85,7 +89,7 @@ func (p *WorkerPool) Execute(ctx context.Context, tasks []TaskFunc) []TaskResult
 			}()
 			res, err := task(ctx)
 			results[i] = TaskResult{Index: i, Result: res, Err: err}
-		}()
+		}(i, task)
 	}
 
 	wg.Wait()

@@ -47,7 +47,7 @@ func (f *Fixer) Fix(ctx context.Context, toolName, output string, onEvent func(s
 	files := AffectedFiles(ctx, errs)
 	var fileContents strings.Builder
 	for _, file := range files {
-		result, err := f.reg.Execute(ctx, "read_file", map[string]any{"path": file})
+		result, err := f.reg.Execute(ctx, tools.NameReadFile, map[string]any{"path": file})
 		if err != nil {
 			continue
 		}
