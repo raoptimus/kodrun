@@ -220,6 +220,12 @@ See [`examples/kodrun.yaml`](examples/kodrun.yaml) for a fully annotated project
 - **Graceful tool errors.** `read_file`, `list_dir`, and `delete_file` return a result message instead of an error for non-existent paths.
 - **Autocomplete scrolling.** Slash-command list now scrolls when items exceed the visible area.
 
+### ⚠️ Migrating to v1.4.0-beta
+
+- **Verifier loop.** After the executor finishes all plan steps, a lightweight `verifier` sub-agent re-reads the changed files and confirms every step was actually completed. If gaps are found, it generates a targeted fix plan and re-runs the executor (up to `agent.max_replans` times). No config changes required — verifier uses `agent.thinking_provider`.
+- **Muninn API key.** New `rag.muninn.api_key` field for Bearer token authentication against a secured Muninn DB instance. Also new `rag.muninn.state_dir` — local directory for caching the chunk-set hash so unchanged content is not re-uploaded on restart.
+- **Internal refactor (no breaking changes).** `cmd/kodrun/main.go` is now a thin entry point; all CLI action handling moved to `internal/cliapp/`. `internal/agent/orchestrator.go` and `agent.go` split into focused modules (`orchestrator_plan.go`, `orchestrator_execute.go`, `orchestrator_findings.go`, `tool_executor.go`, etc.). The `llm.Client` interface is now composed of three narrow interfaces: `Chatter`, `Embedder`, `Inspector`.
+
 ### Minimal `.kodrun/kodrun.yaml`
 
 ```yaml

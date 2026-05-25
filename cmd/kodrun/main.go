@@ -25,7 +25,7 @@ import (
 // version is the kodrun release tag. Declared as a var (not const) so the
 // release pipeline can override it at link time via
 // `-ldflags "-X main.version=..."`.
-var version = "v1.3.0-beta"
+var version = "v1.4.0-beta"
 
 func main() {
 	defer func() {

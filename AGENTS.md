@@ -71,9 +71,10 @@ KodRun is a CLI agent for writing and maintaining Go/Python/JS-TS code. It runs 
 
 ### Package layout
 
-- **`cmd/kodrun/main.go`** — CLI entry point (urfave/cli/v3), wires all components, graceful shutdown. Blank-imports `llm/ollama` and `llm/openai` for factory registration.
+- **`cmd/kodrun/main.go`** — thin CLI entry point (urfave/cli/v3); delegates all action handling to `internal/cliapp/`. Blank-imports `llm/ollama` and `llm/openai` for factory registration.
+- **`internal/cliapp/`** — CLI action handlers extracted from `cmd/kodrun/main.go`. Key files: `app.go` (wiring), `setup.go` (agent + RAG init), `flags.go`, `task.go` (one-shot and TUI task runner), `tuirun.go`, `action_orchestrate.go`, `action_codereview.go`, `action_model.go`, `action_session.go`, `action_rag.go`, `action_state.go`, `codereview.go`, `classifier.go`, `bgindex.go`.
 - **`internal/llm/`** — LLM provider abstraction layer:
-  - `client.go` — `Client` interface (Ping, Models, Chat, ChatSync, Embed)
+  - `client.go` — `Client` interface composed of three narrow sub-interfaces: `Chatter` (Chat/ChatSync/ChatStream), `Embedder` (Embed), `Inspector` (Ping/Models). New code should depend on the narrowest interface it needs.
   - `factory.go` — `RegisterFactory`/`NewClient` pattern; backends register via `init()`
   - `aggregate.go` — shared `AggregateChatStream` (stream-to-sync with fallback tool-call parsing)
   - `parser.go` — `ParseToolCalls` (JSON + XML formats), `CleanToolCallText`
@@ -82,12 +83,22 @@ KodRun is a CLI agent for writing and maintaining Go/Python/JS-TS code. It runs 
   - `openai/` — OpenAI-compatible backend (SSE streaming, `/v1/chat/completions`, `/v1/models`, `/v1/embeddings`, Bearer auth)
 - **`internal/agent/`** — Agent loop and orchestrator:
   - `agent.go` — core chat loop: LLM call -> tool execution -> result injection, Mode (plan/edit/chat), events, confirm, allowedReadPaths whitelist
-  - `orchestrator.go` — Plan -> Execute -> Review pipeline with DAG parallelism
+  - `tool_executor.go` — tool call dispatch and result handling (extracted from agent.go)
+  - `event_emitter.go` — event emission helpers
+  - `prompt.go` — prompt construction helpers
+  - `mode.go` — `Mode` type definition (plan/edit/chat)
+  - `session.go` — session model; `session_store.go` — session persistence to `.kodrun/sessions/`
+  - `orchestrator.go` — Plan → Execute → Verify → Review pipeline with DAG parallelism
+  - `orchestrator_plan.go` — planner sub-pipeline (runPlannerWithTools, runPlannerRevision)
+  - `orchestrator_execute.go` — executor sub-pipeline (confirmAndExecute, runExecutor)
+  - `orchestrator_findings.go` — findings / code-review sub-pipeline
+  - `orchestrator_helpers.go` — shared orchestrator helpers
   - `orchestrator_review.go` — V2 code review pipeline (pre-loads context per file, reviews in parallel without tool-calling)
   - `dag.go` — DAG executor with topological sort and per-file locking
   - `context.go` — context management with auto-compaction on overflow
   - `permission.go` — per-tool permission management (AllowOnce/Session/Augment)
-  - `role.go` — role definitions (planner/executor/reviewer/extractor/structurer/step_executor)
+  - `role.go` — `Role` type and system-prompt generation per role
+  - `tools_const.go` — tool name constants
   - `worker_pool.go` — parallel read-only tool call execution
 - **`internal/tools/`** — Tool registry and implementations. Tools are auto-registered based on detected project language. Each tool is a separate file (e.g., `file_read.go`, `go_tools.go`, `git_tools.go`).
 - **`internal/config/`** — YAML config via viper/mapstructure. Multi-provider support with role-to-provider mapping.
@@ -193,7 +204,17 @@ User task ("смотри задачу в TODO.md")
     │
     ▼
 ┌─────────────────────────────────────────────────────┐
-│ 5. REVIEWER (RoleReviewer, optional)                │
+│ 5. VERIFIER (RoleVerifier, optional)                │
+│    Re-reads changed files, checks every plan step   │
+│    was actually completed. If gaps found:           │
+│    generates a fix plan → re-runs executor          │
+│    (up to agent.max_replans times)                  │
+│    Code: orchestrator_execute.go:verifyOnce()       │
+└─────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────┐
+│ 6. REVIEWER (RoleReviewer, optional)                │
 │    Reads changed files, checks against plan         │
 │    Output: LGTM or list of issues                   │
 │    Code: orchestrator.go:runReviewer()               │
@@ -224,6 +245,7 @@ Original task ──► Planner (full task + RAG + project files)
 | `planner` | `thinking_provider` | Reads code via read-only tools, writes markdown plan with CONSTRAINTS + structured steps |
 | `executor` | `executor_provider` | Applies the approved plan via edit_file/write_file |
 | `step_executor` | `executor_provider` | Executes a single DAG step in isolation (same prompt as executor) |
+| `verifier` | `thinking_provider` | Re-reads changed files after execution; confirms every plan step was completed; generates a fix plan if gaps found (up to `max_replans` iterations) |
 | `reviewer` | `thinking_provider` | Final review pass over executor changes |
 | `extractor` | `extractor_provider` | Converts raw planner output to structured JSON findings (review mode only, json + temp=0) |
 | `structurer` | `extractor_provider` | Converts markdown plan to JSON `Plan{Steps[]}` for DAG execution (json + temp=0) |
@@ -345,3 +367,7 @@ When `agent.max_parallel_tasks > 1`, the structurer converts the plan into a DAG
 | OpenAI-compatible (vLLM, llama.cpp, LiteLLM) | `openai` | SSE | Bearer token (`api_key`) |
 
 Both backends feed into `AggregateChatStream` for unified sync consumption with fallback tool-call parsing.
+
+**Muninn RAG backend** (`rag.backend: muninn`) uses a separate HTTP client (`internal/ragdb/muninn/`) and supports:
+- `rag.muninn.api_key` — Bearer token for authenticated Muninn instances
+- `rag.muninn.state_dir` — local directory for chunk-set hash cache (avoids re-uploading unchanged content on restart)
