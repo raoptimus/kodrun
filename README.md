@@ -2,6 +2,9 @@
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/raoptimus/kodrun.svg)](https://pkg.go.dev/github.com/raoptimus/kodrun/v2)
 [![Go Report Card](https://goreportcard.com/badge/github.com/raoptimus/kodrun)](https://goreportcard.com/report/github.com/raoptimus/kodrun)
+[![Test](https://github.com/raoptimus/kodrun/workflows/Test/badge.svg)](https://github.com/raoptimus/kodrun/actions)
+[![Coverage](https://github.com/raoptimus/kodrun/wiki/coverage.svg)](https://raw.githack.com/wiki/raoptimus/kodrun/coverage.html)
+[![GitHub Release](https://img.shields.io/github/release/raoptimus/kodrun.svg)](https://github.com/raoptimus/kodrun/releases)
 [![License](https://img.shields.io/github/license/raoptimus/kodrun)](https://github.com/raoptimus/kodrun/blob/main/LICENSE)
 
 > **Beta** — this project is under active development. APIs and configuration may change.

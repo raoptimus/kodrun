@@ -17,6 +17,12 @@ env:
   GO_LINT_VERSION: 'v2.7.2'
 
 jobs:
+  docker:
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
